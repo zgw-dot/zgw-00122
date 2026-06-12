@@ -18,7 +18,7 @@ from matcher import (
     generate_payable_recalc_note, get_latest_recalc_note, list_recalc_notes,
     compare_notes, get_latest_comparison, list_comparisons, get_comparison,
     list_comparisons_with_filter, get_latest_confirmed_comparison,
-    update_comparison_review,
+    update_comparison_review, batch_update_comparison_review,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -459,6 +459,29 @@ def review_comparison(batch_id, comparison_id):
     if err:
         return jsonify({"error": err}), 400
     return jsonify({"comparison": updated.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/comparisons/batch-review", methods=["PUT"])
+def batch_review_comparisons(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+
+    payload = request.get_json(silent=True) or {}
+    comparison_ids = payload.get("comparison_ids")
+    review_status = payload.get("review_status")
+    review_remark = payload.get("review_remark", "")
+    operator = payload.get("operator", "user")
+
+    if not comparison_ids or not isinstance(comparison_ids, list) or len(comparison_ids) == 0:
+        return jsonify({"error": "参数缺失: 需要 comparison_ids (非空列表)"}), 400
+
+    valid_statuses = {REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED}
+    if review_status not in valid_statuses:
+        return jsonify({"error": f"无效的复核状态: {review_status}"}), 400
+
+    result = batch_update_comparison_review(
+        batch_id, comparison_ids, review_status, review_remark, operator=operator
+    )
+    return jsonify(result)
 
 
 @bp.route("/api/batches/<int:batch_id>/export", methods=["GET"])

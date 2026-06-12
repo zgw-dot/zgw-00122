@@ -913,3 +913,90 @@ def update_comparison_review(comparison_id, review_status, review_remark=None, o
     db.session.commit()
 
     return comparison, None
+
+
+def batch_update_comparison_review(batch_id, comparison_ids, review_status, review_remark=None, operator="user"):
+    """
+    批量更新对比记录的复核状态和备注。
+
+    对每条记录做完整的冲突校验，成功的提交、冲突的逐条返回原因，
+    绝不静默吞掉半成功的结果。
+
+    返回 dict:
+    {
+        "success_count": int,
+        "success_ids": [id, ...],
+        "conflict_count": int,
+        "conflicts": [{"id": int, "reason": str}, ...]
+    }
+    """
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        return {
+            "success_count": 0,
+            "success_ids": [],
+            "conflict_count": len(comparison_ids),
+            "conflicts": [{"id": cid, "reason": "批次不存在"} for cid in comparison_ids],
+        }
+
+    valid_statuses = {REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED}
+    if review_status not in valid_statuses:
+        return {
+            "success_count": 0,
+            "success_ids": [],
+            "conflict_count": len(comparison_ids),
+            "conflicts": [{"id": cid, "reason": f"无效的复核状态: {review_status}"} for cid in comparison_ids],
+        }
+
+    status_label = {
+        REVIEW_STATUS_PENDING: "待复核",
+        REVIEW_STATUS_CONFIRMED: "已确认",
+        REVIEW_STATUS_IGNORED: "已忽略",
+    }.get(review_status, review_status)
+
+    success_ids = []
+    conflicts = []
+
+    for cid in comparison_ids:
+        comparison = NoteComparison.query.get(cid)
+        if not comparison:
+            conflicts.append({"id": cid, "reason": "对比记录不存在"})
+            continue
+        if comparison.batch_id != batch_id:
+            conflicts.append({"id": cid, "reason": "对比记录不属于该批次"})
+            continue
+        if review_status == REVIEW_STATUS_CONFIRMED:
+            if comparison.review_status == REVIEW_STATUS_CONFIRMED:
+                conflicts.append({"id": cid, "reason": "该对比记录已确认，不允许重复确认"})
+                continue
+            if comparison.review_status == REVIEW_STATUS_IGNORED:
+                conflicts.append({"id": cid, "reason": "该对比记录已忽略，不允许直接确认"})
+                continue
+        if review_status == REVIEW_STATUS_IGNORED:
+            if comparison.review_status == REVIEW_STATUS_IGNORED:
+                conflicts.append({"id": cid, "reason": "该对比记录已忽略，不允许重复忽略"})
+                continue
+
+        comparison.review_status = review_status
+        comparison.review_remark = review_remark
+        comparison.reviewed_by = operator
+        comparison.reviewed_at = datetime.now(timezone.utc)
+
+        log = AuditLog(
+            batch_id=batch_id,
+            action=f"REVIEW_COMPARISON_{review_status}",
+            detail=f"[批量] 对比记录 #{cid} 复核状态更新为 {status_label}"
+                   + (f"，备注: {review_remark}" if review_remark else ""),
+            operator=operator,
+        )
+        db.session.add(log)
+        success_ids.append(cid)
+
+    db.session.commit()
+
+    return {
+        "success_count": len(success_ids),
+        "success_ids": success_ids,
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+    }

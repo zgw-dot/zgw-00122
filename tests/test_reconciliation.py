@@ -1560,3 +1560,379 @@ def test_review_invalid_status_returns_400(client, sample_dir):
     assert r.status_code == 400
     body = r.get_json()
     assert "无效的复核状态" in body.get("error", "")
+
+
+# ---------- 批量复核 测试辅助函数 ----------
+
+def batch_review_api(client, bid, comparison_ids, status, remark="", operator="batch_tester"):
+    r = client.put(
+        f"/api/batches/{bid}/recalc-notes/comparisons/batch-review",
+        json={
+            "comparison_ids": comparison_ids,
+            "review_status": status,
+            "review_remark": remark,
+            "operator": operator,
+        },
+    )
+    return r
+
+
+def create_multiple_comparisons(client, bid, sample_dir, count=3):
+    """创建多个版本和多条对比记录，全部为 PENDING 状态"""
+    match_and_resolve_all(client, bid, sample_dir)
+    exs = get_exceptions(client, bid)
+
+    for i in range(count):
+        if len(exs) > i:
+            client.put(
+                f"/api/batches/{bid}/exceptions/{exs[i]['id']}/remark",
+                json={"remarks": f"v{i+2}备注"},
+            )
+
+    notes = list_notes(client, bid)
+    assert len(notes) >= count + 1, f"需要至少 {count+1} 个版本，实际 {len(notes)}"
+
+    comps = []
+    for i in range(count):
+        r = compare_notes_api(client, bid, notes[i]["id"], notes[i + 1]["id"], operator=f"op_{i}")
+        assert r.status_code == 200
+        comps.append(r.get_json()["comparison"])
+    return comps
+
+
+# ---------- 批量复核 测试用例 ----------
+
+def test_batch_review_all_success(client, sample_dir):
+    """成功批量处理：3 条 PENDING 全部批量确认，状态、备注、复核人、时间都写入"""
+    bid = create_batch(client, "test-batch-success")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=3)
+    comp_ids = [c["id"] for c in comps]
+
+    r = batch_review_api(client, bid, comp_ids, "CONFIRMED", remark="批量确认财务已核对", operator="finance_li")
+    assert r.status_code == 200, f"批量复核失败: {r.data}"
+    body = r.get_json()
+
+    assert body["success_count"] == 3, f"应成功 3 条，实际 {body['success_count']}"
+    assert set(body["success_ids"]) == set(comp_ids)
+    assert body["conflict_count"] == 0
+    assert body["conflicts"] == []
+
+    for cid in comp_ids:
+        r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{cid}")
+        assert r.status_code == 200
+        c = r.get_json()["comparison"]
+        assert c["review_status"] == "CONFIRMED"
+        assert c["review_remark"] == "批量确认财务已核对"
+        assert c["reviewed_by"] == "finance_li"
+        assert c["reviewed_at"] is not None
+
+    from models import AuditLog
+    with client.application.app_context():
+        logs = AuditLog.query.filter_by(batch_id=bid, action="REVIEW_COMPARISON_CONFIRMED").all()
+        assert len(logs) >= 3, "每条成功的批量复核都应写审计日志"
+        for log in logs:
+            assert log.operator == "finance_li"
+            assert "[批量]" in log.detail
+
+
+def test_batch_review_partial_conflicts(client, sample_dir):
+    """部分冲突场景：2 条 PENDING + 1 条已 CONFIRMED + 1 条不存在的 ID + 1 条跨批次
+
+    应返回清楚的冲突结果，成功的成功、冲突的逐条说明，不能静默吞掉。
+    """
+    bid1 = create_batch(client, "test-batch-conflict")
+    comps = create_multiple_comparisons(client, bid1, sample_dir, count=3)
+
+    bid2 = create_batch(client, "test-batch-conflict-bid2")
+    comps_b2 = create_multiple_comparisons(client, bid2, sample_dir, count=1)
+
+    review_comparison_api(client, bid1, comps[0]["id"], "CONFIRMED", remark="提前确认过的")
+
+    mixed_ids = [comps[0]["id"], comps[1]["id"], comps[2]["id"], 99999, comps_b2[0]["id"]]
+
+    r = batch_review_api(client, bid1, mixed_ids, "CONFIRMED", remark="批量处理", operator="finance_wang")
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["success_count"] == 2
+    assert set(body["success_ids"]) == {comps[1]["id"], comps[2]["id"]}
+    assert body["conflict_count"] == 3
+
+    conflict_map = {c["id"]: c["reason"] for c in body["conflicts"]}
+    assert comps[0]["id"] in conflict_map
+    assert "已确认" in conflict_map[comps[0]["id"]]
+    assert 99999 in conflict_map
+    assert "不存在" in conflict_map[99999]
+    assert comps_b2[0]["id"] in conflict_map
+    assert "不属于该批次" in conflict_map[comps_b2[0]["id"]]
+
+    for cid in [comps[1]["id"], comps[2]["id"]]:
+        c = client.get(f"/api/batches/{bid1}/recalc-notes/comparisons/{cid}").get_json()["comparison"]
+        assert c["review_status"] == "CONFIRMED"
+        assert c["review_remark"] == "批量处理"
+        assert c["reviewed_by"] == "finance_wang"
+
+    c0 = client.get(f"/api/batches/{bid1}/recalc-notes/comparisons/{comps[0]['id']}").get_json()["comparison"]
+    assert c0["review_remark"] == "提前确认过的", "冲突的记录不应被覆盖"
+
+
+def test_batch_review_ignored_conflicts(client, sample_dir):
+    """已忽略的记录再批量确认或再批量忽略都应冲突，且不影响原本数据"""
+    bid = create_batch(client, "test-batch-ignored-conflict")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=2)
+
+    review_comparison_api(client, bid, comps[0]["id"], "IGNORED", remark="先单条忽略")
+
+    r = batch_review_api(client, bid, [comps[0]["id"], comps[1]["id"]], "CONFIRMED", remark="批量确认")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["success_count"] == 1
+    assert body["conflict_count"] == 1
+    conflict_map = {c["id"]: c["reason"] for c in body["conflicts"]}
+    assert "已忽略" in conflict_map[comps[0]["id"]]
+
+    c0 = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comps[0]['id']}").get_json()["comparison"]
+    assert c0["review_status"] == "IGNORED", "已忽略的记录不应被批量确认覆盖"
+    assert c0["review_remark"] == "先单条忽略"
+
+    r = batch_review_api(client, bid, [comps[0]["id"]], "IGNORED", remark="重复忽略")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["success_count"] == 0
+    assert body["conflict_count"] == 1
+    assert "重复忽略" in body["conflicts"][0]["reason"]
+
+
+def test_batch_review_persists_across_restart(client, sample_dir, tmp_path):
+    """跨重启持久化：批量复核后的状态、备注、复核人、时间在重启后仍可查"""
+    from app import create_app
+    from models import db
+
+    db_path = tmp_path / "batch_persist_test.db"
+    db_uri = f"sqlite:///{db_path}"
+
+    app1 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app1.app_context():
+        db.create_all()
+    c1 = app1.test_client()
+
+    bid = create_batch(c1, "test-batch-persist")
+    comps = create_multiple_comparisons(c1, bid, sample_dir, count=3)
+    comp_ids = [c["id"] for c in comps]
+
+    r = batch_review_api(c1, bid, comp_ids, "CONFIRMED", remark="持久化批量备注", operator="batch_persist_op")
+    assert r.status_code == 200
+    assert r.get_json()["success_count"] == 3
+
+    saved_states = {}
+    for cid in comp_ids:
+        c = c1.get(f"/api/batches/{bid}/recalc-notes/comparisons/{cid}").get_json()["comparison"]
+        saved_states[cid] = {
+            "review_status": c["review_status"],
+            "review_remark": c["review_remark"],
+            "reviewed_by": c["reviewed_by"],
+            "reviewed_at": c["reviewed_at"],
+        }
+
+    with app1.app_context():
+        db.session.remove()
+
+    app2 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app2.app_context():
+        db.create_all()
+    c2 = app2.test_client()
+
+    for cid in comp_ids:
+        c = c2.get(f"/api/batches/{bid}/recalc-notes/comparisons/{cid}").get_json()["comparison"]
+        assert c["review_status"] == saved_states[cid]["review_status"]
+        assert c["review_remark"] == saved_states[cid]["review_remark"]
+        assert c["reviewed_by"] == saved_states[cid]["reviewed_by"]
+        assert c["reviewed_at"] == saved_states[cid]["reviewed_at"]
+        assert c["review_status"] == "CONFIRMED"
+
+    with app2.app_context():
+        db.session.remove()
+        db.drop_all()
+
+
+def test_batch_review_export_no_cross_data(client, sample_dir):
+    """批量确认后，CSV 导出只带最近一次已确认对比，待复核和已忽略的不混进去"""
+    bid = create_batch(client, "test-batch-export")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=3)
+
+    review_comparison_api(client, bid, comps[0]["id"], "IGNORED", remark="这条忽略掉")
+
+    r = batch_review_api(client, bid, [comps[1]["id"], comps[2]["id"]], "CONFIRMED", remark="批量确认的", operator="export_batch_op")
+    assert r.status_code == 200
+    assert r.get_json()["success_count"] == 2
+
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+
+    with io.StringIO(r.data.decode("utf-8-sig")) as f:
+        rows = list(csv.reader(f))
+
+    in_summary = False
+    exported_compare_summary = None
+    exported_compare_versions = None
+    exported_compare_operator = None
+    exported_reviewer = None
+    exported_review_remark = None
+    has_ignored_summary = False
+    has_pending_summary = False
+
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "汇总信息":
+            in_summary = True
+            continue
+        if in_summary:
+            if row[0] == "最近已确认对比摘要":
+                exported_compare_summary = row[1] if len(row) > 1 else ""
+            if row[0] == "对比版本":
+                exported_compare_versions = row[1] if len(row) > 1 else ""
+            if row[0] == "对比操作人":
+                exported_compare_operator = row[1] if len(row) > 1 else ""
+            if row[0] == "复核人":
+                exported_reviewer = row[1] if len(row) > 1 else ""
+            if row[0] == "复核备注":
+                exported_review_remark = row[1] if len(row) > 1 else ""
+            if row[0] == "最近对比摘要":
+                has_pending_summary = True
+            if "忽略" in (row[1] if len(row) > 1 else ""):
+                has_ignored_summary = True
+
+    assert exported_compare_summary is not None, "导出应包含最近已确认对比摘要"
+    assert exported_reviewer == "export_batch_op"
+    assert exported_review_remark == "批量确认的"
+    assert exported_compare_versions == f"v{comps[2]['note_a_version']} → v{comps[2]['note_b_version']}"
+    assert not has_pending_summary, "导出不应包含待复核的'最近对比摘要'"
+    assert not has_ignored_summary, "导出不应混入已忽略对比的内容"
+
+    api_payable = get_batch(client, bid)["summary"]["payable_total"]
+    exported_payable = None
+    for row in rows:
+        if row and row[0] == "应付合计":
+            exported_payable = float(row[1])
+            break
+    assert exported_payable == api_payable, "导出金额应与接口对齐"
+
+
+def test_batch_review_invalid_params_return_400(client, sample_dir):
+    """批量复核参数校验：空列表、无效状态返回 400 可读 JSON"""
+    bid = create_batch(client, "test-batch-invalid")
+    create_multiple_comparisons(client, bid, sample_dir, count=1)
+
+    r = batch_review_api(client, bid, [], "CONFIRMED")
+    assert r.status_code == 400
+    assert "参数缺失" in r.get_json().get("error", "")
+
+    r = client.put(
+        f"/api/batches/{bid}/recalc-notes/comparisons/batch-review",
+        json={"comparison_ids": [1], "review_status": "BAD"},
+    )
+    assert r.status_code == 400
+    assert "无效的复核状态" in r.get_json().get("error", "")
+
+    r = client.put(
+        f"/api/batches/{bid}/recalc-notes/comparisons/batch-review",
+        json={},
+    )
+    assert r.status_code == 400
+    assert "参数缺失" in r.get_json().get("error", "")
+
+
+def test_batch_review_generates_audit_logs(client, sample_dir):
+    """批量复核每条成功记录都生成独立的审计日志"""
+    bid = create_batch(client, "test-batch-audit")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=3)
+    comp_ids = [c["id"] for c in comps]
+
+    from models import AuditLog
+    with client.application.app_context():
+        before_count = AuditLog.query.filter_by(batch_id=bid, action="REVIEW_COMPARISON_CONFIRMED").count()
+
+    r = batch_review_api(client, bid, comp_ids, "CONFIRMED", remark="审计测试批量", operator="audit_batch_user")
+    assert r.status_code == 200
+    assert r.get_json()["success_count"] == 3
+
+    with client.application.app_context():
+        logs = AuditLog.query.filter_by(batch_id=bid, action="REVIEW_COMPARISON_CONFIRMED").order_by(AuditLog.id.desc()).limit(5).all()
+        after_count = len(logs)
+        assert after_count >= before_count + 3, f"应新增至少 3 条审计日志，新增 {after_count - before_count}"
+        for log in logs:
+            assert log.operator == "audit_batch_user"
+            assert "[批量]" in log.detail
+            assert "审计测试批量" in log.detail
+
+
+def test_batch_review_reset_to_pending(client, sample_dir):
+    """批量重置为待复核状态"""
+    bid = create_batch(client, "test-batch-reset")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=2)
+    comp_ids = [c["id"] for c in comps]
+
+    review_comparison_api(client, bid, comps[0]["id"], "CONFIRMED", remark="先确认")
+    review_comparison_api(client, bid, comps[1]["id"], "IGNORED", remark="先忽略")
+
+    r = batch_review_api(client, bid, comp_ids, "PENDING", remark="批量重置待复核", operator="reset_user")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["success_count"] == 2
+
+    for cid in comp_ids:
+        c = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{cid}").get_json()["comparison"]
+        assert c["review_status"] == "PENDING"
+        assert c["review_remark"] == "批量重置待复核"
+        assert c["reviewed_by"] == "reset_user"
+
+
+def test_batch_review_api_response_readable_json(client, sample_dir):
+    """批量复核接口返回的 JSON 结构清晰可读，页面能直接解析展示"""
+    bid = create_batch(client, "test-batch-json-readable")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=2)
+
+    r = batch_review_api(client, bid, [comps[0]["id"], 99999], "CONFIRMED", remark="测试JSON结构", operator="json_user")
+    assert r.status_code == 200
+    assert "application/json" in r.content_type
+
+    body = r.get_json()
+    assert isinstance(body, dict)
+    assert "success_count" in body and isinstance(body["success_count"], int)
+    assert "success_ids" in body and isinstance(body["success_ids"], list)
+    assert "conflict_count" in body and isinstance(body["conflict_count"], int)
+    assert "conflicts" in body and isinstance(body["conflicts"], list)
+
+    for c in body["conflicts"]:
+        assert "id" in c and isinstance(c["id"], int)
+        assert "reason" in c and isinstance(c["reason"], str)
+        assert len(c["reason"]) > 0
+
+    raw = r.data.decode("utf-8", errors="replace")
+    assert "<!DOCTYPE" not in raw, "不应返回 HTML"
+    assert "Traceback" not in raw, "不应返回 traceback"
+
+
+def test_index_page_has_batch_review_ui(client, sample_dir):
+    """前端页面包含批量复核 UI 元素"""
+    r = client.get("/")
+    assert r.status_code == 200
+    html = r.data.decode("utf-8")
+
+    assert "批量确认" in html, "页面应包含'批量确认'按钮"
+    assert "批量忽略" in html, "页面应包含'批量忽略'按钮"
+    assert "批量备注" in html, "页面应包含'批量备注'输入"
+    assert "全选待复核" in html, "页面应包含'全选待复核'"
+    assert "已选" in html, "页面应显示已选数量"
+    assert "批量操作结果" in html, "页面应展示批量操作冲突结果"

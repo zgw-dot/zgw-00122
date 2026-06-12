@@ -293,9 +293,9 @@
             </div>
           </div>
           <div class="mb-6">
-            <div class="flex items-center justify-between mb-2">
+            <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
               <h3 class="font-medium text-gray-700">历史对比记录</h3>
-              <div class="flex items-center gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
                 <label class="text-xs text-gray-500">状态筛选：</label>
                 <select v-model="comparisonFilter" @change="loadComparisons" class="border rounded px-2 py-1 text-xs">
                   <option value="">全部</option>
@@ -305,10 +305,37 @@
                 </select>
               </div>
             </div>
+            <div v-if="hasSelectedComparisons" class="bg-indigo-50 border border-indigo-200 rounded-lg p-3 mb-3 fade-in">
+              <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+                <span class="text-sm font-medium text-indigo-700">已选 {{ selectedComparisonIds.size }} 条待复核记录</span>
+                <button @click="toggleSelectAllComparisons" class="text-xs text-indigo-600 hover:text-indigo-800">
+                  全选待复核 / 取消全选
+                </button>
+              </div>
+              <div class="flex items-center gap-2 flex-wrap mb-2">
+                <label class="text-xs text-gray-600">批量备注：</label>
+                <input type="text" v-model="batchReviewForm.remark" placeholder="所有选中记录统一写入此备注" class="flex-1 min-w-[200px] border rounded px-2 py-1 text-sm">
+                <button @click="doBatchReview('CONFIRMED')" class="bg-green-600 hover:bg-green-700 text-white px-4 py-1.5 rounded text-sm font-medium transition">
+                  批量确认
+                </button>
+                <button @click="doBatchReview('IGNORED')" class="bg-gray-500 hover:bg-gray-600 text-white px-4 py-1.5 rounded text-sm font-medium transition">
+                  批量忽略
+                </button>
+              </div>
+              <div v-if="batchConflictResult" class="bg-yellow-50 border border-yellow-200 rounded p-2 text-xs">
+                <div class="font-medium text-yellow-800 mb-1">
+                  批量操作结果：成功 {{ batchConflictResult.success_count }} 条，冲突 {{ batchConflictResult.conflict_count }} 条
+                </div>
+                <div v-for="c in batchConflictResult.conflicts" :key="c.id" class="text-yellow-700">
+                  · 对比记录 #{{ c.id }}：{{ c.reason }}
+                </div>
+              </div>
+            </div>
             <div v-if="comparisonHistory.length===0" class="text-center text-gray-400 py-6 bg-white rounded-lg border border-gray-100">暂无对比记录</div>
             <div v-for="c in comparisonHistory" :key="c.id" @click="loadComparisonDetail(c)" class="border rounded-lg p-3 mb-2 cursor-pointer hover:bg-gray-50 transition" :class="c.review_status==='CONFIRMED'?'border-green-200 bg-green-50/30':(c.review_status==='IGNORED'?'border-gray-200 bg-gray-50':'border-yellow-200 bg-yellow-50/30')">
               <div class="flex justify-between items-start mb-2">
                 <div class="flex items-center gap-2">
+                  <input v-if="c.review_status==='PENDING'" type="checkbox" :checked="selectedComparisonIds.has(c.id)" @click.stop="toggleComparisonSelect(c.id)" class="mt-0.5 w-4 h-4">
                   <span class="text-sm font-semibold text-gray-700">v{{ c.note_a_version }} → v{{ c.note_b_version }}</span>
                   <span :class="reviewStatusClass(c.review_status)">{{ reviewStatusLabel(c.review_status) }}</span>
                 </div>
@@ -321,6 +348,10 @@
               </div>
               <div v-if="c.review_remark" class="text-xs text-gray-500 bg-white/60 rounded px-2 py-1">
                 <span class="font-medium">备注：</span>{{ c.review_remark }}
+              </div>
+              <div class="mt-1 text-xs text-gray-500" v-if="c.reviewed_by">
+                <span class="font-medium">复核人：</span>{{ c.reviewed_by }}
+                <span v-if="c.reviewed_at" class="ml-2">{{ formatTime(c.reviewed_at) }}</span>
               </div>
             </div>
           </div>

@@ -20,6 +20,9 @@ createApp({
     const compareError = ref("");
     const compareForm = reactive({ noteAId: "", noteBId: "" });
     const reviewForm = reactive({ remark: "" });
+    const selectedComparisonIds = ref(new Set());
+    const batchReviewForm = reactive({ remark: "" });
+    const batchConflictResult = ref(null);
 
     const createForm = reactive({ name: "", tolerance_pct: 2.0, tolerance_abs: 100.0 });
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
@@ -40,6 +43,7 @@ createApp({
     const canRollback = computed(() => currentBatch.value && currentBatch.value.status === "POSTED");
     const canReset = computed(() => currentBatch.value && ["ROLLED_BACK", "FAILED"].includes(currentBatch.value.status));
     const canCompare = computed(() => compareForm.noteAId && compareForm.noteBId && compareForm.noteAId !== compareForm.noteBId);
+    const hasSelectedComparisons = computed(() => selectedComparisonIds.value.size > 0);
 
     function showToast(msg, type = "success") {
       toast.message = msg;
@@ -311,6 +315,68 @@ createApp({
       }
     }
 
+    function toggleComparisonSelect(id) {
+      const s = new Set(selectedComparisonIds.value);
+      if (s.has(id)) s.delete(id);
+      else s.add(id);
+      selectedComparisonIds.value = s;
+    }
+
+    function toggleSelectAllComparisons() {
+      const pending = comparisonHistory.value.filter(c => c.review_status === "PENDING");
+      const allSelected = pending.every(c => selectedComparisonIds.value.has(c.id));
+      const s = new Set(selectedComparisonIds.value);
+      if (allSelected) {
+        pending.forEach(c => s.delete(c.id));
+      } else {
+        pending.forEach(c => s.add(c.id));
+      }
+      selectedComparisonIds.value = s;
+    }
+
+    async function doBatchReview(status) {
+      if (selectedComparisonIds.value.size === 0) {
+        showToast("请先勾选要批量操作的记录", "error");
+        return;
+      }
+      batchConflictResult.value = null;
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/recalc-notes/comparisons/batch-review`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            comparison_ids: Array.from(selectedComparisonIds.value),
+            review_status: status,
+            review_remark: batchReviewForm.remark,
+            operator: "web_user",
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showToast(data.error || "批量复核操作失败", "error");
+          return;
+        }
+        if (data.conflict_count > 0) {
+          batchConflictResult.value = data;
+          showToast(`批量复核：成功 ${data.success_count} 条，冲突 ${data.conflict_count} 条`, data.success_count > 0 ? "success" : "error");
+        } else {
+          showToast(`批量复核成功，共 ${data.success_count} 条`);
+        }
+        selectedComparisonIds.value = new Set();
+        batchReviewForm.remark = "";
+        loadComparisons();
+        if (comparisonResult.value) {
+          const r = await fetch(`/api/batches/${currentBatch.value.id}/recalc-notes/comparisons/${comparisonResult.value.id}`);
+          if (r.ok) {
+            const d = await r.json();
+            comparisonResult.value = d.comparison;
+          }
+        }
+      } catch (e) {
+        showToast("网络错误: " + e.message, "error");
+      }
+    }
+
     function reviewStatusLabel(s) {
       const m = { PENDING: "待复核", CONFIRMED: "已确认", IGNORED: "已忽略" };
       return m[s] || s;
@@ -365,10 +431,12 @@ createApp({
       batchSummary, activeTab, showCreateModal, toast, tabs,
       createForm, toleranceForm, compareForm, reviewForm,
       recalcNotes, comparisonResult, comparisonHistory, comparisonFilter, compareError,
-      canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare,
+      selectedComparisonIds, batchReviewForm, batchConflictResult,
+      canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons,
       openBatch, createBatch, uploadFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
       exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
+      toggleComparisonSelect, toggleSelectAllComparisons, doBatchReview,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };
