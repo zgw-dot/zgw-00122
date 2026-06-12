@@ -13,6 +13,11 @@ createApp({
     const showCreateModal = ref(false);
     const toast = reactive({ show: false, message: "", type: "success" });
 
+    const recalcNotes = ref([]);
+    const comparisonResult = ref(null);
+    const compareError = ref("");
+    const compareForm = reactive({ noteAId: "", noteBId: "" });
+
     const createForm = reactive({ name: "", tolerance_pct: 2.0, tolerance_abs: 100.0 });
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
 
@@ -20,6 +25,7 @@ createApp({
       { key: "upload", label: "文件上传" },
       { key: "results", label: "匹配结果" },
       { key: "exceptions", label: "异常待确认" },
+      { key: "recalc-notes", label: "重算说明" },
       { key: "actions", label: "操作" },
       { key: "history", label: "历史记录" },
     ];
@@ -30,6 +36,7 @@ createApp({
     const canPost = computed(() => currentBatch.value && currentBatch.value.status === "CONFIRMED");
     const canRollback = computed(() => currentBatch.value && currentBatch.value.status === "POSTED");
     const canReset = computed(() => currentBatch.value && ["ROLLED_BACK", "FAILED"].includes(currentBatch.value.status));
+    const canCompare = computed(() => compareForm.noteAId && compareForm.noteBId && compareForm.noteAId !== compareForm.noteBId);
 
     function showToast(msg, type = "success") {
       toast.message = msg;
@@ -74,6 +81,11 @@ createApp({
       activeTab.value = "upload";
       matchResults.value = [];
       exceptions.value = [];
+      recalcNotes.value = [];
+      comparisonResult.value = null;
+      compareError.value = "";
+      compareForm.noteAId = "";
+      compareForm.noteBId = "";
     }
 
     async function createBatch() {
@@ -208,6 +220,44 @@ createApp({
       window.open(`/api/batches/${currentBatch.value.id}/export`, "_blank");
     }
 
+    async function loadRecalcNotes() {
+      const data = await api(`/api/batches/${currentBatch.value.id}/recalc-notes`);
+      if (data) {
+        recalcNotes.value = data.notes || [];
+      }
+    }
+
+    async function doCompare() {
+      compareError.value = "";
+      comparisonResult.value = null;
+      if (!canCompare.value) {
+        compareError.value = "请选择两个不同的版本进行对比";
+        return;
+      }
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/recalc-notes/compare`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            note_a_id: Number(compareForm.noteAId),
+            note_b_id: Number(compareForm.noteBId),
+            operator: "web_user",
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          compareError.value = data.error || "对比失败";
+          showToast(data.error || "对比失败", "error");
+          return;
+        }
+        comparisonResult.value = data.comparison;
+        showToast("对比完成");
+      } catch (e) {
+        compareError.value = "网络错误: " + e.message;
+        showToast("网络错误: " + e.message, "error");
+      }
+    }
+
     function statusLabel(s) {
       const m = { CREATED:"已创建", VALIDATING:"校验中", MATCHED:"已匹配", EXCEPTION_PENDING:"异常待确认", CONFIRMED:"已确认", POSTED:"已入账", ROLLED_BACK:"已回滚", FAILED:"失败" };
       return m[s] || s;
@@ -238,6 +288,7 @@ createApp({
       if (!currentBatch.value) return;
       if (tab === "results") loadResults();
       else if (tab === "exceptions") loadExceptions();
+      else if (tab === "recalc-notes") loadRecalcNotes();
     });
 
     onMounted(loadDashboard);
@@ -245,11 +296,13 @@ createApp({
     return {
       recentBatches, currentBatch, matchResults, exceptions, toleranceHistory, auditLogs,
       batchSummary, activeTab, showCreateModal, toast, tabs,
-      createForm, toleranceForm,
-      canUpload, canMatch, canConfirm, canPost, canRollback, canReset,
+      createForm, toleranceForm, compareForm,
+      recalcNotes, comparisonResult, compareError,
+      canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare,
       openBatch, createBatch, uploadFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
-      exportReport, statusLabel, statusClass, matchTypeLabel, matchTypeClass, formatTime,
+      exportReport, loadRecalcNotes, doCompare,
+      statusLabel, statusClass, matchTypeLabel, matchTypeClass, formatTime,
       showToast,
     };
   },

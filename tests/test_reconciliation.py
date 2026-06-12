@@ -1039,3 +1039,103 @@ def test_comparison_persists_across_restart(client, sample_dir, tmp_path):
     with app2.app_context():
         db.session.remove()
         db.drop_all()
+
+
+# ---------- 前端/页面入口 测试 ----------
+
+def test_recalc_notes_frontend_api_flow(client, sample_dir):
+    """模拟前端调用流程：列表 → 选两个版本 → 对比 → 展示结果"""
+    bid = create_batch(client, "test-frontend-flow")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    exs = get_exceptions(client, bid)
+    if exs:
+        exc0 = exs[0]
+        r = client.put(
+            f"/api/batches/{bid}/exceptions/{exc0['id']}/remark",
+            json={"remarks": "前端测试备注"},
+        )
+        assert r.status_code == 200
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes")
+    assert r.status_code == 200
+    notes = r.get_json()["notes"]
+    assert len(notes) >= 2, f"需要至少 2 个版本，实际 {len(notes)}"
+    assert "id" in notes[0]
+    assert "version" in notes[0]
+    assert "current_total" in notes[0]
+    assert "change_source" in notes[0]
+
+    n1 = notes[0]
+    n2 = notes[-1]
+
+    r = client.post(
+        f"/api/batches/{bid}/recalc-notes/compare",
+        json={"note_a_id": n1["id"], "note_b_id": n2["id"], "operator": "web_user"},
+    )
+    assert r.status_code == 200
+    comp = r.get_json()["comparison"]
+    assert comp["operator"] == "web_user"
+    assert comp["note_a_version"] == n1["version"]
+    assert comp["note_b_version"] == n2["version"]
+    assert "amount_diff" in comp
+    assert "change_source" in comp
+    assert "po_added" in comp
+    assert "po_removed" in comp
+    assert "po_changed" in comp
+    assert "invoice_added" in comp
+    assert "invoice_removed" in comp
+    assert "invoice_changed" in comp
+    assert "rule_version_a" in comp
+    assert "rule_version_b" in comp
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons")
+    assert r.status_code == 200
+    comps = r.get_json()["comparisons"]
+    assert len(comps) >= 1
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/latest")
+    assert r.status_code == 200
+    latest = r.get_json()["comparison"]
+    assert latest["id"] == comp["id"]
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comp['id']}")
+    assert r.status_code == 200
+    fetched = r.get_json()["comparison"]
+    assert fetched["id"] == comp["id"]
+
+
+def test_index_page_has_recalc_notes_tab(client):
+    """首页 HTML 包含重算说明 tab 入口，前端漏接问题不复现"""
+    r = client.get("/")
+    assert r.status_code == 200
+    html = r.data.decode("utf-8")
+    assert "重算说明" in html, "页面应包含'重算说明'tab"
+    assert "版本对比" in html, "页面应包含'版本对比'区域"
+    assert "recalc-notes" in html, "页面应包含 recalc-notes tab key"
+    assert "开始对比" in html, "页面应包含对比按钮"
+    assert "应付差额" in html, "页面应展示应付差额"
+    assert "变化来源" in html, "页面应展示变化来源"
+    assert "说明版本历史" in html, "页面应包含说明版本历史"
+
+
+def test_frontend_compare_error_handling_client_friendly(client, sample_dir):
+    """前端对比接口的错误返回对用户友好（400 JSON，含 error 字段）"""
+    bid = create_batch(client, "test-frontend-error")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    notes = list_notes(client, bid)
+    assert len(notes) >= 1
+    n1 = notes[0]
+
+    r = client.post(
+        f"/api/batches/{bid}/recalc-notes/compare",
+        json={"note_a_id": n1["id"], "note_b_id": n1["id"]},
+    )
+    assert r.status_code == 400
+    body = r.get_json()
+    assert "error" in body
+    assert isinstance(body["error"], str)
+    assert len(body["error"]) > 0
+    assert "traceback" not in body, "错误信息不应暴露 traceback"
+    assert "NameError" not in body.get("error", ""), "错误信息不应暴露 NameError"
