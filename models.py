@@ -90,7 +90,7 @@ class Batch(db.Model):
 
     @property
     def summary(self):
-        matched = [r for r in self.match_results if r.match_type in (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE)]
+        matched = [r for r in self.match_results if r.match_type in (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)]
         unmatched_po = [r for r in self.match_results if r.match_type == MATCH_TYPE_UNMATCHED_PO]
         unmatched_inv = [r for r in self.match_results if r.match_type == MATCH_TYPE_UNMATCHED_INVOICE]
         exceptions = [e for e in self.exception_items if e.status == EXCEPTION_STATUS_PENDING]
