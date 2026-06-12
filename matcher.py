@@ -890,6 +890,11 @@ def update_comparison_review(comparison_id, review_status, review_remark=None, o
             return None, "该对比记录已确认，不允许重复确认"
         if comparison.review_status == REVIEW_STATUS_IGNORED:
             return None, "该对比记录已忽略，不允许直接确认"
+    if review_status == REVIEW_STATUS_IGNORED:
+        if comparison.review_status == REVIEW_STATUS_CONFIRMED:
+            return None, "该对比记录已确认，不允许直接忽略"
+        if comparison.review_status == REVIEW_STATUS_IGNORED:
+            return None, "该对比记录已忽略，不允许重复忽略"
 
     comparison.review_status = review_status
     comparison.review_remark = review_remark
@@ -973,6 +978,9 @@ def batch_update_comparison_review(batch_id, comparison_ids, review_status, revi
                 conflicts.append({"id": cid, "reason": "该对比记录已忽略，不允许直接确认"})
                 continue
         if review_status == REVIEW_STATUS_IGNORED:
+            if comparison.review_status == REVIEW_STATUS_CONFIRMED:
+                conflicts.append({"id": cid, "reason": "该对比记录已确认，不允许直接忽略"})
+                continue
             if comparison.review_status == REVIEW_STATUS_IGNORED:
                 conflicts.append({"id": cid, "reason": "该对比记录已忽略，不允许重复忽略"})
                 continue

@@ -1703,6 +1703,105 @@ def test_batch_review_ignored_conflicts(client, sample_dir):
     assert "重复忽略" in body["conflicts"][0]["reason"]
 
 
+def test_batch_review_confirmed_should_not_be_overwritten_by_ignore(client, sample_dir):
+    """回归测试：已确认的对比记录再被批量忽略时必须进 conflicts，原状态/备注/复核人/时间都不能被覆盖。
+
+    同时覆盖：已忽略再批量确认、已忽略重复忽略、正常 PENDING 批量处理不受影响。
+    """
+    bid = create_batch(client, "test-batch-confirmed-not-overwritten")
+    comps = create_multiple_comparisons(client, bid, sample_dir, count=3)
+
+    r = review_comparison_api(client, bid, comps[0]["id"], "CONFIRMED", remark="原确认备注", operator="original_confirmer")
+    assert r.status_code == 200
+    c0_before = r.get_json()["comparison"]
+    saved_c0_status = c0_before["review_status"]
+    saved_c0_remark = c0_before["review_remark"]
+    saved_c0_reviewer = c0_before["reviewed_by"]
+    saved_c0_time = c0_before["reviewed_at"]
+    assert saved_c0_status == "CONFIRMED"
+    assert saved_c0_remark == "原确认备注"
+    assert saved_c0_reviewer == "original_confirmer"
+    assert saved_c0_time is not None
+
+    review_comparison_api(client, bid, comps[1]["id"], "IGNORED", remark="原忽略备注", operator="original_ignorer")
+    c1_before = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comps[1]['id']}").get_json()["comparison"]
+    saved_c1_status = c1_before["review_status"]
+    saved_c1_remark = c1_before["review_remark"]
+    saved_c1_reviewer = c1_before["reviewed_by"]
+    saved_c1_time = c1_before["reviewed_at"]
+
+    # --- 场景 A：批量忽略（已确认 + 已忽略 + 待复核 混合）---
+    r = batch_review_api(
+        client, bid,
+        [comps[0]["id"], comps[1]["id"], comps[2]["id"]],
+        "IGNORED",
+        remark="批量忽略恶意覆盖",
+        operator="bad_actor",
+    )
+    assert r.status_code == 200
+    body = r.get_json()
+
+    assert body["success_count"] == 1, f"只有 PENDING 的 comps[2] 应成功，实际成功 {body['success_count']} 条"
+    assert body["conflict_count"] == 2, f"已确认和已忽略都应冲突，实际冲突 {body['conflict_count']} 条"
+    conflict_map = {c["id"]: c["reason"] for c in body["conflicts"]}
+
+    assert comps[0]["id"] in conflict_map, "已确认记录批量忽略必须进 conflicts"
+    assert "已确认" in conflict_map[comps[0]["id"]], f"冲突原因应提示已确认，实际: {conflict_map[comps[0]['id']]}"
+    assert comps[1]["id"] in conflict_map, "已忽略记录批量忽略必须进 conflicts（重复忽略）"
+    assert set(body["success_ids"]) == {comps[2]["id"]}, "只有 PENDING 记录能成功批量忽略"
+
+    c0_after = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comps[0]['id']}").get_json()["comparison"]
+    assert c0_after["review_status"] == saved_c0_status, "已确认记录的状态不应被批量忽略覆盖"
+    assert c0_after["review_remark"] == saved_c0_remark, "已确认记录的备注不应被批量忽略覆盖"
+    assert c0_after["reviewed_by"] == saved_c0_reviewer, "已确认记录的复核人不应被批量忽略覆盖"
+    assert c0_after["reviewed_at"] == saved_c0_time, "已确认记录的复核时间不应被批量忽略覆盖"
+
+    c1_after = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comps[1]['id']}").get_json()["comparison"]
+    assert c1_after["review_status"] == saved_c1_status, "已忽略记录的状态不应被覆盖"
+    assert c1_after["review_remark"] == saved_c1_remark, "已忽略记录的备注不应被覆盖"
+    assert c1_after["reviewed_by"] == saved_c1_reviewer, "已忽略记录的复核人不应被覆盖"
+    assert c1_after["reviewed_at"] == saved_c1_time, "已忽略记录的复核时间不应被覆盖"
+
+    c2_after = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comps[2]['id']}").get_json()["comparison"]
+    assert c2_after["review_status"] == "IGNORED", "PENDING 记录批量忽略应成功"
+    assert c2_after["review_remark"] == "批量忽略恶意覆盖"
+    assert c2_after["reviewed_by"] == "bad_actor"
+
+    # --- 场景 B：批量确认（已确认 + 已忽略 + 待复核）---
+    # 重置 comps[2] 回 PENDING 用于测试
+    review_comparison_api(client, bid, comps[2]["id"], "PENDING", remark="重置回待复核")
+
+    r = batch_review_api(
+        client, bid,
+        [comps[0]["id"], comps[1]["id"], comps[2]["id"]],
+        "CONFIRMED",
+        remark="批量确认测试",
+        operator="confirm_user",
+    )
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["success_count"] == 1, "只有 PENDING 的 comps[2] 应批量确认成功"
+    assert body["conflict_count"] == 2
+    conflict_map_b = {c["id"]: c["reason"] for c in body["conflicts"]}
+    assert "已确认" in conflict_map_b[comps[0]["id"]], "已确认→批量确认应冲突（重复确认）"
+    assert "已忽略" in conflict_map_b[comps[1]["id"]], "已忽略→批量确认应冲突"
+
+    c0_final = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comps[0]['id']}").get_json()["comparison"]
+    assert c0_final["review_status"] == "CONFIRMED"
+    assert c0_final["review_remark"] == "原确认备注"
+    assert c0_final["reviewed_by"] == "original_confirmer"
+
+    # --- 场景 C：CSV 导出应只包含最近一次已确认对比（不受批量忽略影响）---
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+    csv_content = r.data.decode("utf-8-sig")
+    assert "批量确认测试" in csv_content, "导出应包含最近一次（场景 B 批量确认 comps[2]）的备注"
+    assert "confirm_user" in csv_content, "导出应包含最近一次确认人"
+    assert "批量忽略恶意覆盖" not in csv_content, "导出不应混入批量忽略阶段的内容"
+    assert "bad_actor" not in csv_content, "导出不应包含批量忽略操作人"
+    assert "原确认备注" not in csv_content, "导出只取最近一次已确认对比，不应包含更早的 comps[0] 备注"
+
+
 def test_batch_review_persists_across_restart(client, sample_dir, tmp_path):
     """跨重启持久化：批量复核后的状态、备注、复核人、时间在重启后仍可查"""
     from app import create_app
