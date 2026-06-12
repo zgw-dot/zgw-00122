@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+from datetime import datetime, timezone
 from models import (
     db, Batch, PurchaseOrder, Invoice, MatchResult, ExceptionItem,
     ToleranceHistory, AuditLog, PayableRecalcNote, NoteComparison,
@@ -11,6 +12,7 @@ from models import (
     EXCEPTION_MISSING_FIELD, EXCEPTION_OVER_TOLERANCE,
     EXCEPTION_DUPLICATE_INVOICE,
     EXCEPTION_STATUS_PENDING, RESULT_STATUS_PENDING, RESULT_STATUS_REJECTED,
+    REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED,
     compute_rule_version, compute_note_content_hash,
 )
 
@@ -850,3 +852,64 @@ def list_comparisons(batch_id):
 def get_comparison(comparison_id):
     """按ID获取版本对比结果"""
     return NoteComparison.query.get(comparison_id)
+
+
+def list_comparisons_with_filter(batch_id, review_status=None):
+    """列出指定批次的版本对比结果，支持按复核状态筛选"""
+    query = NoteComparison.query.filter_by(batch_id=batch_id)
+    if review_status:
+        query = query.filter_by(review_status=review_status)
+    return query.order_by(NoteComparison.created_at.desc()).all()
+
+
+def get_latest_confirmed_comparison(batch_id):
+    """获取指定批次最近一次已确认的版本对比"""
+    return (
+        NoteComparison.query.filter_by(batch_id=batch_id, review_status=REVIEW_STATUS_CONFIRMED)
+        .order_by(NoteComparison.reviewed_at.desc())
+        .first()
+    )
+
+
+def update_comparison_review(comparison_id, review_status, review_remark=None, operator="user"):
+    """
+    更新对比记录的复核状态和备注。
+
+    返回 (comparison_obj, error_message)。
+    冲突场景：
+    - 对比记录不存在 → 400
+    - 已确认后再确认 → 400（重复确认）
+    - 已忽略后再确认 → 400（需先恢复待复核？这里按需求直接返回冲突）
+    """
+    comparison = NoteComparison.query.get(comparison_id)
+    if not comparison:
+        return None, "对比记录不存在"
+
+    if review_status == REVIEW_STATUS_CONFIRMED:
+        if comparison.review_status == REVIEW_STATUS_CONFIRMED:
+            return None, "该对比记录已确认，不允许重复确认"
+        if comparison.review_status == REVIEW_STATUS_IGNORED:
+            return None, "该对比记录已忽略，不允许直接确认"
+
+    comparison.review_status = review_status
+    comparison.review_remark = review_remark
+    comparison.reviewed_by = operator
+    comparison.reviewed_at = datetime.now(timezone.utc)
+
+    status_label = {
+        REVIEW_STATUS_PENDING: "待复核",
+        REVIEW_STATUS_CONFIRMED: "已确认",
+        REVIEW_STATUS_IGNORED: "已忽略",
+    }.get(review_status, review_status)
+
+    log = AuditLog(
+        batch_id=comparison.batch_id,
+        action=f"REVIEW_COMPARISON_{review_status}",
+        detail=f"对比记录 #{comparison_id} 复核状态更新为 {status_label}"
+               + (f"，备注: {review_remark}" if review_remark else ""),
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return comparison, None

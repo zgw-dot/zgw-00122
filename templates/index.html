@@ -202,7 +202,12 @@
               </div>
               <div v-if="comparisonResult" class="mt-4 fade-in">
                 <div class="bg-white rounded-lg border border-indigo-200 p-4">
-                  <h4 class="font-semibold text-indigo-700 mb-3">对比结果</h4>
+                  <div class="flex items-center justify-between mb-3">
+                    <h4 class="font-semibold text-indigo-700">对比结果</h4>
+                    <span :class="reviewStatusClass(comparisonResult.review_status)">
+                      {{ reviewStatusLabel(comparisonResult.review_status) }}
+                    </span>
+                  </div>
                   <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
                     <div class="bg-gray-50 rounded p-3 text-center">
                       <div class="text-lg font-bold" :class="comparisonResult.amount_diff>0?'text-red-600':(comparisonResult.amount_diff<0?'text-green-600':'text-gray-700')">
@@ -228,7 +233,7 @@
                     <span class="text-sm font-medium text-gray-600">变化来源：</span>
                     <span class="text-sm text-gray-700">{{ comparisonResult.change_source || '无' }}</span>
                   </div>
-                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                     <div>
                       <h5 class="text-sm font-medium text-gray-700 mb-2">采购单变动</h5>
                       <div v-if="comparisonResult.po_added?.length" class="mb-2">
@@ -262,7 +267,60 @@
                       <div v-if="!comparisonResult.invoice_added?.length && !comparisonResult.invoice_removed?.length && !comparisonResult.invoice_changed?.length" class="text-xs text-gray-400">无变动</div>
                     </div>
                   </div>
+                  <div class="border-t border-gray-100 pt-4">
+                    <h5 class="text-sm font-medium text-gray-700 mb-2">复核操作</h5>
+                    <div class="mb-3">
+                      <label class="block text-xs text-gray-500 mb-1">复核备注</label>
+                      <textarea v-model="reviewForm.remark" rows="2" class="w-full border rounded px-3 py-2 text-sm" placeholder="请输入复核备注..."></textarea>
+                    </div>
+                    <div class="flex gap-2">
+                      <button @click="doReview('CONFIRMED')" :disabled="comparisonResult.review_status==='CONFIRMED'" class="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 text-white px-4 py-2 rounded text-sm font-medium transition">
+                        确认
+                      </button>
+                      <button @click="doReview('IGNORED')" :disabled="comparisonResult.review_status==='IGNORED'" class="bg-gray-500 hover:bg-gray-600 disabled:bg-gray-300 text-white px-4 py-2 rounded text-sm font-medium transition">
+                        忽略
+                      </button>
+                      <button @click="doReview('PENDING')" :disabled="comparisonResult.review_status==='PENDING'" class="bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-300 text-white px-4 py-2 rounded text-sm font-medium transition">
+                        重置待复核
+                      </button>
+                    </div>
+                    <div v-if="comparisonResult.review_remark" class="mt-3 text-sm text-gray-600 bg-gray-50 rounded p-2">
+                      <span class="font-medium">当前备注：</span>{{ comparisonResult.review_remark }}
+                    </div>
+                  </div>
                 </div>
+              </div>
+            </div>
+          </div>
+          <div class="mb-6">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="font-medium text-gray-700">历史对比记录</h3>
+              <div class="flex items-center gap-2">
+                <label class="text-xs text-gray-500">状态筛选：</label>
+                <select v-model="comparisonFilter" @change="loadComparisons" class="border rounded px-2 py-1 text-xs">
+                  <option value="">全部</option>
+                  <option value="PENDING">待复核</option>
+                  <option value="CONFIRMED">已确认</option>
+                  <option value="IGNORED">已忽略</option>
+                </select>
+              </div>
+            </div>
+            <div v-if="comparisonHistory.length===0" class="text-center text-gray-400 py-6 bg-white rounded-lg border border-gray-100">暂无对比记录</div>
+            <div v-for="c in comparisonHistory" :key="c.id" @click="loadComparisonDetail(c)" class="border rounded-lg p-3 mb-2 cursor-pointer hover:bg-gray-50 transition" :class="c.review_status==='CONFIRMED'?'border-green-200 bg-green-50/30':(c.review_status==='IGNORED'?'border-gray-200 bg-gray-50':'border-yellow-200 bg-yellow-50/30')">
+              <div class="flex justify-between items-start mb-2">
+                <div class="flex items-center gap-2">
+                  <span class="text-sm font-semibold text-gray-700">v{{ c.note_a_version }} → v{{ c.note_b_version }}</span>
+                  <span :class="reviewStatusClass(c.review_status)">{{ reviewStatusLabel(c.review_status) }}</span>
+                </div>
+                <span class="text-xs text-gray-400">{{ formatTime(c.created_at) }}</span>
+              </div>
+              <div class="flex gap-4 text-xs text-gray-600 mb-2">
+                <span>应付差额: <span :class="c.amount_diff>0?'text-red-600':(c.amount_diff<0?'text-green-600':'')">{{ c.amount_diff>0?'+':'' }}{{ c.amount_diff.toFixed(2) }}</span></span>
+                <span>变化来源: {{ c.change_source || '无' }}</span>
+                <span>操作人: {{ c.operator || '-' }}</span>
+              </div>
+              <div v-if="c.review_remark" class="text-xs text-gray-500 bg-white/60 rounded px-2 py-1">
+                <span class="font-medium">备注：</span>{{ c.review_remark }}
               </div>
             </div>
           </div>

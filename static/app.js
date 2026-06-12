@@ -15,8 +15,11 @@ createApp({
 
     const recalcNotes = ref([]);
     const comparisonResult = ref(null);
+    const comparisonHistory = ref([]);
+    const comparisonFilter = ref("");
     const compareError = ref("");
     const compareForm = reactive({ noteAId: "", noteBId: "" });
+    const reviewForm = reactive({ remark: "" });
 
     const createForm = reactive({ name: "", tolerance_pct: 2.0, tolerance_abs: 100.0 });
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
@@ -83,9 +86,12 @@ createApp({
       exceptions.value = [];
       recalcNotes.value = [];
       comparisonResult.value = null;
+      comparisonHistory.value = [];
+      comparisonFilter.value = "";
       compareError.value = "";
       compareForm.noteAId = "";
       compareForm.noteBId = "";
+      reviewForm.remark = "";
     }
 
     async function createBatch() {
@@ -225,6 +231,7 @@ createApp({
       if (data) {
         recalcNotes.value = data.notes || [];
       }
+      loadComparisons();
     }
 
     async function doCompare() {
@@ -251,11 +258,71 @@ createApp({
           return;
         }
         comparisonResult.value = data.comparison;
+        reviewForm.remark = data.comparison.review_remark || "";
         showToast("对比完成");
+        loadComparisons();
       } catch (e) {
         compareError.value = "网络错误: " + e.message;
         showToast("网络错误: " + e.message, "error");
       }
+    }
+
+    async function loadComparisons() {
+      if (!currentBatch.value) return;
+      let url = `/api/batches/${currentBatch.value.id}/recalc-notes/comparisons`;
+      if (comparisonFilter.value) {
+        url += `?review_status=${comparisonFilter.value}`;
+      }
+      const data = await api(url);
+      if (data) {
+        comparisonHistory.value = data.comparisons || [];
+      }
+    }
+
+    function loadComparisonDetail(c) {
+      comparisonResult.value = c;
+      reviewForm.remark = c.review_remark || "";
+      compareForm.noteAId = String(c.note_a_id);
+      compareForm.noteBId = String(c.note_b_id);
+    }
+
+    async function doReview(status) {
+      if (!comparisonResult.value) return;
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/recalc-notes/comparisons/${comparisonResult.value.id}/review`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            review_status: status,
+            review_remark: reviewForm.remark,
+            operator: "web_user",
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showToast(data.error || "复核操作失败", "error");
+          return;
+        }
+        comparisonResult.value = data.comparison;
+        showToast("复核操作成功");
+        loadComparisons();
+      } catch (e) {
+        showToast("网络错误: " + e.message, "error");
+      }
+    }
+
+    function reviewStatusLabel(s) {
+      const m = { PENDING: "待复核", CONFIRMED: "已确认", IGNORED: "已忽略" };
+      return m[s] || s;
+    }
+
+    function reviewStatusClass(s) {
+      const m = {
+        PENDING: "bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-xs font-semibold",
+        CONFIRMED: "bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs font-semibold",
+        IGNORED: "bg-gray-200 text-gray-600 px-2 py-0.5 rounded text-xs font-semibold",
+      };
+      return m[s] || "bg-gray-100 text-gray-700 px-2 py-0.5 rounded text-xs font-semibold";
     }
 
     function statusLabel(s) {
@@ -296,13 +363,13 @@ createApp({
     return {
       recentBatches, currentBatch, matchResults, exceptions, toleranceHistory, auditLogs,
       batchSummary, activeTab, showCreateModal, toast, tabs,
-      createForm, toleranceForm, compareForm,
-      recalcNotes, comparisonResult, compareError,
+      createForm, toleranceForm, compareForm, reviewForm,
+      recalcNotes, comparisonResult, comparisonHistory, comparisonFilter, compareError,
       canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare,
       openBatch, createBatch, uploadFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
-      exportReport, loadRecalcNotes, doCompare,
-      statusLabel, statusClass, matchTypeLabel, matchTypeClass, formatTime,
+      exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
+      statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };
   },

@@ -44,6 +44,10 @@ RESULT_STATUS_PENDING = "PENDING"
 RESULT_STATUS_CONFIRMED = "CONFIRMED"
 RESULT_STATUS_REJECTED = "REJECTED"
 
+REVIEW_STATUS_PENDING = "PENDING"
+REVIEW_STATUS_CONFIRMED = "CONFIRMED"
+REVIEW_STATUS_IGNORED = "IGNORED"
+
 
 def compute_rule_version(tolerance_pct, tolerance_abs):
     raw = f"{tolerance_pct}:{tolerance_abs}"
@@ -338,6 +342,10 @@ class NoteComparison(db.Model):
     operator = db.Column(db.String(100), default="system")
     comparison_summary = db.Column(db.Text)
     detail = db.Column(db.Text)
+    review_status = db.Column(db.String(20), default=REVIEW_STATUS_PENDING)
+    review_remark = db.Column(db.Text)
+    reviewed_by = db.Column(db.String(100))
+    reviewed_at = db.Column(db.DateTime)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     batch = db.relationship("Batch", backref="note_comparisons")
@@ -364,6 +372,10 @@ class NoteComparison(db.Model):
             "rule_version_b": self.rule_version_b,
             "operator": self.operator,
             "comparison_summary": self.comparison_summary,
+            "review_status": self.review_status,
+            "review_remark": self.review_remark,
+            "reviewed_by": self.reviewed_by,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

@@ -10,12 +10,15 @@ from models import (
     BATCH_STATUS_ROLLED_BACK, BATCH_STATUS_FAILED,
     EXCEPTION_STATUS_PENDING, EXCEPTION_STATUS_RESOLVED,
     RESULT_STATUS_PENDING, RESULT_STATUS_CONFIRMED, RESULT_STATUS_REJECTED,
+    REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED,
     VALID_TRANSITIONS, compute_rule_version, init_db,
 )
 from matcher import (
     process_batch, validate_and_import_po, validate_and_import_invoice, ValidationError,
     generate_payable_recalc_note, get_latest_recalc_note, list_recalc_notes,
     compare_notes, get_latest_comparison, list_comparisons, get_comparison,
+    list_comparisons_with_filter, get_latest_confirmed_comparison,
+    update_comparison_review,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -403,7 +406,14 @@ def compare_recalc_notes(batch_id):
 @bp.route("/api/batches/<int:batch_id>/recalc-notes/comparisons", methods=["GET"])
 def list_batch_comparisons(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    comparisons = list_comparisons(batch_id)
+    review_status = request.args.get("review_status")
+    if review_status:
+        valid_statuses = {REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED}
+        if review_status not in valid_statuses:
+            return jsonify({"error": f"无效的复核状态: {review_status}"}), 400
+        comparisons = list_comparisons_with_filter(batch_id, review_status=review_status)
+    else:
+        comparisons = list_comparisons(batch_id)
     return jsonify({"comparisons": [c.to_dict() for c in comparisons]})
 
 
@@ -427,13 +437,37 @@ def get_batch_comparison(batch_id, comparison_id):
     return jsonify({"comparison": comparison.to_dict()})
 
 
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/comparisons/<int:comparison_id>/review", methods=["PUT"])
+def review_comparison(batch_id, comparison_id):
+    batch = Batch.query.get_or_404(batch_id)
+    comparison = get_comparison(comparison_id)
+    if comparison is None:
+        return jsonify({"error": "对比记录不存在"}), 404
+    if comparison.batch_id != batch_id:
+        return jsonify({"error": "对比记录不属于该批次"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    review_status = payload.get("review_status")
+    review_remark = payload.get("review_remark", "")
+    operator = payload.get("operator", "user")
+
+    valid_statuses = {REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED}
+    if review_status not in valid_statuses:
+        return jsonify({"error": f"无效的复核状态: {review_status}"}), 400
+
+    updated, err = update_comparison_review(comparison_id, review_status, review_remark, operator=operator)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"comparison": updated.to_dict()})
+
+
 @bp.route("/api/batches/<int:batch_id>/export", methods=["GET"])
 def export_report(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     results = MatchResult.query.filter_by(batch_id=batch_id).all()
     exceptions = ExceptionItem.query.filter_by(batch_id=batch_id).all()
     latest_note = get_latest_recalc_note(batch_id)
-    latest_comparison = get_latest_comparison(batch_id)
+    latest_confirmed_comparison = get_latest_confirmed_comparison(batch_id)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -483,10 +517,12 @@ def export_report(batch_id):
         if latest_note.previous_total is not None:
             writer.writerow(["上一次应付合计", latest_note.previous_total])
             writer.writerow(["应付差额", latest_note.amount_diff])
-    if latest_comparison:
-        writer.writerow(["最近对比摘要", latest_comparison.comparison_summary or ""])
-        writer.writerow(["对比版本", f"v{latest_comparison.note_a_version} → v{latest_comparison.note_b_version}"])
-        writer.writerow(["对比操作人", latest_comparison.operator or ""])
+    if latest_confirmed_comparison:
+        writer.writerow(["最近已确认对比摘要", latest_confirmed_comparison.comparison_summary or ""])
+        writer.writerow(["对比版本", f"v{latest_confirmed_comparison.note_a_version} → v{latest_confirmed_comparison.note_b_version}"])
+        writer.writerow(["对比操作人", latest_confirmed_comparison.operator or ""])
+        writer.writerow(["复核人", latest_confirmed_comparison.reviewed_by or ""])
+        writer.writerow(["复核备注", latest_confirmed_comparison.review_remark or ""])
 
     output.seek(0)
     filename = f"reconciliation_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"

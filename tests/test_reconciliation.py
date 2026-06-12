@@ -889,7 +889,7 @@ def test_version_comparison_invalid_cases_return_400(client, sample_dir):
 
 
 def test_export_includes_comparison_summary(client, sample_dir):
-    """CSV 汇总区包含最近一次对比摘要，导出金额仍和批次详情一致。"""
+    """CSV 汇总区只包含最近一次已确认对比的摘要，待复核/已忽略的不混入，导出金额仍和批次详情一致。"""
     bid = create_batch(client, "test-export-compare-summary")
     match_and_resolve_all(client, bid, sample_dir)
 
@@ -913,6 +913,21 @@ def test_export_includes_comparison_summary(client, sample_dir):
 
     api_payable = get_batch(client, bid)["summary"]["payable_total"]
 
+    r_before = client.get(f"/api/batches/{bid}/export")
+    assert r_before.status_code == 200
+    with io.StringIO(r_before.data.decode("utf-8-sig")) as f:
+        rows_before = list(csv.reader(f))
+    has_old_field = any(row and row[0] == "最近对比摘要" for row in rows_before)
+    has_confirmed_field_before = any(row and row[0] == "最近已确认对比摘要" for row in rows_before)
+    assert not has_old_field, "未确认的对比不应导出'最近对比摘要'"
+    assert not has_confirmed_field_before, "未确认的对比不应导出'最近已确认对比摘要'"
+
+    r_review = client.put(
+        f"/api/batches/{bid}/recalc-notes/comparisons/{comp['id']}/review",
+        json={"review_status": "CONFIRMED", "review_remark": "财务已复核", "operator": "finance_reviewer"},
+    )
+    assert r_review.status_code == 200
+
     r = client.get(f"/api/batches/{bid}/export")
     assert r.status_code == 200
 
@@ -924,6 +939,8 @@ def test_export_includes_comparison_summary(client, sample_dir):
     exported_compare_summary = None
     exported_compare_versions = None
     exported_compare_operator = None
+    exported_reviewer = None
+    exported_review_remark = None
 
     for row in rows:
         if not row:
@@ -933,12 +950,16 @@ def test_export_includes_comparison_summary(client, sample_dir):
             continue
         if in_summary and row[0] == "应付合计":
             exported_payable = float(row[1])
-        if in_summary and row[0] == "最近对比摘要":
+        if in_summary and row[0] == "最近已确认对比摘要":
             exported_compare_summary = row[1] if len(row) > 1 else ""
         if in_summary and row[0] == "对比版本":
             exported_compare_versions = row[1] if len(row) > 1 else ""
         if in_summary and row[0] == "对比操作人":
             exported_compare_operator = row[1] if len(row) > 1 else ""
+        if in_summary and row[0] == "复核人":
+            exported_reviewer = row[1] if len(row) > 1 else ""
+        if in_summary and row[0] == "复核备注":
+            exported_review_remark = row[1] if len(row) > 1 else ""
 
     assert exported_payable is not None, "导出应含应付合计"
     assert exported_payable == api_payable, (
@@ -949,6 +970,8 @@ def test_export_includes_comparison_summary(client, sample_dir):
     )
     assert exported_compare_versions == f"v{comp['note_a_version']} → v{comp['note_b_version']}"
     assert exported_compare_operator == "export_test"
+    assert exported_reviewer == "finance_reviewer", "导出应含复核人"
+    assert exported_review_remark == "财务已复核", "导出应含复核备注"
 
 
 def test_comparison_persists_across_restart(client, sample_dir, tmp_path):
@@ -1139,3 +1162,375 @@ def test_frontend_compare_error_handling_client_friendly(client, sample_dir):
     assert len(body["error"]) > 0
     assert "traceback" not in body, "错误信息不应暴露 traceback"
     assert "NameError" not in body.get("error", ""), "错误信息不应暴露 NameError"
+
+
+# ---------- 复核记录 测试辅助函数 ----------
+
+def review_comparison_api(client, bid, comp_id, status, remark="", operator="test_reviewer"):
+    r = client.put(
+        f"/api/batches/{bid}/recalc-notes/comparisons/{comp_id}/review",
+        json={"review_status": status, "review_remark": remark, "operator": operator},
+    )
+    return r
+
+
+def create_two_notes_and_compare(client, bid, sample_dir):
+    """创建两个版本并对比，返回对比记录"""
+    match_and_resolve_all(client, bid, sample_dir)
+    exs = get_exceptions(client, bid)
+    if exs:
+        exc0 = exs[0]
+        client.put(
+            f"/api/batches/{bid}/exceptions/{exc0['id']}/remark",
+            json={"remarks": "触发v2的备注"},
+        )
+    notes = list_notes(client, bid)
+    assert len(notes) >= 2
+    r = compare_notes_api(client, bid, notes[0]["id"], notes[-1]["id"])
+    assert r.status_code == 200
+    return r.get_json()["comparison"]
+
+
+# ---------- 复核记录 测试用例 ----------
+
+def test_review_comparison_basic_flow(client, sample_dir):
+    """复核基本流程：待复核 → 已确认，状态和备注写入数据库"""
+    bid = create_batch(client, "test-review-basic")
+    comp = create_two_notes_and_compare(client, bid, sample_dir)
+
+    assert comp["review_status"] == "PENDING", "新建对比应为待复核状态"
+    assert comp["review_remark"] is None or comp["review_remark"] == ""
+    assert comp["reviewed_by"] is None
+    assert comp["reviewed_at"] is None
+
+    r = review_comparison_api(client, bid, comp["id"], "CONFIRMED", remark="财务确认无误", operator="finance_zhang")
+    assert r.status_code == 200, f"确认失败: {r.data}"
+    updated = r.get_json()["comparison"]
+
+    assert updated["review_status"] == "CONFIRMED"
+    assert updated["review_remark"] == "财务确认无误"
+    assert updated["reviewed_by"] == "finance_zhang"
+    assert updated["reviewed_at"] is not None
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comp['id']}")
+    assert r.status_code == 200
+    fetched = r.get_json()["comparison"]
+    assert fetched["review_status"] == "CONFIRMED"
+    assert fetched["review_remark"] == "财务确认无误"
+    assert fetched["reviewed_by"] == "finance_zhang"
+
+
+def test_review_comparison_conflict_duplicate_confirm(client, sample_dir):
+    """冲突场景：已确认后再确认 → 返回 400 错误"""
+    bid = create_batch(client, "test-review-conflict-confirm")
+    comp = create_two_notes_and_compare(client, bid, sample_dir)
+
+    r = review_comparison_api(client, bid, comp["id"], "CONFIRMED", remark="第一次确认")
+    assert r.status_code == 200
+
+    r = review_comparison_api(client, bid, comp["id"], "CONFIRMED", remark="重复确认")
+    assert r.status_code == 400, f"重复确认应返回 400，实际 {r.status_code}"
+    body = r.get_json()
+    assert "已确认" in body.get("error", ""), f"错误信息应提示已确认: {body}"
+    assert "重复确认" in body.get("error", ""), f"错误信息应提示重复确认: {body}"
+
+
+def test_review_comparison_conflict_ignored_then_confirm(client, sample_dir):
+    """冲突场景：已忽略后再确认 → 返回 400 错误"""
+    bid = create_batch(client, "test-review-conflict-ignored")
+    comp = create_two_notes_and_compare(client, bid, sample_dir)
+
+    r = review_comparison_api(client, bid, comp["id"], "IGNORED", remark="先忽略")
+    assert r.status_code == 200
+
+    r = review_comparison_api(client, bid, comp["id"], "CONFIRMED", remark="忽略后再确认")
+    assert r.status_code == 400, f"忽略后确认应返回 400，实际 {r.status_code}"
+    body = r.get_json()
+    assert "已忽略" in body.get("error", ""), f"错误信息应提示已忽略: {body}"
+
+
+def test_review_comparison_not_found(client, sample_dir):
+    """冲突场景：对比记录不存在 → 返回 404"""
+    bid = create_batch(client, "test-review-notfound")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    r = review_comparison_api(client, bid, 99999, "CONFIRMED")
+    assert r.status_code == 404, f"不存在的对比记录应返回 404，实际 {r.status_code}"
+    body = r.get_json()
+    assert "不存在" in body.get("error", ""), f"错误信息应提示不存在: {body}"
+
+
+def test_review_comparison_filter_by_status(client, sample_dir):
+    """历史对比列表支持按复核状态筛选"""
+    bid = create_batch(client, "test-review-filter")
+
+    match_and_resolve_all(client, bid, sample_dir)
+    notes = list_notes(client, bid)
+
+    exs = get_exceptions(client, bid)
+    if len(exs) >= 2:
+        client.put(
+            f"/api/batches/{bid}/exceptions/{exs[0]['id']}/remark",
+            json={"remarks": "v2备注"},
+        )
+        client.put(
+            f"/api/batches/{bid}/exceptions/{exs[1]['id']}/remark",
+            json={"remarks": "v3备注"},
+        )
+    notes = list_notes(client, bid)
+    assert len(notes) >= 3, f"需要至少 3 个版本，实际 {len(notes)}"
+
+    r1 = compare_notes_api(client, bid, notes[0]["id"], notes[1]["id"])
+    assert r1.status_code == 200
+    comp1 = r1.get_json()["comparison"]
+
+    r2 = compare_notes_api(client, bid, notes[1]["id"], notes[2]["id"])
+    assert r2.status_code == 200
+    comp2 = r2.get_json()["comparison"]
+
+    r3 = compare_notes_api(client, bid, notes[0]["id"], notes[2]["id"])
+    assert r3.status_code == 200
+    comp3 = r3.get_json()["comparison"]
+
+    review_comparison_api(client, bid, comp1["id"], "CONFIRMED", remark="确认1")
+    review_comparison_api(client, bid, comp2["id"], "IGNORED", remark="忽略2")
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons")
+    assert r.status_code == 200
+    all_comps = r.get_json()["comparisons"]
+    assert len(all_comps) == 3
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons?review_status=CONFIRMED")
+    assert r.status_code == 200
+    confirmed = r.get_json()["comparisons"]
+    assert len(confirmed) == 1
+    assert confirmed[0]["id"] == comp1["id"]
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons?review_status=IGNORED")
+    assert r.status_code == 200
+    ignored = r.get_json()["comparisons"]
+    assert len(ignored) == 1
+    assert ignored[0]["id"] == comp2["id"]
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons?review_status=PENDING")
+    assert r.status_code == 200
+    pending = r.get_json()["comparisons"]
+    assert len(pending) == 1
+    assert pending[0]["id"] == comp3["id"]
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons?review_status=INVALID")
+    assert r.status_code == 400
+    assert "无效的复核状态" in r.get_json().get("error", "")
+
+
+def test_export_only_includes_confirmed_comparison(client, sample_dir):
+    """导出 CSV 汇总区只带最近一次已确认对比，待复核和已忽略的不混进去"""
+    bid = create_batch(client, "test-export-confirmed-only")
+
+    match_and_resolve_all(client, bid, sample_dir)
+    exs = get_exceptions(client, bid)
+    if len(exs) >= 2:
+        client.put(
+            f"/api/batches/{bid}/exceptions/{exs[0]['id']}/remark",
+            json={"remarks": "v2备注"},
+        )
+        client.put(
+            f"/api/batches/{bid}/exceptions/{exs[1]['id']}/remark",
+            json={"remarks": "v3备注"},
+        )
+    notes = list_notes(client, bid)
+    assert len(notes) >= 3
+
+    r1 = compare_notes_api(client, bid, notes[0]["id"], notes[1]["id"], operator="op1")
+    comp_pending = r1.get_json()["comparison"]
+
+    r2 = compare_notes_api(client, bid, notes[1]["id"], notes[2]["id"], operator="op2")
+    comp2 = r2.get_json()["comparison"]
+    review_comparison_api(client, bid, comp2["id"], "CONFIRMED", remark="已确认的对比", operator="reviewer_li")
+
+    r3 = compare_notes_api(client, bid, notes[0]["id"], notes[2]["id"], operator="op3")
+    comp_ignored = r3.get_json()["comparison"]
+    review_comparison_api(client, bid, comp_ignored["id"], "IGNORED", remark="已忽略的对比")
+
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+
+    with io.StringIO(r.data.decode("utf-8-sig")) as f:
+        rows = list(csv.reader(f))
+
+    in_summary = False
+    has_confirmed_summary = False
+    has_reviewer = False
+    has_review_remark = False
+    has_old_pending = True
+
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "汇总信息":
+            in_summary = True
+            continue
+        if in_summary:
+            if row[0] == "最近已确认对比摘要":
+                has_confirmed_summary = True
+                assert "v2 → v3" in row[1] or "v1 → v2" in row[1], "已确认对比摘要应正确"
+            if row[0] == "复核人":
+                has_reviewer = True
+                assert row[1] == "reviewer_li", "复核人应正确"
+            if row[0] == "复核备注":
+                has_review_remark = True
+                assert row[1] == "已确认的对比", "复核备注应正确"
+            if row[0] == "最近对比摘要":
+                has_old_pending = False
+
+    assert has_confirmed_summary, "导出应包含'最近已确认对比摘要'"
+    assert has_reviewer, "导出应包含'复核人'"
+    assert has_review_remark, "导出应包含'复核备注'"
+    assert has_old_pending, "导出不应包含旧的'最近对比摘要'字段（待确认的不应混入）"
+
+
+def test_review_persists_across_restart(client, sample_dir, tmp_path):
+    """跨重启持久化：复核状态、备注、操作人、复核时间在重启后仍然存在"""
+    from app import create_app
+    from models import db
+
+    db_path = tmp_path / "review_persist_test.db"
+    db_uri = f"sqlite:///{db_path}"
+
+    app1 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app1.app_context():
+        db.create_all()
+    c1 = app1.test_client()
+
+    bid = create_batch(c1, "test-review-persist")
+    upload_file(c1, bid, "po", sample_dir, "purchase_orders.csv")
+    upload_file(c1, bid, "invoice", sample_dir, "invoices.csv")
+    c1.post(f"/api/batches/{bid}/match")
+
+    exs = c1.get(f"/api/batches/{bid}/exceptions").get_json()["exceptions"]
+    if exs:
+        c1.put(
+            f"/api/batches/{bid}/exceptions/{exs[0]['id']}/remark",
+            json={"remarks": "触发v2"},
+        )
+
+    notes = c1.get(f"/api/batches/{bid}/recalc-notes").get_json()["notes"]
+    r = c1.post(
+        f"/api/batches/{bid}/recalc-notes/compare",
+        json={"note_a_id": notes[0]["id"], "note_b_id": notes[-1]["id"], "operator": "persist_op"},
+    )
+    comp = r.get_json()["comparison"]
+    comp_id = comp["id"]
+
+    r = c1.put(
+        f"/api/batches/{bid}/recalc-notes/comparisons/{comp_id}/review",
+        json={"review_status": "CONFIRMED", "review_remark": "持久化测试备注", "operator": "persist_reviewer"},
+    )
+    assert r.status_code == 200
+
+    saved_status = r.get_json()["comparison"]["review_status"]
+    saved_remark = r.get_json()["comparison"]["review_remark"]
+    saved_reviewer = r.get_json()["comparison"]["reviewed_by"]
+    saved_reviewed_at = r.get_json()["comparison"]["reviewed_at"]
+
+    with app1.app_context():
+        db.session.remove()
+
+    app2 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app2.app_context():
+        db.create_all()
+    c2 = app2.test_client()
+
+    r = c2.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comp_id}")
+    assert r.status_code == 200
+    after = r.get_json()["comparison"]
+
+    assert after["review_status"] == saved_status
+    assert after["review_remark"] == saved_remark
+    assert after["reviewed_by"] == saved_reviewer
+    assert after["reviewed_at"] == saved_reviewed_at
+    assert after["review_status"] == "CONFIRMED"
+    assert after["review_remark"] == "持久化测试备注"
+
+    with app2.app_context():
+        db.session.remove()
+        db.drop_all()
+
+
+def test_review_generates_audit_log(client, sample_dir):
+    """复核操作会生成审计日志，包含状态和备注信息"""
+    bid = create_batch(client, "test-review-audit-log")
+    comp = create_two_notes_and_compare(client, bid, sample_dir)
+
+    r = review_comparison_api(client, bid, comp["id"], "CONFIRMED", remark="审计日志测试", operator="audit_tester")
+    assert r.status_code == 200
+
+    batch = get_batch(client, bid)
+    logs_endpoint = f"/api/batches/{bid}"
+
+    from models import AuditLog
+    with client.application.app_context():
+        logs = AuditLog.query.filter_by(batch_id=bid).order_by(AuditLog.id.desc()).limit(5).all()
+        log_actions = [log.action for log in logs]
+
+    has_review_log = any("REVIEW" in action for action in log_actions)
+    assert has_review_log, "复核操作应生成审计日志"
+
+    review_logs = [log for log in logs if "REVIEW" in log.action]
+    assert len(review_logs) >= 1
+    assert review_logs[0].operator == "audit_tester"
+    assert "审计日志测试" in review_logs[0].detail
+
+
+def test_review_can_reset_to_pending(client, sample_dir):
+    """已确认或已忽略的对比可以重置为待复核状态"""
+    bid = create_batch(client, "test-review-reset")
+    comp = create_two_notes_and_compare(client, bid, sample_dir)
+
+    review_comparison_api(client, bid, comp["id"], "CONFIRMED", remark="先确认")
+
+    r = review_comparison_api(client, bid, comp["id"], "PENDING", remark="重置为待复核")
+    assert r.status_code == 200
+    assert r.get_json()["comparison"]["review_status"] == "PENDING"
+
+    review_comparison_api(client, bid, comp["id"], "IGNORED", remark="再忽略")
+
+    r = review_comparison_api(client, bid, comp["id"], "PENDING", remark="重置为待复核2")
+    assert r.status_code == 200
+    assert r.get_json()["comparison"]["review_status"] == "PENDING"
+
+
+def test_index_page_has_review_ui_elements(client, sample_dir):
+    """前端页面包含复核相关的 UI 元素"""
+    r = client.get("/")
+    assert r.status_code == 200
+    html = r.data.decode("utf-8")
+
+    assert "复核操作" in html, "页面应包含'复核操作'区域"
+    assert "复核备注" in html, "页面应包含'复核备注'输入"
+    assert "历史对比记录" in html, "页面应包含'历史对比记录'列表"
+    assert "状态筛选" in html, "页面应包含'状态筛选'下拉框"
+    assert "待复核" in html, "页面应包含'待复核'状态选项"
+    assert "已确认" in html, "页面应包含'已确认'状态选项"
+    assert "已忽略" in html, "页面应包含'已忽略'状态选项"
+
+
+def test_review_invalid_status_returns_400(client, sample_dir):
+    """无效的复核状态返回 400 错误"""
+    bid = create_batch(client, "test-review-invalid-status")
+    comp = create_two_notes_and_compare(client, bid, sample_dir)
+
+    r = review_comparison_api(client, bid, comp["id"], "INVALID_STATUS")
+    assert r.status_code == 400
+    body = r.get_json()
+    assert "无效的复核状态" in body.get("error", "")
