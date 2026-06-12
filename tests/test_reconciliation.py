@@ -717,3 +717,325 @@ def test_recalc_note_affected_docs_only_changed():
     with app.app_context():
         db.session.remove()
         db.drop_all()
+
+
+# ---------- 版本对比 测试辅助函数 ----------
+
+def compare_notes_api(client, bid, note_a_id, note_b_id, operator="test_user"):
+    r = client.post(
+        f"/api/batches/{bid}/recalc-notes/compare",
+        json={"note_a_id": note_a_id, "note_b_id": note_b_id, "operator": operator},
+    )
+    return r
+
+
+# ---------- 版本对比 测试用例 ----------
+
+def test_version_comparison_v1_vs_v3_after_two_remarks(client, sample_dir):
+    """两次备注变更后做 v1/v3 对比，验证差异分析完整。
+
+    流程:
+    1. 创建批次 + 匹配 → 生成 v1
+    2. 修改异常 A 备注 → 生成 v2
+    3. 修改异常 B 备注 → 生成 v3
+    4. 对比 v1 vs v3
+    预期:
+    - 应付合计差额正确
+    - 变化来源正确
+    - 涉及采购单/发票的变更列表正确
+    - 规则版本和操作人正确
+    """
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-A,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-B,V002,供应商B,20000.00,2024-01-01\n"
+    )
+    inv_csv = (
+        "invoice_number,vendor_code,vendor_name,amount,invoice_date\n"
+        "INV-A,V001,供应商A,10500.00,2024-01-02\n"
+        "INV-B,V002,供应商B,21000.00,2024-01-02\n"
+    )
+
+    bid = create_batch(client, "test-compare-v1-v3", pct=0.1, ab=1)
+    upload_csv_bytes(client, bid, "po", po_csv, "po.csv")
+    upload_csv_bytes(client, bid, "invoice", inv_csv, "inv.csv")
+
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    notes = list_notes(client, bid)
+    assert len(notes) >= 1
+    note_v1 = notes[0]
+    assert note_v1["version"] == 1
+    v1_total = note_v1["current_total"]
+
+    exs = get_exceptions(client, bid)
+    assert len(exs) == 2, f"应有 2 条异常，实际 {len(exs)}"
+
+    exc_a = next(e for e in exs if e["po_number"] == "PO-A")
+    exc_b = next(e for e in exs if e["po_number"] == "PO-B")
+
+    r = client.put(
+        f"/api/batches/{bid}/exceptions/{exc_a['id']}/remark",
+        json={"remarks": "第一次备注变更"},
+    )
+    assert r.status_code == 200
+
+    notes = list_notes(client, bid)
+    note_v2 = notes[-1]
+    assert note_v2["version"] == 2
+
+    r = client.put(
+        f"/api/batches/{bid}/exceptions/{exc_b['id']}/remark",
+        json={"remarks": "第二次备注变更"},
+    )
+    assert r.status_code == 200
+
+    notes = list_notes(client, bid)
+    assert len(notes) == 3
+    note_v3 = notes[-1]
+    assert note_v3["version"] == 3
+    v3_total = note_v3["current_total"]
+
+    r = compare_notes_api(client, bid, note_v1["id"], note_v3["id"], operator="finance_user")
+    assert r.status_code == 200, f"对比失败: {r.data}"
+    body = r.get_json()
+    comp = body["comparison"]
+
+    expected_diff = round(v3_total - v1_total, 2)
+    assert comp["amount_diff"] == expected_diff, (
+        f"差额不对: {comp['amount_diff']} != {expected_diff}"
+    )
+    assert comp["note_a_version"] == 1
+    assert comp["note_b_version"] == 3
+    assert comp["operator"] == "finance_user"
+    assert comp["rule_version_a"] == note_v1["rule_version"]
+    assert comp["rule_version_b"] == note_v3["rule_version"]
+    assert comp["comparison_summary"], "对比摘要不应为空"
+    assert "v1 → v3" in comp["comparison_summary"]
+
+    assert "PO-A" in comp["po_changed"], "PO-A 应在变更列表"
+    assert "PO-B" in comp["po_changed"], "PO-B 应在变更列表"
+    assert "INV-A" in comp["invoice_changed"], "INV-A 应在变更列表"
+    assert "INV-B" in comp["invoice_changed"], "INV-B 应在变更列表"
+
+    assert comp["po_added"] == [], "v1→v3 不应有新增采购单"
+    assert comp["po_removed"] == [], "v1→v3 不应有移除采购单"
+    assert comp["invoice_added"] == [], "v1→v3 不应有新增发票"
+    assert comp["invoice_removed"] == [], "v1→v3 不应有移除发票"
+
+    assert comp["change_source"], "变化来源不应为空"
+    assert "变更" in comp["change_source"], "变化来源应包含'变更'"
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons")
+    assert r.status_code == 200
+    assert len(r.get_json()["comparisons"]) == 1
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/comparisons/latest")
+    assert r.status_code == 200
+    latest = r.get_json()["comparison"]
+    assert latest["id"] == comp["id"]
+
+
+def test_version_comparison_invalid_cases_return_400(client, sample_dir):
+    """非法对比场景返回 400 错误，不抛 500。
+
+    覆盖:
+    - 版本不存在
+    - 跨批次对比
+    - 同版本对比
+    - 参数缺失
+    """
+    bid1 = create_batch(client, "test-compare-err-1")
+    match_and_resolve_all(client, bid1, sample_dir)
+    notes1 = list_notes(client, bid1)
+    assert len(notes1) >= 1
+    n1 = notes1[0]
+
+    bid2 = create_batch(client, "test-compare-err-2")
+    match_and_resolve_all(client, bid2, sample_dir)
+    notes2 = list_notes(client, bid2)
+    assert len(notes2) >= 1
+    n2 = notes2[0]
+
+    r = compare_notes_api(client, bid1, n1["id"], n1["id"])
+    assert r.status_code == 400, f"同版本对比应 400，实际 {r.status_code}: {r.data}"
+    body = r.get_json()
+    assert "同一版本" in body.get("error", ""), f"错误信息不对: {body}"
+    assert r.content_type.startswith("application/json")
+
+    r = compare_notes_api(client, bid1, n1["id"], n2["id"])
+    assert r.status_code == 400, f"跨批次对比应 400，实际 {r.status_code}: {r.data}"
+    body = r.get_json()
+    assert "不属于" in body.get("error", ""), f"错误信息不对: {body}"
+    assert r.content_type.startswith("application/json")
+
+    r = compare_notes_api(client, bid1, n1["id"], 99999)
+    assert r.status_code == 400, f"版本不存在应 400，实际 {r.status_code}: {r.data}"
+    body = r.get_json()
+    assert "不存在" in body.get("error", ""), f"错误信息不对: {body}"
+    assert r.content_type.startswith("application/json")
+
+    r = client.post(f"/api/batches/{bid1}/recalc-notes/compare", json={})
+    assert r.status_code == 400, f"参数缺失应 400，实际 {r.status_code}: {r.data}"
+    body = r.get_json()
+    assert "缺失" in body.get("error", ""), f"错误信息不对: {body}"
+
+    r = client.post(
+        f"/api/batches/{bid1}/recalc-notes/compare",
+        json={"note_a_id": "abc", "note_b_id": 1},
+    )
+    assert r.status_code == 400, f"参数类型错误应 400，实际 {r.status_code}: {r.data}"
+
+
+def test_export_includes_comparison_summary(client, sample_dir):
+    """CSV 汇总区包含最近一次对比摘要，导出金额仍和批次详情一致。"""
+    bid = create_batch(client, "test-export-compare-summary")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    exs = get_exceptions(client, bid)
+    if exs:
+        exc0 = exs[0]
+        r = client.put(
+            f"/api/batches/{bid}/exceptions/{exc0['id']}/remark",
+            json={"remarks": "修改备注触发v2"},
+        )
+        assert r.status_code == 200
+
+    notes = list_notes(client, bid)
+    assert len(notes) >= 2, f"需要至少 2 个版本才能对比，实际 {len(notes)}"
+    n1 = notes[0]
+    n2 = notes[-1]
+
+    r = compare_notes_api(client, bid, n1["id"], n2["id"], operator="export_test")
+    assert r.status_code == 200
+    comp = r.get_json()["comparison"]
+
+    api_payable = get_batch(client, bid)["summary"]["payable_total"]
+
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+
+    with io.StringIO(r.data.decode("utf-8-sig")) as f:
+        rows = list(csv.reader(f))
+
+    in_summary = False
+    exported_payable = None
+    exported_compare_summary = None
+    exported_compare_versions = None
+    exported_compare_operator = None
+
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "汇总信息":
+            in_summary = True
+            continue
+        if in_summary and row[0] == "应付合计":
+            exported_payable = float(row[1])
+        if in_summary and row[0] == "最近对比摘要":
+            exported_compare_summary = row[1] if len(row) > 1 else ""
+        if in_summary and row[0] == "对比版本":
+            exported_compare_versions = row[1] if len(row) > 1 else ""
+        if in_summary and row[0] == "对比操作人":
+            exported_compare_operator = row[1] if len(row) > 1 else ""
+
+    assert exported_payable is not None, "导出应含应付合计"
+    assert exported_payable == api_payable, (
+        f"导出应付 {exported_payable} != 接口应付 {api_payable}"
+    )
+    assert exported_compare_summary == comp["comparison_summary"], (
+        f"导出对比摘要不对: {exported_compare_summary} != {comp['comparison_summary']}"
+    )
+    assert exported_compare_versions == f"v{comp['note_a_version']} → v{comp['note_b_version']}"
+    assert exported_compare_operator == "export_test"
+
+
+def test_comparison_persists_across_restart(client, sample_dir, tmp_path):
+    """服务重启后历史说明和对比接口结果都能查回来。"""
+    from app import create_app
+    from models import db
+
+    db_path = tmp_path / "compare_persist_test.db"
+    db_uri = f"sqlite:///{db_path}"
+
+    app1 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app1.app_context():
+        db.create_all()
+    c1 = app1.test_client()
+
+    bid = create_batch(c1, "test-compare-persist")
+    upload_file(c1, bid, "po", sample_dir, "purchase_orders.csv")
+    upload_file(c1, bid, "invoice", sample_dir, "invoices.csv")
+    r = c1.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    exs = c1.get(f"/api/batches/{bid}/exceptions").get_json()["exceptions"]
+    if exs:
+        exc0 = exs[0]
+        r = c1.put(
+            f"/api/batches/{bid}/exceptions/{exc0['id']}/remark",
+            json={"remarks": "修改备注触发v2"},
+        )
+        assert r.status_code == 200
+
+    notes_before = c1.get(f"/api/batches/{bid}/recalc-notes").get_json()["notes"]
+    assert len(notes_before) >= 2
+    n1 = notes_before[0]
+    n2 = notes_before[-1]
+
+    r = c1.post(
+        f"/api/batches/{bid}/recalc-notes/compare",
+        json={"note_a_id": n1["id"], "note_b_id": n2["id"], "operator": "persist_test"},
+    )
+    assert r.status_code == 200
+    comp_before = r.get_json()["comparison"]
+    comp_id = comp_before["id"]
+    comp_summary = comp_before["comparison_summary"]
+    comp_diff = comp_before["amount_diff"]
+    comp_operator = comp_before["operator"]
+
+    with app1.app_context():
+        db.session.remove()
+
+    app2 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app2.app_context():
+        db.create_all()
+    c2 = app2.test_client()
+
+    notes_after = c2.get(f"/api/batches/{bid}/recalc-notes").get_json()["notes"]
+    assert len(notes_after) == len(notes_before), "重启后说明数量应不变"
+
+    r = c2.get(f"/api/batches/{bid}/recalc-notes/comparisons")
+    assert r.status_code == 200
+    comparisons = r.get_json()["comparisons"]
+    assert len(comparisons) >= 1, "重启后应能查到对比记录"
+
+    r = c2.get(f"/api/batches/{bid}/recalc-notes/comparisons/latest")
+    assert r.status_code == 200
+    latest = r.get_json()["comparison"]
+    assert latest is not None
+    assert latest["id"] == comp_id
+    assert latest["comparison_summary"] == comp_summary
+    assert latest["amount_diff"] == comp_diff
+    assert latest["operator"] == comp_operator
+
+    r = c2.get(f"/api/batches/{bid}/recalc-notes/comparisons/{comp_id}")
+    assert r.status_code == 200
+    fetched = r.get_json()["comparison"]
+    assert fetched["id"] == comp_id
+    assert fetched["comparison_summary"] == comp_summary
+
+    with app2.app_context():
+        db.session.remove()
+        db.drop_all()

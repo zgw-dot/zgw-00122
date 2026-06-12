@@ -3,7 +3,7 @@ import io
 import json
 from models import (
     db, Batch, PurchaseOrder, Invoice, MatchResult, ExceptionItem,
-    ToleranceHistory, AuditLog, PayableRecalcNote,
+    ToleranceHistory, AuditLog, PayableRecalcNote, NoteComparison,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
@@ -633,3 +633,220 @@ def list_recalc_notes(batch_id):
         .order_by(PayableRecalcNote.version.asc())
         .all()
     )
+
+
+def _get_doc_sets_from_snapshot(snapshot):
+    """从快照中提取采购单和发票的集合（用于对比增删）"""
+    po_set = set()
+    inv_set = set()
+    mr_map = {}
+    exc_map = {}
+    mr_id_to_docs = {}
+
+    if not snapshot:
+        return po_set, inv_set, mr_map, exc_map, mr_id_to_docs
+
+    try:
+        snap = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
+    except (json.JSONDecodeError, TypeError):
+        return po_set, inv_set, mr_map, exc_map, mr_id_to_docs
+
+    for mr_id, mr in snap.get("match_results", {}).items():
+        po_num = mr.get("po_number")
+        inv_num = mr.get("invoice_number")
+        if po_num:
+            po_set.add(po_num)
+        if inv_num:
+            inv_set.add(inv_num)
+        key = f"{po_num}:{inv_num}"
+        mr_map[key] = mr
+        mr_id_to_docs[str(mr.get("po_id") or "")] = (po_num, inv_num)
+        mr_id_to_docs[str(mr.get("invoice_id") or "")] = (po_num, inv_num)
+        mr_id_to_docs[str(mr_id)] = (po_num, inv_num)
+
+    for exc_id, exc in snap.get("exceptions", {}).items():
+        exc_map[exc_id] = exc
+
+    return po_set, inv_set, mr_map, exc_map, mr_id_to_docs
+
+
+def _find_changed_docs(a_map, b_map, a_exc_map, b_exc_map, a_mr_id_to_docs, b_mr_id_to_docs, doc_type="po"):
+    """找出在两个版本中都存在但状态/备注/类型等发生变化的单据"""
+    changed = set()
+    num_key = "po_number" if doc_type == "po" else "invoice_number"
+
+    for key in a_map:
+        if key in b_map:
+            a_item = a_map[key]
+            b_item = b_map[key]
+            if a_item != b_item:
+                num = a_item.get(num_key) or b_item.get(num_key)
+                if num:
+                    changed.add(num)
+
+    all_exc_ids = set(a_exc_map.keys()) | set(b_exc_map.keys())
+    for exc_id in all_exc_ids:
+        a_exc = a_exc_map.get(exc_id)
+        b_exc = b_exc_map.get(exc_id)
+        if a_exc != b_exc:
+            exc = b_exc or a_exc
+            mr_id = str(exc.get("match_result_id") or "")
+            docs = a_mr_id_to_docs.get(mr_id) or b_mr_id_to_docs.get(mr_id)
+            if docs:
+                po_num, inv_num = docs
+                if doc_type == "po" and po_num:
+                    changed.add(po_num)
+                elif doc_type == "invoice" and inv_num:
+                    changed.add(inv_num)
+
+    return sorted(changed)
+
+
+def compare_notes(batch_id, note_a_id, note_b_id, operator="system"):
+    """
+    比较同一批次内两个应付重算说明版本的差异。
+    
+    返回 (comparison_obj, error_message)。
+    如果有错误，error_message 不为 None，comparison_obj 为 None。
+    """
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        return None, "批次不存在"
+
+    note_a = PayableRecalcNote.query.get(note_a_id)
+    if not note_a:
+        return None, f"版本 {note_a_id} 不存在"
+
+    note_b = PayableRecalcNote.query.get(note_b_id)
+    if not note_b:
+        return None, f"版本 {note_b_id} 不存在"
+
+    if note_a.batch_id != batch_id:
+        return None, f"版本 {note_a_id} 不属于批次 {batch_id}"
+
+    if note_b.batch_id != batch_id:
+        return None, f"版本 {note_b_id} 不属于批次 {batch_id}"
+
+    if note_a_id == note_b_id:
+        return None, "不能对比同一版本"
+
+    a_po, a_inv, a_map, a_exc_map, a_mr_id_to_docs = _get_doc_sets_from_snapshot(note_a.result_snapshot)
+    b_po, b_inv, b_map, b_exc_map, b_mr_id_to_docs = _get_doc_sets_from_snapshot(note_b.result_snapshot)
+
+    po_added = sorted(b_po - a_po)
+    po_removed = sorted(a_po - b_po)
+    po_changed = _find_changed_docs(a_map, b_map, a_exc_map, b_exc_map, a_mr_id_to_docs, b_mr_id_to_docs, doc_type="po")
+
+    invoice_added = sorted(b_inv - a_inv)
+    invoice_removed = sorted(a_inv - b_inv)
+    invoice_changed = _find_changed_docs(a_map, b_map, a_exc_map, b_exc_map, a_mr_id_to_docs, b_mr_id_to_docs, doc_type="invoice")
+
+    amount_diff = round(note_b.current_total - note_a.current_total, 2)
+
+    change_sources = []
+    if po_added:
+        change_sources.append(f"采购单新增{len(po_added)}条")
+    if po_removed:
+        change_sources.append(f"采购单移除{len(po_removed)}条")
+    if po_changed:
+        change_sources.append(f"采购单变更{len(po_changed)}条")
+    if invoice_added:
+        change_sources.append(f"发票新增{len(invoice_added)}条")
+    if invoice_removed:
+        change_sources.append(f"发票移除{len(invoice_removed)}条")
+    if invoice_changed:
+        change_sources.append(f"发票变更{len(invoice_changed)}条")
+    if note_a.rule_version != note_b.rule_version:
+        change_sources.append(f"规则版本变更")
+    change_source = "; ".join(change_sources) if change_sources else "无变化"
+
+    summary_parts = []
+    if amount_diff > 0:
+        summary_parts.append(f"应付合计增加 {abs(amount_diff):.2f}")
+    elif amount_diff < 0:
+        summary_parts.append(f"应付合计减少 {abs(amount_diff):.2f}")
+    else:
+        summary_parts.append("应付合计不变")
+    summary_parts.append(f"(v{note_a.version} → v{note_b.version})")
+    if change_sources:
+        summary_parts.append(f"变化来源: {change_source}")
+    comparison_summary = " ".join(summary_parts)
+
+    detail = json.dumps({
+        "note_a": {
+            "version": note_a.version,
+            "current_total": note_a.current_total,
+            "rule_version": note_a.rule_version,
+            "change_source": note_a.change_source,
+        },
+        "note_b": {
+            "version": note_b.version,
+            "current_total": note_b.current_total,
+            "rule_version": note_b.rule_version,
+            "change_source": note_b.change_source,
+        },
+        "diff": {
+            "po_added": po_added,
+            "po_removed": po_removed,
+            "po_changed": po_changed,
+            "invoice_added": invoice_added,
+            "invoice_removed": invoice_removed,
+            "invoice_changed": invoice_changed,
+        },
+    }, ensure_ascii=False)
+
+    comparison = NoteComparison(
+        batch_id=batch_id,
+        note_a_id=note_a_id,
+        note_b_id=note_b_id,
+        note_a_version=note_a.version,
+        note_b_version=note_b.version,
+        amount_diff=amount_diff,
+        change_source=change_source,
+        po_added=json.dumps(po_added, ensure_ascii=False),
+        po_removed=json.dumps(po_removed, ensure_ascii=False),
+        po_changed=json.dumps(po_changed, ensure_ascii=False),
+        invoice_added=json.dumps(invoice_added, ensure_ascii=False),
+        invoice_removed=json.dumps(invoice_removed, ensure_ascii=False),
+        invoice_changed=json.dumps(invoice_changed, ensure_ascii=False),
+        rule_version_a=note_a.rule_version,
+        rule_version_b=note_b.rule_version,
+        operator=operator,
+        comparison_summary=comparison_summary,
+        detail=detail,
+    )
+    db.session.add(comparison)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="COMPARE_NOTES",
+        detail=f"对比应付说明 v{note_a.version} vs v{note_b.version}: {comparison_summary}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return comparison, None
+
+
+def get_latest_comparison(batch_id):
+    """获取指定批次最新的版本对比结果"""
+    return (
+        NoteComparison.query.filter_by(batch_id=batch_id)
+        .order_by(NoteComparison.created_at.desc())
+        .first()
+    )
+
+
+def list_comparisons(batch_id):
+    """列出指定批次所有版本对比结果（按时间降序）"""
+    return (
+        NoteComparison.query.filter_by(batch_id=batch_id)
+        .order_by(NoteComparison.created_at.desc())
+        .all()
+    )
+
+
+def get_comparison(comparison_id):
+    """按ID获取版本对比结果"""
+    return NoteComparison.query.get(comparison_id)

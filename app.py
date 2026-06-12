@@ -15,6 +15,7 @@ from models import (
 from matcher import (
     process_batch, validate_and_import_po, validate_and_import_invoice, ValidationError,
     generate_payable_recalc_note, get_latest_recalc_note, list_recalc_notes,
+    compare_notes, get_latest_comparison, list_comparisons, get_comparison,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -379,12 +380,60 @@ def trigger_recalc_note(batch_id):
     return jsonify({"note": note.to_dict(), "is_new": is_new})
 
 
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/compare", methods=["POST"])
+def compare_recalc_notes(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    note_a_id = payload.get("note_a_id")
+    note_b_id = payload.get("note_b_id")
+    operator = payload.get("operator", "user")
+
+    if note_a_id is None or note_b_id is None:
+        return jsonify({"error": "参数缺失: 需要 note_a_id 和 note_b_id"}), 400
+
+    if not isinstance(note_a_id, int) or not isinstance(note_b_id, int):
+        return jsonify({"error": "note_a_id 和 note_b_id 必须是整数"}), 400
+
+    comparison, err = compare_notes(batch_id, note_a_id, note_b_id, operator=operator)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"comparison": comparison.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/comparisons", methods=["GET"])
+def list_batch_comparisons(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    comparisons = list_comparisons(batch_id)
+    return jsonify({"comparisons": [c.to_dict() for c in comparisons]})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/comparisons/latest", methods=["GET"])
+def get_batch_latest_comparison(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    comparison = get_latest_comparison(batch_id)
+    if comparison is None:
+        return jsonify({"comparison": None})
+    return jsonify({"comparison": comparison.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/comparisons/<int:comparison_id>", methods=["GET"])
+def get_batch_comparison(batch_id, comparison_id):
+    batch = Batch.query.get_or_404(batch_id)
+    comparison = get_comparison(comparison_id)
+    if comparison is None:
+        return jsonify({"error": "对比记录不存在"}), 404
+    if comparison.batch_id != batch_id:
+        return jsonify({"error": "对比记录不属于该批次"}), 400
+    return jsonify({"comparison": comparison.to_dict()})
+
+
 @bp.route("/api/batches/<int:batch_id>/export", methods=["GET"])
 def export_report(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     results = MatchResult.query.filter_by(batch_id=batch_id).all()
     exceptions = ExceptionItem.query.filter_by(batch_id=batch_id).all()
     latest_note = get_latest_recalc_note(batch_id)
+    latest_comparison = get_latest_comparison(batch_id)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -434,6 +483,10 @@ def export_report(batch_id):
         if latest_note.previous_total is not None:
             writer.writerow(["上一次应付合计", latest_note.previous_total])
             writer.writerow(["应付差额", latest_note.amount_diff])
+    if latest_comparison:
+        writer.writerow(["最近对比摘要", latest_comparison.comparison_summary or ""])
+        writer.writerow(["对比版本", f"v{latest_comparison.note_a_version} → v{latest_comparison.note_b_version}"])
+        writer.writerow(["对比操作人", latest_comparison.operator or ""])
 
     output.seek(0)
     filename = f"reconciliation_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"

@@ -317,6 +317,57 @@ def compute_note_content_hash(batch):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+class NoteComparison(db.Model):
+    __tablename__ = "note_comparisons"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    note_a_id = db.Column(db.Integer, db.ForeignKey("payable_recalc_notes.id"), nullable=False)
+    note_b_id = db.Column(db.Integer, db.ForeignKey("payable_recalc_notes.id"), nullable=False)
+    note_a_version = db.Column(db.Integer, nullable=False)
+    note_b_version = db.Column(db.Integer, nullable=False)
+    amount_diff = db.Column(db.Float, nullable=False, default=0.0)
+    change_source = db.Column(db.Text)
+    po_added = db.Column(db.Text)
+    po_removed = db.Column(db.Text)
+    po_changed = db.Column(db.Text)
+    invoice_added = db.Column(db.Text)
+    invoice_removed = db.Column(db.Text)
+    invoice_changed = db.Column(db.Text)
+    rule_version_a = db.Column(db.String(50))
+    rule_version_b = db.Column(db.String(50))
+    operator = db.Column(db.String(100), default="system")
+    comparison_summary = db.Column(db.Text)
+    detail = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="note_comparisons")
+    note_a = db.relationship("PayableRecalcNote", foreign_keys=[note_a_id])
+    note_b = db.relationship("PayableRecalcNote", foreign_keys=[note_b_id])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "note_a_id": self.note_a_id,
+            "note_b_id": self.note_b_id,
+            "note_a_version": self.note_a_version,
+            "note_b_version": self.note_b_version,
+            "amount_diff": round(self.amount_diff, 2),
+            "change_source": self.change_source,
+            "po_added": json.loads(self.po_added) if self.po_added else [],
+            "po_removed": json.loads(self.po_removed) if self.po_removed else [],
+            "po_changed": json.loads(self.po_changed) if self.po_changed else [],
+            "invoice_added": json.loads(self.invoice_added) if self.invoice_added else [],
+            "invoice_removed": json.loads(self.invoice_removed) if self.invoice_removed else [],
+            "invoice_changed": json.loads(self.invoice_changed) if self.invoice_changed else [],
+            "rule_version_a": self.rule_version_a,
+            "rule_version_b": self.rule_version_b,
+            "operator": self.operator,
+            "comparison_summary": self.comparison_summary,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 def init_db(app):
     if "sqlalchemy" not in app.extensions:
         db.init_app(app)
