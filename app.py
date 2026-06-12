@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from flask import Flask, Blueprint, request, jsonify, send_file, send_from_directory
 from models import (
     db, Batch, MatchResult, ExceptionItem, ToleranceHistory, AuditLog,
+    PayableRecalcNote,
     BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED, BATCH_STATUS_POSTED,
     BATCH_STATUS_ROLLED_BACK, BATCH_STATUS_FAILED,
     EXCEPTION_STATUS_PENDING, EXCEPTION_STATUS_RESOLVED,
@@ -13,6 +14,7 @@ from models import (
 )
 from matcher import (
     process_batch, validate_and_import_po, validate_and_import_invoice, ValidationError,
+    generate_payable_recalc_note, get_latest_recalc_note, list_recalc_notes,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -143,6 +145,7 @@ def update_tolerance(batch_id):
     )
     db.session.add(log)
     db.session.commit()
+    generate_payable_recalc_note(batch_id, change_source="UPDATE_TOLERANCE", operator="user")
     resp = batch.to_dict()
     resp["summary"] = batch.summary
     return jsonify(resp)
@@ -235,6 +238,7 @@ def remark_exception(batch_id, exc_id):
     log = AuditLog(batch_id=batch_id, action="REMARK", detail=f"异常#{exc_id} 备注: {remarks}")
     db.session.add(log)
     db.session.commit()
+    generate_payable_recalc_note(batch_id, change_source="EXCEPTION_REMARK", operator="user")
     return jsonify(exc.to_dict())
 
 
@@ -271,6 +275,8 @@ def resolve_exception(batch_id, exc_id):
         db.session.add(log2)
         db.session.commit()
 
+    generate_payable_recalc_note(batch_id, change_source=f"EXCEPTION_{action.upper()}", operator="user")
+
     return jsonify(exc.to_dict())
 
 
@@ -289,6 +295,7 @@ def confirm_batch(batch_id):
     log = AuditLog(batch_id=batch_id, action="CONFIRM", detail="批次确认入账")
     db.session.add(log)
     db.session.commit()
+    generate_payable_recalc_note(batch_id, change_source="CONFIRM", operator="user")
     return jsonify(batch.to_dict())
 
 
@@ -301,6 +308,7 @@ def post_batch(batch_id):
     log = AuditLog(batch_id=batch_id, action="POST", detail="批次已入账")
     db.session.add(log)
     db.session.commit()
+    generate_payable_recalc_note(batch_id, change_source="POST", operator="user")
     return jsonify(batch.to_dict())
 
 
@@ -315,6 +323,7 @@ def rollback_batch(batch_id):
     log = AuditLog(batch_id=batch_id, action="ROLLBACK", detail="批次回滚")
     db.session.add(log)
     db.session.commit()
+    generate_payable_recalc_note(batch_id, change_source="ROLLBACK", operator="user")
     return jsonify(batch.to_dict())
 
 
@@ -329,7 +338,45 @@ def reset_batch(batch_id):
     log = AuditLog(batch_id=batch_id, action="RESET", detail="批次重置为创建状态")
     db.session.add(log)
     db.session.commit()
+    generate_payable_recalc_note(batch_id, change_source="RESET", operator="user")
     return jsonify(batch.to_dict())
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes", methods=["GET"])
+def list_batch_recalc_notes(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    notes = list_recalc_notes(batch_id)
+    return jsonify({"notes": [n.to_dict() for n in notes]})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/latest", methods=["GET"])
+def get_batch_latest_recalc_note(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    note = get_latest_recalc_note(batch_id)
+    if note is None:
+        return jsonify({"note": None})
+    return jsonify({"note": note.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/<int:note_id>", methods=["GET"])
+def get_batch_recalc_note(batch_id, note_id):
+    batch = Batch.query.get_or_404(batch_id)
+    note = PayableRecalcNote.query.get_or_404(note_id)
+    if note.batch_id != batch_id:
+        return jsonify({"error": "说明不属于该批次"}), 400
+    return jsonify({"note": note.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/recalc-notes/generate", methods=["POST"])
+def trigger_recalc_note(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    change_source = payload.get("change_source", "MANUAL")
+    operator = payload.get("operator", "user")
+    note, is_new = generate_payable_recalc_note(batch_id, change_source=change_source, operator=operator)
+    if note is None:
+        return jsonify({"error": "批次不存在"}), 404
+    return jsonify({"note": note.to_dict(), "is_new": is_new})
 
 
 @bp.route("/api/batches/<int:batch_id>/export", methods=["GET"])
@@ -337,6 +384,7 @@ def export_report(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     results = MatchResult.query.filter_by(batch_id=batch_id).all()
     exceptions = ExceptionItem.query.filter_by(batch_id=batch_id).all()
+    latest_note = get_latest_recalc_note(batch_id)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -379,6 +427,13 @@ def export_report(batch_id):
     writer.writerow(["容差百分比", batch.tolerance_pct])
     writer.writerow(["容差绝对值", batch.tolerance_abs])
     writer.writerow(["规则版本", batch.rule_version])
+    if latest_note:
+        writer.writerow(["重算说明版本", latest_note.version])
+        writer.writerow(["重算说明摘要", latest_note.change_summary or ""])
+        writer.writerow(["重算来源", latest_note.change_source or ""])
+        if latest_note.previous_total is not None:
+            writer.writerow(["上一次应付合计", latest_note.previous_total])
+            writer.writerow(["应付差额", latest_note.amount_diff])
 
     output.seek(0)
     filename = f"reconciliation_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"

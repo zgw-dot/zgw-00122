@@ -263,6 +263,59 @@ class AuditLog(db.Model):
         }
 
 
+class PayableRecalcNote(db.Model):
+    __tablename__ = "payable_recalc_notes"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    version = db.Column(db.Integer, nullable=False, default=1)
+    current_total = db.Column(db.Float, nullable=False, default=0.0)
+    previous_total = db.Column(db.Float)
+    amount_diff = db.Column(db.Float)
+    change_source = db.Column(db.String(200))
+    change_summary = db.Column(db.Text)
+    po_numbers = db.Column(db.Text)
+    invoice_numbers = db.Column(db.Text)
+    rule_version = db.Column(db.String(50))
+    content_hash = db.Column(db.String(64), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="recalc_notes")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "version": self.version,
+            "current_total": round(self.current_total, 2),
+            "previous_total": round(self.previous_total, 2) if self.previous_total is not None else None,
+            "amount_diff": round(self.amount_diff, 2) if self.amount_diff is not None else None,
+            "change_source": self.change_source,
+            "change_summary": self.change_summary,
+            "po_numbers": json.loads(self.po_numbers) if self.po_numbers else [],
+            "invoice_numbers": json.loads(self.invoice_numbers) if self.invoice_numbers else [],
+            "rule_version": self.rule_version,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+def compute_note_content_hash(batch):
+    """基于批次状态、异常状态、备注、匹配结果、规则版本生成哈希，用于去重判断"""
+    parts = []
+    parts.append(f"rule:{batch.rule_version}")
+    parts.append(f"status:{batch.status}")
+    for mr in sorted(batch.match_results, key=lambda x: x.id or 0):
+        parts.append(
+            f"mr:{mr.po_id}:{mr.invoice_id}:{mr.match_type}:{mr.status}:"
+            f"{mr.rule_version}:{mr.exception_type}:{mr.remarks or ''}"
+        )
+    for exc in sorted(batch.exception_items, key=lambda x: x.id or 0):
+        parts.append(
+            f"exc:{exc.match_result_id}:{exc.exception_type}:{exc.status}:{exc.remarks or ''}"
+        )
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def init_db(app):
     if "sqlalchemy" not in app.extensions:
         db.init_app(app)

@@ -3,15 +3,15 @@ import io
 import json
 from models import (
     db, Batch, PurchaseOrder, Invoice, MatchResult, ExceptionItem,
-    ToleranceHistory, AuditLog,
+    ToleranceHistory, AuditLog, PayableRecalcNote,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
     MATCH_TYPE_UNMATCHED_PO, MATCH_TYPE_UNMATCHED_INVOICE,
     EXCEPTION_MISSING_FIELD, EXCEPTION_OVER_TOLERANCE,
     EXCEPTION_DUPLICATE_INVOICE,
-    EXCEPTION_STATUS_PENDING, RESULT_STATUS_PENDING,
-    compute_rule_version,
+    EXCEPTION_STATUS_PENDING, RESULT_STATUS_PENDING, RESULT_STATUS_REJECTED,
+    compute_rule_version, compute_note_content_hash,
 )
 
 PO_REQUIRED_COLUMNS = ["po_number", "vendor_code", "vendor_name", "amount", "po_date"]
@@ -356,6 +356,9 @@ def process_batch(batch_id):
             batch.status = BATCH_STATUS_MATCHED
 
         db.session.commit()
+
+        generate_payable_recalc_note(batch.id, change_source="MATCH", operator="system")
+
         return {"success": True, "has_exceptions": has_exceptions}
 
     except ValidationError:
@@ -431,3 +434,116 @@ def validate_and_import_invoice(batch_or_id, file_storage_or_content, filename=N
     db.session.add(log)
     db.session.commit()
     return len(rows)
+
+
+def _compute_payable_total(batch):
+    matched = [r for r in batch.match_results if r.match_type in (
+        MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)]
+    return round(sum(r.invoice_amount or 0 for r in matched if r.status != RESULT_STATUS_REJECTED), 2)
+
+
+def _collect_affected_documents(batch, prev_note):
+    """收集当前版本相对于上一版涉及变化的采购单和发票号"""
+    po_set = set()
+    inv_set = set()
+    for mr in batch.match_results:
+        if mr.po:
+            po_set.add(mr.po.po_number)
+        if mr.invoice:
+            inv_set.add(mr.invoice.invoice_number)
+    return sorted(po_set), sorted(inv_set)
+
+
+def _build_change_summary(batch, prev_note, current_total):
+    """生成变化摘要文本"""
+    parts = []
+    if prev_note is None:
+        parts.append(f"首次生成应付说明，应付合计 {current_total:.2f}")
+    else:
+        diff = round(current_total - prev_note.current_total, 2)
+        if diff != 0:
+            direction = "增加" if diff > 0 else "减少"
+            parts.append(f"应付合计{direction} {abs(diff):.2f}（{prev_note.current_total:.2f} → {current_total:.2f}）")
+        else:
+            parts.append(f"应付合计不变（{current_total:.2f}）")
+        if prev_note.rule_version != batch.rule_version:
+            parts.append(f"规则版本变更: {prev_note.rule_version[:8]} → {batch.rule_version[:8]}")
+    if not parts:
+        parts.append("匹配结果状态或异常处理意见变更")
+    return "; ".join(parts)
+
+
+def generate_payable_recalc_note(batch_id, change_source=None, operator="system"):
+    """
+    生成应付重算说明。
+    - 如果内容哈希与最新版本一致，不生成新记录（去重）
+    - 否则生成新版本，并将变化摘要写入操作日志
+    - 返回 (note_obj, is_new)
+    """
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        return None, False
+
+    content_hash = compute_note_content_hash(batch)
+
+    latest_note = (
+        PayableRecalcNote.query.filter_by(batch_id=batch_id)
+        .order_by(PayableRecalcNote.version.desc())
+        .first()
+    )
+
+    if latest_note and latest_note.content_hash == content_hash:
+        return latest_note, False
+
+    current_total = _compute_payable_total(batch)
+    previous_total = latest_note.current_total if latest_note else None
+    amount_diff = round(current_total - previous_total, 2) if previous_total is not None else None
+
+    po_numbers, invoice_numbers = _collect_affected_documents(batch, latest_note)
+    change_summary = _build_change_summary(batch, latest_note, current_total)
+
+    new_version = (latest_note.version + 1) if latest_note else 1
+
+    note = PayableRecalcNote(
+        batch_id=batch_id,
+        version=new_version,
+        current_total=current_total,
+        previous_total=previous_total,
+        amount_diff=amount_diff,
+        change_source=change_source,
+        change_summary=change_summary,
+        po_numbers=json.dumps(po_numbers, ensure_ascii=False),
+        invoice_numbers=json.dumps(invoice_numbers, ensure_ascii=False),
+        rule_version=batch.rule_version,
+        content_hash=content_hash,
+    )
+    db.session.add(note)
+
+    action = "RECALC_NOTE_V1" if new_version == 1 else f"RECALC_NOTE_V{new_version}"
+    log = AuditLog(
+        batch_id=batch_id,
+        action=action,
+        detail=f"应付重算说明 v{new_version}: {change_summary}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    return note, True
+
+
+def get_latest_recalc_note(batch_id):
+    """获取指定批次最新的应付重算说明"""
+    return (
+        PayableRecalcNote.query.filter_by(batch_id=batch_id)
+        .order_by(PayableRecalcNote.version.desc())
+        .first()
+    )
+
+
+def list_recalc_notes(batch_id):
+    """列出指定批次所有应付重算说明（按版本升序）"""
+    return (
+        PayableRecalcNote.query.filter_by(batch_id=batch_id)
+        .order_by(PayableRecalcNote.version.asc())
+        .all()
+    )

@@ -25,7 +25,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import (
-    MatchResult, ExceptionItem, Batch,
+    MatchResult, ExceptionItem, Batch, PayableRecalcNote,
     RESULT_STATUS_PENDING, RESULT_STATUS_CONFIRMED,
     MATCH_TYPE_OVER_TOLERANCE, MATCH_TYPE_UNMATCHED_PO, MATCH_TYPE_UNMATCHED_INVOICE,
     BATCH_STATUS_CREATED, BATCH_STATUS_POSTED, BATCH_STATUS_ROLLED_BACK,
@@ -302,3 +302,301 @@ def test_rollback_export_payable_consistent(client, sample_dir):
     )
     # 临时目录的导出文件存在
     assert os.path.exists(csv_path), f"临时目录导出文件不存在: {csv_path}"
+
+
+# ---------- 应付重算说明 测试辅助函数 ----------
+
+def get_latest_note(client, bid):
+    r = client.get(f"/api/batches/{bid}/recalc-notes/latest")
+    assert r.status_code == 200
+    return r.get_json().get("note")
+
+
+def list_notes(client, bid):
+    r = client.get(f"/api/batches/{bid}/recalc-notes")
+    assert r.status_code == 200
+    return r.get_json()["notes"]
+
+
+def match_and_resolve_all(client, bid, sample_dir):
+    upload_file(client, bid, "po", sample_dir, "purchase_orders.csv")
+    upload_file(client, bid, "invoice", sample_dir, "invoices.csv")
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+    resolve_all_exceptions(client, bid)
+    return bid
+
+
+# ---------- 应付重算说明 测试用例 ----------
+
+def test_recalc_note_first_generation(client, sample_dir):
+    """场景1: 首次匹配生成应付重算说明 v1"""
+    bid = create_batch(client, "test-note-v1")
+    upload_file(client, bid, "po", sample_dir, "purchase_orders.csv")
+    upload_file(client, bid, "invoice", sample_dir, "invoices.csv")
+
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    note = get_latest_note(client, bid)
+    assert note is not None, "匹配后应生成应付说明"
+    assert note["version"] == 1, f"首次生成版本应为 1，实际 {note['version']}"
+    assert note["previous_total"] is None, "v1 无 previous_total"
+    assert note["amount_diff"] is None, "v1 无 amount_diff"
+    assert isinstance(note["current_total"], float), "current_total 应为数值"
+    assert note["current_total"] > 0, "current_total 应大于 0"
+    assert note["change_source"] == "MATCH", f"change_source 应为 MATCH，实际 {note['change_source']}"
+    assert note["change_summary"], "change_summary 不能为空"
+    assert "首次生成" in note["change_summary"], f"v1 摘要应含'首次生成'，实际 {note['change_summary']}"
+    assert isinstance(note["po_numbers"], list), "po_numbers 应为列表"
+    assert isinstance(note["invoice_numbers"], list), "invoice_numbers 应为列表"
+    assert len(note["po_numbers"]) > 0, "po_numbers 不应为空"
+    assert len(note["invoice_numbers"]) > 0, "invoice_numbers 不应为空"
+    assert note["rule_version"], "rule_version 不能为空"
+    assert note["created_at"], "created_at 不能为空"
+
+
+def test_recalc_note_no_change_no_duplicate(client, sample_dir):
+    """场景2: 无变化重复生成不会堆积多条相同记录"""
+    bid = create_batch(client, "test-note-dedup")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    notes_before = list_notes(client, bid)
+    count_before = len(notes_before)
+    assert count_before >= 1
+
+    r = client.post(f"/api/batches/{bid}/recalc-notes/generate", json={"change_source": "MANUAL"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["is_new"] is False, "无变化时 is_new 应为 False"
+
+    notes_after = list_notes(client, bid)
+    count_after = len(notes_after)
+    assert count_after == count_before, f"无变化不应新增记录，{count_before} → {count_after}"
+
+    r = client.post(f"/api/batches/{bid}/recalc-notes/generate", json={"change_source": "MANUAL"})
+    assert r.status_code == 200
+    assert r.get_json()["is_new"] is False
+
+    notes_final = list_notes(client, bid)
+    assert len(notes_final) == count_before
+
+
+def test_recalc_note_change_creates_new_version(client, sample_dir):
+    """场景3: 异常处理变更后生成新版本 v2"""
+    bid = create_batch(client, "test-note-v2")
+    upload_file(client, bid, "po", sample_dir, "purchase_orders.csv")
+    upload_file(client, bid, "invoice", sample_dir, "invoices.csv")
+
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    note_v1 = get_latest_note(client, bid)
+    assert note_v1["version"] == 1
+    v1_total = note_v1["current_total"]
+
+    exs = get_exceptions(client, bid)
+    assert len(exs) > 0, "需要至少 1 条异常来测试"
+    exc0 = exs[0]
+
+    r = client.put(
+        f"/api/batches/{bid}/exceptions/{exc0['id']}/remark",
+        json={"remarks": "财务改了意见"},
+    )
+    assert r.status_code == 200
+
+    note_v2 = get_latest_note(client, bid)
+    assert note_v2 is not None
+    assert note_v2["version"] == 2, f"异常备注变更后应生成 v2，实际 {note_v2['version']}"
+    assert note_v2["previous_total"] == v1_total, "v2 previous_total 应等于 v1 current_total"
+    assert note_v2["change_source"] == "EXCEPTION_REMARK"
+    assert note_v2["change_summary"], "v2 摘要不能为空"
+
+    r = client.put(
+        f"/api/batches/{bid}/exceptions/{exc0['id']}/resolve",
+        json={"action": "reject"},
+    )
+    assert r.status_code == 200
+
+    note_v3 = get_latest_note(client, bid)
+    assert note_v3["version"] == 3, f"异常 reject 后应生成 v3，实际 {note_v3['version']}"
+    assert note_v3["change_source"] == "EXCEPTION_REJECT"
+
+    all_notes = list_notes(client, bid)
+    assert len(all_notes) == 3, f"应有 3 个版本，实际 {len(all_notes)}"
+    versions = [n["version"] for n in all_notes]
+    assert versions == [1, 2, 3], f"版本号应按升序 [1,2,3]，实际 {versions}"
+
+
+def test_recalc_note_persists_across_app_restart(client, sample_dir, tmp_path):
+    """场景4: 重启后数据保留（使用文件 SQLite 模拟持久化）"""
+    from app import create_app
+    from models import db
+
+    db_path = tmp_path / "persist_test.db"
+    db_uri = f"sqlite:///{db_path}"
+
+    app1 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app1.app_context():
+        db.create_all()
+    c1 = app1.test_client()
+
+    bid = create_batch(c1, "test-note-persist")
+    upload_file(c1, bid, "po", sample_dir, "purchase_orders.csv")
+    upload_file(c1, bid, "invoice", sample_dir, "invoices.csv")
+    r = c1.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    note_before = c1.get(f"/api/batches/{bid}/recalc-notes/latest").get_json()["note"]
+    assert note_before["version"] == 1
+    saved_total = note_before["current_total"]
+    saved_version = note_before["version"]
+    saved_summary = note_before["change_summary"]
+    saved_hash = note_before.get("rule_version")
+
+    with app1.app_context():
+        db.session.remove()
+
+    app2 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app2.app_context():
+        db.create_all()
+    c2 = app2.test_client()
+
+    note_after = c2.get(f"/api/batches/{bid}/recalc-notes/latest").get_json()["note"]
+    assert note_after is not None, "重启后应能读到说明"
+    assert note_after["version"] == saved_version, f"版本号应不变: {saved_version}"
+    assert note_after["current_total"] == saved_total, f"应付合计应不变: {saved_total}"
+    assert note_after["change_summary"] == saved_summary, "摘要应不变"
+
+    all_notes = c2.get(f"/api/batches/{bid}/recalc-notes").get_json()["notes"]
+    assert len(all_notes) == 1, "重启后记录数应不变"
+
+    with app2.app_context():
+        db.session.remove()
+        db.drop_all()
+
+
+def test_recalc_note_rollback_history_and_export_no_cross_data(client, sample_dir):
+    """场景5: 回滚后历史可查，当前导出不串数据"""
+    bid = create_batch(client, "test-note-rollback")
+    match_and_resolve_all(client, bid, sample_dir)
+    client.post(f"/api/batches/{bid}/confirm")
+    client.post(f"/api/batches/{bid}/post")
+
+    notes_before_rollback = list_notes(client, bid)
+    count_before = len(notes_before_rollback)
+    assert count_before >= 1, "回滚前至少有 1 条说明"
+
+    last_before = notes_before_rollback[-1]
+
+    r = client.post(f"/api/batches/{bid}/rollback")
+    assert r.status_code == 200
+    assert r.get_json()["status"] == BATCH_STATUS_ROLLED_BACK
+
+    notes_after_rollback = list_notes(client, bid)
+    count_after = len(notes_after_rollback)
+    assert count_after == count_before + 1, "回滚应生成新版本"
+
+    for i, n in enumerate(notes_before_rollback):
+        assert notes_after_rollback[i]["version"] == n["version"]
+        assert notes_after_rollback[i]["current_total"] == n["current_total"]
+        assert notes_after_rollback[i]["change_summary"] == n["change_summary"]
+
+    latest = get_latest_note(client, bid)
+    assert latest["change_source"] == "ROLLBACK"
+
+    api_payable = get_batch(client, bid)["summary"]["payable_total"]
+
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+    with io.StringIO(r.data.decode("utf-8-sig")) as f:
+        rows = list(csv.reader(f))
+
+    in_summary = False
+    exported_payable = None
+    exported_note_version = None
+    exported_note_summary = None
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "汇总信息":
+            in_summary = True
+            continue
+        if in_summary and row[0] == "应付合计":
+            exported_payable = float(row[1])
+        if in_summary and row[0] == "重算说明版本":
+            exported_note_version = int(row[1])
+        if in_summary and row[0] == "重算说明摘要":
+            exported_note_summary = row[1] if len(row) > 1 else ""
+
+    assert exported_payable is not None, "导出应含应付合计"
+    assert exported_payable == api_payable, f"导出应付 {exported_payable} != API {api_payable}"
+    assert exported_note_version == latest["version"], f"导出版本 {exported_note_version} != 最新 {latest['version']}"
+    assert exported_note_summary is not None, "导出应含重算说明摘要"
+    assert exported_note_summary == latest["change_summary"], "导出摘要应等于最新版本摘要"
+
+    r = client.post(f"/api/batches/{bid}/reset")
+    assert r.status_code == 200
+
+    notes_after_reset = list_notes(client, bid)
+    assert len(notes_after_reset) == count_after + 1, "重置也应生成新版本"
+    for i, n in enumerate(notes_after_rollback):
+        assert notes_after_reset[i]["version"] == n["version"]
+        assert notes_after_reset[i]["current_total"] == n["current_total"]
+
+
+def test_recalc_note_list_and_get_by_id(client, sample_dir):
+    """API: 列表查询和按ID查询"""
+    bid = create_batch(client, "test-note-api")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    notes = list_notes(client, bid)
+    assert len(notes) >= 1
+    n0 = notes[0]
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/{n0['id']}")
+    assert r.status_code == 200
+    fetched = r.get_json()["note"]
+    assert fetched["id"] == n0["id"]
+    assert fetched["version"] == n0["version"]
+    assert fetched["current_total"] == n0["current_total"]
+
+    r = client.get(f"/api/batches/{bid}/recalc-notes/99999")
+    assert r.status_code == 404
+
+
+def test_recalc_note_amount_aligned_with_batch_detail(client, sample_dir):
+    """导出金额与批次详情接口对齐"""
+    bid = create_batch(client, "test-note-align")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    batch = get_batch(client, bid)
+    api_payable = batch["summary"]["payable_total"]
+
+    note = get_latest_note(client, bid)
+    assert note["current_total"] == api_payable, (
+        f"说明应付 {note['current_total']} != 接口 {api_payable}"
+    )
+
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+    with io.StringIO(r.data.decode("utf-8-sig")) as f:
+        rows = list(csv.reader(f))
+    exported_payable = None
+    for row in rows:
+        if row and row[0] == "应付合计":
+            exported_payable = float(row[1])
+            break
+    assert exported_payable == api_payable, (
+        f"导出应付 {exported_payable} != 接口 {api_payable}"
+    )

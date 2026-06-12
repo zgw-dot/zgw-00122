@@ -106,3 +106,63 @@ POSTED → ROLLED_BACK → CREATED
 - 使用 SQLite 数据库（`reconciliation.db`），服务重启后数据完整保留
 - 回滚后应付合计与导出的对账报表保持一致
 - 容差变更历史、操作日志均持久化
+- 应付重算说明持久化存储，服务重启后历史版本完整可查
+
+## 应付重算说明
+
+当财务修改异常处理意见、回滚后重新匹配，或调整容差再跑一次时，系统自动生成应付重算说明，清晰记录应付金额变化的原因。
+
+### 字段说明
+
+| 字段 | 说明 |
+|------|------|
+| `version` | 版本号，每次有效变更自增 |
+| `current_total` | 本次应付合计 |
+| `previous_total` | 上一次应付合计（v1 为 null） |
+| `amount_diff` | 差额 = current_total - previous_total |
+| `change_source` | 变化来源（MATCH / EXCEPTION_REMARK / EXCEPTION_RESOLVE / UPDATE_TOLERANCE / CONFIRM / POST / ROLLBACK / RESET / MANUAL） |
+| `change_summary` | 变化摘要，人类可读文本 |
+| `po_numbers` | 涉及的采购单号列表 |
+| `invoice_numbers` | 涉及的发票号列表 |
+| `rule_version` | 对应规则版本哈希 |
+
+### 去重与版本控制
+
+- 基于「异常状态 + 备注 + 匹配结果 + 规则版本」计算 SHA-256 哈希作为内容指纹
+- 相同内容重复生成时不新增记录（`is_new: false`）
+- 只要异常状态、备注、匹配结果或规则版本任一变化，即生成新版本
+- 每次生成新版本自动写入操作日志（`RECALC_NOTE_V{n}`），包含变化摘要
+
+### API 接口
+
+```bash
+# 查询某批次全部历史说明（按版本升序）
+GET /api/batches/{batch_id}/recalc-notes
+
+# 查询最新版本说明
+GET /api/batches/{batch_id}/recalc-notes/latest
+
+# 按 ID 查询指定版本
+GET /api/batches/{batch_id}/recalc-notes/{note_id}
+
+# 手动触发生成（自动去重）
+POST /api/batches/{batch_id}/recalc-notes/generate
+Body: {"change_source": "MANUAL", "operator": "finance_user"}
+```
+
+### 导出报表
+
+导出 CSV 的「汇总信息」区自动附带：
+- 重算说明版本
+- 重算说明摘要
+- 重算来源
+- 上一次应付合计（如存在）
+- 应付差额（如存在）
+
+导出金额严格与批次详情接口 `/api/batches/{id}` 的 `summary.payable_total` 对齐。
+
+### 回滚与重置
+
+- 已回滚或重置的批次可查看全部历史说明（版本列表完整保留）
+- 回滚/重置操作本身也会生成新的说明版本，但旧版本不会被覆盖或修改
+- 导出始终取当前最新版本，不会串用回滚前的旧数据
