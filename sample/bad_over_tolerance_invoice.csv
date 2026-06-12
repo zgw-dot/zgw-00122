@@ -1,0 +1,2 @@
+invoice_number,vendor_code,vendor_name,amount,currency,invoice_date
+INV-2024-201,V006,超容差供应商,80000.00,CNY,2024-06-05

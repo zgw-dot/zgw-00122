@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>供应商对账批处理平台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  [v-cloak] { display: none; }
+  .fade-in { animation: fadeIn .2s ease-in; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .status-badge { @apply px-2 py-0.5 rounded text-xs font-semibold; }
+  .toast { @apply fixed top-4 right-4 z-50 px-4 py-3 rounded shadow-lg text-white text-sm max-w-md; }
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+<div id="app" v-cloak>
+  <nav class="bg-white shadow-sm border-b border-gray-200">
+    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
+          <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+        </div>
+        <h1 class="text-lg font-bold text-gray-800">供应商对账批处理平台</h1>
+      </div>
+      <button @click="showCreateModal=true" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition">+ 新建批次</button>
+    </div>
+  </nav>
+
+  <div v-if="toast.show" :class="['toast', toast.type==='success'?'bg-green-600':'bg-red-600']">
+    {{ toast.message }}
+  </div>
+
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <div class="mb-6">
+      <h2 class="text-lg font-semibold text-gray-700 mb-3">最近批次</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div v-for="b in recentBatches" :key="b.id" @click="openBatch(b.id)" class="bg-white rounded-xl shadow-sm border border-gray-100 p-4 cursor-pointer hover:shadow-md hover:border-indigo-200 transition">
+          <div class="flex justify-between items-start mb-2">
+            <span class="font-semibold text-gray-800 truncate">{{ b.name }}</span>
+            <span :class="statusClass(b.status)">{{ statusLabel(b.status) }}</span>
+          </div>
+          <div class="text-xs text-gray-500 mb-2">批次 #{{ b.id }} · {{ formatTime(b.updated_at) }}</div>
+          <div v-if="b.summary" class="flex gap-3 text-xs text-gray-600">
+            <span>匹配 {{ b.summary.matched_count }}</span>
+            <span>异常 {{ b.summary.exception_count }}</span>
+            <span>应付 ¥{{ b.summary.payable_total }}</span>
+          </div>
+        </div>
+      </div>
+      <div v-if="recentBatches.length===0" class="text-center text-gray-400 py-12">暂无批次，点击右上角新建批次开始</div>
+    </div>
+
+    <div v-if="currentBatch" class="fade-in">
+      <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6 mb-4">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h2 class="text-xl font-bold text-gray-800">{{ currentBatch.name }}</h2>
+            <div class="text-sm text-gray-500 mt-1">批次 #{{ currentBatch.id }} · 规则版本 {{ currentBatch.rule_version }}</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span :class="statusClass(currentBatch.status)">{{ statusLabel(currentBatch.status) }}</span>
+            <button @click="currentBatch=null" class="text-gray-400 hover:text-gray-600 ml-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="flex border-b border-gray-200 mb-4">
+          <button v-for="tab in tabs" :key="tab.key" @click="activeTab=tab.key" :class="['px-4 py-2 text-sm font-medium border-b-2 -mb-px transition', activeTab===tab.key?'border-indigo-600 text-indigo-600':'border-transparent text-gray-500 hover:text-gray-700']">{{ tab.label }}</button>
+        </div>
+
+        <div v-if="activeTab==='upload'">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <h3 class="font-medium text-gray-700 mb-2">采购单文件</h3>
+              <div v-if="currentBatch.po_filename" class="text-sm text-green-600 mb-2">已上传: {{ currentBatch.po_filename }}</div>
+              <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center" @dragover.prevent @drop.prevent="handleDrop($event,'po')">
+                <input type="file" ref="poFile" accept=".csv,.xlsx,.xls" @change="uploadFile($event,'po')" class="hidden">
+                <button @click="$refs.poFile.click()" :disabled="!canUpload" class="text-indigo-600 hover:text-indigo-800 text-sm">选择采购单文件</button>
+                <p class="text-xs text-gray-400 mt-1">支持 CSV / XLSX</p>
+              </div>
+            </div>
+            <div>
+              <h3 class="font-medium text-gray-700 mb-2">发票文件</h3>
+              <div v-if="currentBatch.invoice_filename" class="text-sm text-green-600 mb-2">已上传: {{ currentBatch.invoice_filename }}</div>
+              <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center" @dragover.prevent @drop.prevent="handleDrop($event,'invoice')">
+                <input type="file" ref="invoiceFile" accept=".csv,.xlsx,.xls" @change="uploadFile($event,'invoice')" class="hidden">
+                <button @click="$refs.invoiceFile.click()" :disabled="!canUpload" class="text-indigo-600 hover:text-indigo-800 text-sm">选择发票文件</button>
+                <p class="text-xs text-gray-400 mt-1">支持 CSV / XLSX</p>
+              </div>
+            </div>
+          </div>
+          <div class="mt-4 flex items-center gap-4">
+            <div class="flex items-center gap-2">
+              <label class="text-sm text-gray-600">容差百分比(%)</label>
+              <input type="number" v-model.number="toleranceForm.pct" step="0.1" min="0" class="w-20 border rounded px-2 py-1 text-sm" :disabled="!canUpload">
+            </div>
+            <div class="flex items-center gap-2">
+              <label class="text-sm text-gray-600">容差绝对值</label>
+              <input type="number" v-model.number="toleranceForm.abs" step="1" min="0" class="w-20 border rounded px-2 py-1 text-sm" :disabled="!canUpload">
+            </div>
+            <button @click="updateTolerance" :disabled="!canUpload" class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1 rounded text-sm transition">保存容差</button>
+          </div>
+          <div class="mt-4 flex gap-3">
+            <button @click="runMatch" :disabled="!canMatch" class="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-6 py-2 rounded-lg text-sm font-medium transition">执行匹配</button>
+          </div>
+        </div>
+
+        <div v-if="activeTab==='results'">
+          <div v-if="batchSummary" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+            <div class="bg-green-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-green-700">{{ batchSummary.matched_count }}</div><div class="text-xs text-green-600">匹配成功</div></div>
+            <div class="bg-yellow-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-yellow-700">{{ batchSummary.unmatched_po_count }}</div><div class="text-xs text-yellow-600">未匹配采购单</div></div>
+            <div class="bg-orange-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-orange-700">{{ batchSummary.unmatched_invoice_count }}</div><div class="text-xs text-orange-600">未匹配发票</div></div>
+            <div class="bg-red-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-red-700">{{ batchSummary.exception_count }}</div><div class="text-xs text-red-600">待处理异常</div></div>
+            <div class="bg-blue-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-blue-700">¥{{ batchSummary.payable_total }}</div><div class="text-xs text-blue-600">应付合计</div></div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-gray-50 text-gray-600">
+                <tr>
+                  <th class="px-3 py-2 text-left">采购单号</th>
+                  <th class="px-3 py-2 text-left">发票号</th>
+                  <th class="px-3 py-2 text-left">供应商</th>
+                  <th class="px-3 py-2 text-right">采购金额</th>
+                  <th class="px-3 py-2 text-right">发票金额</th>
+                  <th class="px-3 py-2 text-right">差异</th>
+                  <th class="px-3 py-2 text-center">匹配类型</th>
+                  <th class="px-3 py-2 text-center">状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in matchResults" :key="r.id" class="border-b border-gray-100 hover:bg-gray-50">
+                  <td class="px-3 py-2">{{ r.po_number||'-' }}</td>
+                  <td class="px-3 py-2">{{ r.invoice_number||'-' }}</td>
+                  <td class="px-3 py-2">{{ r.vendor_name||'-' }}</td>
+                  <td class="px-3 py-2 text-right">{{ r.po_amount!=null ? '¥'+r.po_amount.toFixed(2) : '-' }}</td>
+                  <td class="px-3 py-2 text-right">{{ r.invoice_amount!=null ? '¥'+r.invoice_amount.toFixed(2) : '-' }}</td>
+                  <td class="px-3 py-2 text-right" :class="r.amount_diff!=null&&r.amount_diff>0?'text-red-600':''">{{ r.amount_diff!=null ? r.amount_diff.toFixed(2) : '-' }}</td>
+                  <td class="px-3 py-2 text-center"><span :class="matchTypeClass(r.match_type)">{{ matchTypeLabel(r.match_type) }}</span></td>
+                  <td class="px-3 py-2 text-center">{{ r.status }}</td>
+                </tr>
+                <tr v-if="matchResults.length===0"><td colspan="8" class="text-center text-gray-400 py-8">暂无匹配结果</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div v-if="activeTab==='exceptions'">
+          <div v-if="exceptions.length===0" class="text-center text-gray-400 py-8">暂无异常</div>
+          <div v-for="e in exceptions" :key="e.id" class="border rounded-lg p-4 mb-3" :class="e.status==='PENDING'?'border-red-200 bg-red-50':'border-green-200 bg-green-50'">
+            <div class="flex justify-between items-start mb-2">
+              <div>
+                <span class="font-medium text-sm" :class="e.status==='PENDING'?'text-red-700':'text-green-700'">{{ e.exception_type }}</span>
+                <span class="ml-2 text-xs px-2 py-0.5 rounded" :class="e.status==='PENDING'?'bg-red-200 text-red-800':'bg-green-200 text-green-800'">{{ e.status }}</span>
+              </div>
+            </div>
+            <p class="text-sm text-gray-700 mb-2">{{ e.detail }}</p>
+            <div class="flex items-center gap-2">
+              <input type="text" v-model="e._remarks" :placeholder="e.remarks||'添加备注...'" class="flex-1 border rounded px-2 py-1 text-sm">
+              <button @click="saveRemark(e)" class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1 rounded text-xs">保存备注</button>
+              <button v-if="e.status==='PENDING'" @click="resolveException(e,'resolve')" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-xs">确认</button>
+              <button v-if="e.status==='PENDING'" @click="resolveException(e,'reject')" class="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-xs">驳回</button>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="activeTab==='actions'">
+          <div class="space-y-4">
+            <div class="flex items-center gap-4">
+              <button @click="confirmBatch" :disabled="!canConfirm" class="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 text-white px-6 py-2 rounded-lg text-sm font-medium transition">确认入账</button>
+              <span class="text-xs text-gray-500" v-if="currentBatch.status==='EXCEPTION_PENDING'">需先处理所有异常</span>
+            </div>
+            <div class="flex items-center gap-4">
+              <button @click="postBatch" :disabled="!canPost" class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 text-white px-6 py-2 rounded-lg text-sm font-medium transition">入账</button>
+            </div>
+            <div class="flex items-center gap-4">
+              <button @click="rollbackBatch" :disabled="!canRollback" class="bg-orange-600 hover:bg-orange-700 disabled:bg-gray-300 text-white px-6 py-2 rounded-lg text-sm font-medium transition">回滚</button>
+            </div>
+            <div class="flex items-center gap-4">
+              <button @click="resetBatch" :disabled="!canReset" class="bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white px-6 py-2 rounded-lg text-sm font-medium transition">重置批次</button>
+            </div>
+            <div class="flex items-center gap-4">
+              <button @click="exportReport" class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2 rounded-lg text-sm font-medium transition">导出对账报表</button>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="activeTab==='history'">
+          <div class="space-y-2">
+            <div v-for="th in toleranceHistory" :key="th.id" class="bg-gray-50 rounded-lg p-3 flex justify-between text-sm">
+              <span>容差: {{ th.tolerance_pct }}% / ¥{{ th.tolerance_abs }} · 版本 {{ th.rule_version }}</span>
+              <span class="text-gray-400">{{ formatTime(th.changed_at) }}</span>
+            </div>
+            <div v-if="toleranceHistory.length===0" class="text-center text-gray-400 py-4">暂无容差变更记录</div>
+          </div>
+          <h3 class="font-medium text-gray-700 mt-6 mb-2">操作日志</h3>
+          <div class="space-y-2">
+            <div v-for="log in auditLogs" :key="log.id" class="bg-gray-50 rounded-lg p-3 flex justify-between text-sm">
+              <div><span class="font-medium">{{ log.action }}</span> <span class="text-gray-500">{{ log.detail||'' }}</span></div>
+              <span class="text-gray-400 text-xs">{{ formatTime(log.created_at) }}</span>
+            </div>
+            <div v-if="auditLogs.length===0" class="text-center text-gray-400 py-4">暂无操作日志</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showCreateModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showCreateModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+      <h3 class="text-lg font-bold mb-4">新建批次</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">批次名称</label>
+          <input type="text" v-model="createForm.name" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="例: 2024年6月对账批次">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">容差百分比(%)</label>
+            <input type="number" v-model.number="createForm.tolerance_pct" step="0.1" min="0" class="w-full border rounded-lg px-3 py-2 text-sm">
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">容差绝对值</label>
+            <input type="number" v-model.number="createForm.tolerance_abs" step="1" min="0" class="w-full border rounded-lg px-3 py-2 text-sm">
+          </div>
+        </div>
+      </div>
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showCreateModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
+        <button @click="createBatch" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium">创建</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
