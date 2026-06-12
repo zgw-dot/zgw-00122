@@ -19,6 +19,9 @@ from matcher import (
     compare_notes, get_latest_comparison, list_comparisons, get_comparison,
     list_comparisons_with_filter, get_latest_confirmed_comparison,
     update_comparison_review, batch_update_comparison_review,
+    create_import_draft, get_latest_draft, list_drafts, get_draft,
+    confirm_draft, discard_draft, DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
+    DRAFT_STATUS_PENDING,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +195,127 @@ def upload_invoice(batch_id):
         db.session.add(log)
         db.session.commit()
         return jsonify({"imported": count, "filename": f.filename})
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/precheck-po", methods=["POST"])
+def precheck_po(batch_id):
+    """上传采购单并创建预检草稿"""
+    batch = Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    try:
+        content = f.read().decode("utf-8-sig")
+        operator = request.form.get("operator", "web_user")
+        draft, is_new, conflict = create_import_draft(
+            batch.id, content, f.filename, DRAFT_FILE_TYPE_PO, operator=operator
+        )
+        resp = draft.to_dict()
+        resp["is_new"] = is_new
+        if conflict:
+            resp["conflict"] = conflict
+        return jsonify(resp)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/precheck-invoice", methods=["POST"])
+def precheck_invoice(batch_id):
+    """上传发票并创建预检草稿"""
+    batch = Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    try:
+        content = f.read().decode("utf-8-sig")
+        operator = request.form.get("operator", "web_user")
+        draft, is_new, conflict = create_import_draft(
+            batch.id, content, f.filename, DRAFT_FILE_TYPE_INVOICE, operator=operator
+        )
+        resp = draft.to_dict()
+        resp["is_new"] = is_new
+        if conflict:
+            resp["conflict"] = conflict
+        return jsonify(resp)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/drafts", methods=["GET"])
+def list_batch_drafts(batch_id):
+    """列出批次的所有草稿"""
+    batch = Batch.query.get_or_404(batch_id)
+    file_type = request.args.get("file_type")
+    status = request.args.get("status")
+    drafts = list_drafts(batch_id, file_type=file_type, status=status)
+    return jsonify({"drafts": [d.to_dict() for d in drafts]})
+
+
+@bp.route("/api/batches/<int:batch_id>/drafts/latest", methods=["GET"])
+def get_batch_latest_draft(batch_id):
+    """获取批次最新草稿"""
+    batch = Batch.query.get_or_404(batch_id)
+    file_type = request.args.get("file_type")
+    draft = get_latest_draft(batch_id, file_type=file_type)
+    if draft is None:
+        return jsonify({"draft": None})
+    return jsonify({"draft": draft.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/drafts/<int:draft_id>", methods=["GET"])
+def get_batch_draft(batch_id, draft_id):
+    """获取单个草稿详情"""
+    batch = Batch.query.get_or_404(batch_id)
+    draft = get_draft(draft_id)
+    if draft is None:
+        return jsonify({"error": "草稿不存在"}), 404
+    if draft.batch_id != batch_id:
+        return jsonify({"error": "草稿不属于该批次"}), 400
+    return jsonify({"draft": draft.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/drafts/<int:draft_id>/confirm", methods=["POST"])
+def confirm_batch_draft(batch_id, draft_id):
+    """确认草稿，写入正式数据"""
+    batch = Batch.query.get_or_404(batch_id)
+    draft = get_draft(draft_id)
+    if draft is None:
+        return jsonify({"error": "草稿不存在"}), 404
+    if draft.batch_id != batch_id:
+        return jsonify({"error": "草稿不属于该批次"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        operator = payload.get("operator", "web_user")
+        result = confirm_draft(draft_id, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/drafts/<int:draft_id>/discard", methods=["POST"])
+def discard_batch_draft(batch_id, draft_id):
+    """丢弃草稿"""
+    batch = Batch.query.get_or_404(batch_id)
+    draft = get_draft(draft_id)
+    if draft is None:
+        return jsonify({"error": "草稿不存在"}), 404
+    if draft.batch_id != batch_id:
+        return jsonify({"error": "草稿不属于该批次"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        operator = payload.get("operator", "web_user")
+        result = discard_draft(draft_id, operator=operator)
+        return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
         return jsonify({"error": str(e), "details": e.details}), 400

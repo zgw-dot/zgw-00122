@@ -2035,3 +2035,562 @@ def test_index_page_has_batch_review_ui(client, sample_dir):
     assert "全选待复核" in html, "页面应包含'全选待复核'"
     assert "已选" in html, "页面应显示已选数量"
     assert "批量操作结果" in html, "页面应展示批量操作冲突结果"
+
+
+# ---------- 预检草稿 测试辅助函数 ----------
+
+def precheck_file_api(client, bid, typ, sample_dir, filename, operator="test_user"):
+    path = os.path.join(sample_dir, filename)
+    with open(path, "rb") as f:
+        data = {"file": (f, filename), "operator": operator}
+        url = f"/api/batches/{bid}/precheck-{typ}"
+        r = client.post(url, data=data, content_type="multipart/form-data")
+    return r.get_json() if r.content_type.startswith("application/json") else {"status_code": r.status_code, "raw": r.data.decode("utf-8", errors="replace")}
+
+
+def precheck_csv_bytes(client, bid, typ, csv_text, filename="data.csv", operator="test_user"):
+    data = {"file": (BytesIO(csv_text.encode("utf-8-sig")), filename), "operator": operator}
+    url = f"/api/batches/{bid}/precheck-{typ}"
+    r = client.post(url, data=data, content_type="multipart/form-data")
+    return r.get_json() if r.content_type.startswith("application/json") else {"status_code": r.status_code, "raw": r.data.decode("utf-8", errors="replace")}
+
+
+def get_draft_api(client, bid, draft_id):
+    r = client.get(f"/api/batches/{bid}/drafts/{draft_id}")
+    assert r.status_code == 200
+    return r.get_json()["draft"]
+
+
+def list_drafts_api(client, bid, file_type=None, status=None):
+    url = f"/api/batches/{bid}/drafts"
+    params = []
+    if file_type:
+        params.append(f"file_type={file_type}")
+    if status:
+        params.append(f"status={status}")
+    if params:
+        url += "?" + "&".join(params)
+    r = client.get(url)
+    assert r.status_code == 200
+    return r.get_json()["drafts"]
+
+
+def get_latest_draft_api(client, bid, file_type=None):
+    url = f"/api/batches/{bid}/drafts/latest"
+    if file_type:
+        url += f"?file_type={file_type}"
+    r = client.get(url)
+    assert r.status_code == 200
+    return r.get_json().get("draft")
+
+
+def confirm_draft_api(client, bid, draft_id, operator="test_user"):
+    r = client.post(
+        f"/api/batches/{bid}/drafts/{draft_id}/confirm",
+        json={"operator": operator},
+    )
+    return r.get_json() if r.content_type.startswith("application/json") else {"status_code": r.status_code}
+
+
+def discard_draft_api(client, bid, draft_id, operator="test_user"):
+    r = client.post(
+        f"/api/batches/{bid}/drafts/{draft_id}/discard",
+        json={"operator": operator},
+    )
+    return r.get_json() if r.content_type.startswith("application/json") else {"status_code": r.status_code}
+
+
+# ---------- 预检草稿 测试用例 ----------
+
+def test_precheck_normal_import_flow(client, sample_dir):
+    """正常导入流程：预检 → 确认 → 数据写入成功"""
+    bid = create_batch(client, "test-precheck-normal")
+
+    r = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert "error" not in r, f"预检PO失败: {r}"
+    assert r["file_type"] == "PO"
+    assert r["status"] == "PENDING"
+    assert r["row_count"] > 0
+    assert r["error_count"] == 0
+    assert r["warning_count"] >= 0
+    po_draft_id = r["id"]
+
+    r = precheck_file_api(client, bid, "invoice", sample_dir, "invoices.csv")
+    assert "error" not in r, f"预检发票失败: {r}"
+    assert r["file_type"] == "INVOICE"
+    assert r["status"] == "PENDING"
+    assert r["row_count"] > 0
+    assert r["error_count"] == 0
+    inv_draft_id = r["id"]
+
+    batch_before = get_batch(client, bid)
+    assert batch_before["po_filename"] is None, "预检不应写入正式数据"
+    assert batch_before["invoice_filename"] is None
+
+    r = confirm_draft_api(client, bid, po_draft_id, operator="finance_user")
+    assert r["success"] is True
+    assert r["imported_count"] > 0
+
+    r = confirm_draft_api(client, bid, inv_draft_id, operator="finance_user")
+    assert r["success"] is True
+    assert r["imported_count"] > 0
+
+    batch_after = get_batch(client, bid)
+    assert batch_after["po_filename"] == "purchase_orders.csv"
+    assert batch_after["invoice_filename"] == "invoices.csv"
+
+    from models import PurchaseOrder, Invoice
+    with client.application.app_context():
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() > 0
+        assert Invoice.query.filter_by(batch_id=bid).count() > 0
+
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+
+def test_precheck_missing_columns_does_not_pollute_data(client, sample_dir):
+    """缺列文件预检失败，确认丢弃后不污染数据"""
+    bid = create_batch(client, "test-precheck-missing-col")
+
+    r = precheck_file_api(client, bid, "po", sample_dir, "bad_missing_columns.csv")
+    assert "error" not in r, f"预检请求本身失败: {r}"
+    assert r["error_count"] > 0, "缺列文件应有错误"
+    assert any("缺少必填列" in issue["message"] for issue in r["issues"]), "应检测到缺列"
+    draft_id = r["id"]
+
+    batch_before = get_batch(client, bid)
+    assert batch_before["po_filename"] is None
+
+    r = discard_draft_api(client, bid, draft_id, operator="finance_user")
+    assert r["success"] is True
+
+    batch_after = get_batch(client, bid)
+    assert batch_after["po_filename"] is None
+
+    from models import PurchaseOrder, ImportDraft
+    with client.application.app_context():
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 0
+        draft = ImportDraft.query.get(draft_id)
+        assert draft.status == "DISCARDED"
+
+
+def test_precheck_duplicate_invoice_does_not_pollute_data(client, sample_dir):
+    """重复发票号预检检测到错误，丢弃后不污染数据"""
+    bid = create_batch(client, "test-precheck-dup-inv")
+
+    r = precheck_file_api(client, bid, "po", sample_dir, "bad_over_tolerance_po.csv")
+    assert "error" not in r
+    po_draft_id = r["id"]
+
+    r = precheck_file_api(client, bid, "invoice", sample_dir, "bad_duplicate_invoice.csv")
+    assert "error" not in r
+    assert r["error_count"] > 0
+    assert any("发票号重复" in issue["message"] for issue in r["issues"]), "应检测到重复发票号"
+    inv_draft_id = r["id"]
+
+    batch_before = get_batch(client, bid)
+    assert batch_before["invoice_filename"] is None
+
+    discard_draft_api(client, bid, po_draft_id)
+    discard_draft_api(client, bid, inv_draft_id)
+
+    batch_after = get_batch(client, bid)
+    assert batch_after["po_filename"] is None
+    assert batch_after["invoice_filename"] is None
+
+    from models import PurchaseOrder, Invoice
+    with client.application.app_context():
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 0
+        assert Invoice.query.filter_by(batch_id=bid).count() == 0
+
+
+def test_precheck_discard_does_not_pollute_data(client, sample_dir):
+    """正常文件预检后取消（丢弃），不写入任何数据"""
+    bid = create_batch(client, "test-precheck-discard")
+
+    r = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert "error" not in r
+    assert r["error_count"] == 0
+    draft_id = r["id"]
+
+    batch_before = get_batch(client, bid)
+    assert batch_before["po_filename"] is None
+
+    r = discard_draft_api(client, bid, draft_id, operator="finance_user")
+    assert r["success"] is True
+
+    batch_after = get_batch(client, bid)
+    assert batch_after["po_filename"] is None
+
+    from models import PurchaseOrder, ImportDraft
+    with client.application.app_context():
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 0
+        draft = ImportDraft.query.get(draft_id)
+        assert draft.status == "DISCARDED"
+
+    with client.application.app_context():
+        from models import AuditLog
+        logs = AuditLog.query.filter_by(batch_id=bid, action="DRAFT_DISCARDED_PO").all()
+        assert len(logs) == 1, "丢弃草稿应写审计日志"
+
+
+def test_precheck_draft_conflict_handling(client, sample_dir):
+    """同类文件重新上传时，旧草稿自动丢弃并记录冲突"""
+    bid = create_batch(client, "test-precheck-conflict")
+
+    r1 = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert "error" not in r1
+    old_draft_id = r1["id"]
+
+    r2 = precheck_file_api(client, bid, "po", sample_dir, "bad_over_tolerance_po.csv")
+    assert "error" not in r2
+    assert r2["conflict"] is not None
+    assert r2["conflict"]["old_draft_id"] == old_draft_id
+    new_draft_id = r2["id"]
+
+    assert old_draft_id != new_draft_id
+
+    old_draft = get_draft_api(client, bid, old_draft_id)
+    assert old_draft["status"] == "DISCARDED"
+
+    new_draft = get_draft_api(client, bid, new_draft_id)
+    assert new_draft["status"] == "PENDING"
+
+    from models import AuditLog
+    with client.application.app_context():
+        logs = AuditLog.query.filter_by(batch_id=bid, action="DRAFT_CONFLICT_DISCARDED").all()
+        assert len(logs) == 1, "冲突处理应写审计日志"
+
+
+def test_precheck_same_file_no_duplicate_draft(client, sample_dir):
+    """相同内容文件重复上传不创建新草稿"""
+    bid = create_batch(client, "test-precheck-same-file")
+
+    r1 = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert "error" not in r1
+    assert r1["is_new"] is True
+    draft_id_1 = r1["id"]
+
+    r2 = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert "error" not in r2
+    assert r2["is_new"] is False
+    draft_id_2 = r2["id"]
+
+    assert draft_id_1 == draft_id_2, "相同文件应返回同一草稿"
+
+    drafts = list_drafts_api(client, bid, file_type="PO")
+    assert len(drafts) == 1, "不应创建重复草稿"
+
+
+def test_precheck_tolerance_snapshot_preserved(client, sample_dir):
+    """草稿保存容差配置快照，修改容差后快照不变"""
+    bid = create_batch(client, "test-precheck-tolerance-snap", pct=2.0, ab=100.0)
+
+    r = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert "error" not in r
+    draft_id = r["id"]
+    assert r["tolerance_pct"] == 2.0
+    assert r["tolerance_abs"] == 100.0
+
+    client.put(f"/api/batches/{bid}/tolerance", json={"tolerance_pct": 5.0, "tolerance_abs": 200.0})
+
+    draft = get_draft_api(client, bid, draft_id)
+    assert draft["tolerance_pct"] == 2.0, "容差快照不应随批次更新"
+    assert draft["tolerance_abs"] == 100.0, "容差快照不应随批次更新"
+    assert draft["rule_version"] == r["rule_version"], "规则版本快照应保持不变"
+
+
+def test_precheck_persists_across_restart(client, sample_dir, tmp_path):
+    """跨服务重启，预检草稿仍可查询"""
+    from app import create_app
+    from models import db
+
+    db_path = tmp_path / "draft_persist_test.db"
+    db_uri = f"sqlite:///{db_path}"
+
+    app1 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app1.app_context():
+        db.create_all()
+    c1 = app1.test_client()
+
+    bid = create_batch(c1, "test-precheck-persist")
+
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-001,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-002,V001,供应商A,20000.00,2024-01-01\n"
+    )
+    r = precheck_csv_bytes(c1, bid, "po", po_csv, "persist_po.csv", operator="persist_user")
+    assert "error" not in r
+    draft_id = r["id"]
+    saved_error_count = r["error_count"]
+    saved_warning_count = r["warning_count"]
+    saved_tolerance_pct = r["tolerance_pct"]
+    saved_tolerance_abs = r["tolerance_abs"]
+    saved_file_hash = r["file_hash"]
+
+    latest_before = get_latest_draft_api(c1, bid, file_type="PO")
+    assert latest_before is not None
+    assert latest_before["id"] == draft_id
+
+    with app1.app_context():
+        db.session.remove()
+
+    app2 = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": db_uri,
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": str(tmp_path),
+    })
+    with app2.app_context():
+        db.create_all()
+    c2 = app2.test_client()
+
+    draft_after = get_draft_api(c2, bid, draft_id)
+    assert draft_after is not None
+    assert draft_after["id"] == draft_id
+    assert draft_after["status"] == "PENDING"
+    assert draft_after["error_count"] == saved_error_count
+    assert draft_after["warning_count"] == saved_warning_count
+    assert draft_after["tolerance_pct"] == saved_tolerance_pct
+    assert draft_after["tolerance_abs"] == saved_tolerance_abs
+    assert draft_after["file_hash"] == saved_file_hash
+    assert draft_after["precheck_report"] is not None
+    assert len(draft_after["issues"]) >= 0
+
+    latest_after = get_latest_draft_api(c2, bid, file_type="PO")
+    assert latest_after is not None
+    assert latest_after["id"] == draft_id
+
+    all_drafts = list_drafts_api(c2, bid)
+    assert len(all_drafts) >= 1
+
+    with app2.app_context():
+        db.session.remove()
+        db.drop_all()
+
+
+def test_precheck_draft_list_and_filter(client, sample_dir):
+    """草稿列表查询和筛选功能正常"""
+    bid = create_batch(client, "test-precheck-list-filter")
+
+    r1 = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    po_draft_id = r1["id"]
+
+    r2 = precheck_file_api(client, bid, "invoice", sample_dir, "invoices.csv")
+    inv_draft_id = r2["id"]
+
+    all_drafts = list_drafts_api(client, bid)
+    assert len(all_drafts) == 2
+
+    po_drafts = list_drafts_api(client, bid, file_type="PO")
+    assert len(po_drafts) == 1
+    assert po_drafts[0]["id"] == po_draft_id
+
+    inv_drafts = list_drafts_api(client, bid, file_type="INVOICE")
+    assert len(inv_drafts) == 1
+    assert inv_drafts[0]["id"] == inv_draft_id
+
+    pending_drafts = list_drafts_api(client, bid, status="PENDING")
+    assert len(pending_drafts) == 2
+
+    discard_draft_api(client, bid, po_draft_id)
+
+    pending_after = list_drafts_api(client, bid, status="PENDING")
+    assert len(pending_after) == 1
+    assert pending_after[0]["id"] == inv_draft_id
+
+    discarded = list_drafts_api(client, bid, status="DISCARDED")
+    assert len(discarded) == 1
+    assert discarded[0]["id"] == po_draft_id
+
+
+def test_precheck_vendor_consistency_warning(client, sample_dir):
+    """供应商不一致检测生成警告"""
+    bid = create_batch(client, "test-precheck-vendor-warn")
+
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-001,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-002,V002,供应商B,20000.00,2024-01-01\n"
+    )
+    r = precheck_csv_bytes(client, bid, "po", po_csv, "multi_vendor_po.csv")
+    assert "error" not in r
+    assert r["warning_count"] >= 1
+    assert any("VENDOR_INCONSISTENT" == issue["issue_code"] for issue in r["issues"])
+    assert any("不同的供应商编码" in issue["message"] for issue in r["issues"])
+
+
+def test_precheck_amount_format_validation(client, sample_dir):
+    """金额格式错误检测"""
+    bid = create_batch(client, "test-precheck-amount-format")
+
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-001,V001,供应商A,not_a_number,2024-01-01\n"
+        "PO-002,V001,供应商A,-500.00,2024-01-01\n"
+        "PO-003,V001,供应商A,0,2024-01-01\n"
+    )
+    r = precheck_csv_bytes(client, bid, "po", po_csv, "bad_amount_po.csv")
+    assert "error" not in r
+
+    error_issues = [i for i in r["issues"] if i["issue_type"] == "ERROR"]
+    warning_issues = [i for i in r["issues"] if i["issue_type"] == "WARNING"]
+
+    assert any("金额格式错误" in i["message"] for i in error_issues), "应检测到金额格式错误"
+    assert any("NEGATIVE_AMOUNT" == i["issue_code"] for i in warning_issues), "应检测到负金额警告"
+    assert any("ZERO_AMOUNT" == i["issue_code"] for i in warning_issues), "应检测到零金额警告"
+
+
+def test_precheck_vendor_mismatch_with_existing_data(client, sample_dir):
+    """批次已有对方单据时，检测供应商不匹配"""
+    bid = create_batch(client, "test-precheck-vendor-mismatch")
+
+    inv_csv = (
+        "invoice_number,vendor_code,vendor_name,amount,invoice_date\n"
+        "INV-001,V001,供应商A,10000.00,2024-01-01\n"
+    )
+    r = precheck_csv_bytes(client, bid, "invoice", inv_csv, "vendor_a_inv.csv")
+    confirm_draft_api(client, bid, r["id"])
+
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-001,V002,供应商B,10000.00,2024-01-01\n"
+    )
+    r = precheck_csv_bytes(client, bid, "po", po_csv, "vendor_b_po.csv")
+    assert "error" not in r
+
+    assert any("VENDOR_MISMATCH" == i["issue_code"] for i in r["issues"]), "应检测到供应商不匹配警告"
+    assert any("V001" in i["message"] for i in r["issues"]), "警告应包含已有供应商编码"
+
+
+def test_precheck_full_api_flow_with_requests_like(client, sample_dir):
+    """完整预检链路测试：模拟 requests 客户端调用"""
+    bid = create_batch(client, "test-precheck-full-flow", pct=3.0, ab=150.0)
+
+    po_content = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-A,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-B,V001,供应商A,20000.00,2024-01-01\n"
+    )
+    inv_content = (
+        "invoice_number,vendor_code,vendor_name,amount,invoice_date\n"
+        "INV-A,V001,供应商A,10000.00,2024-01-02\n"
+        "INV-B,V001,供应商A,20000.00,2024-01-02\n"
+    )
+
+    r = precheck_csv_bytes(client, bid, "po", po_content, "po_flow.csv", operator="test_op")
+    assert "error" not in r
+    assert r["file_type"] == "PO"
+    assert r["status"] == "PENDING"
+    assert r["row_count"] == 2
+    assert r["error_count"] == 0
+    assert r["warning_count"] == 0
+    assert r["tolerance_pct"] == 3.0
+    assert r["tolerance_abs"] == 150.0
+    assert r["operator"] == "test_op"
+    assert r["precheck_report"] is not None
+    assert len(r["issues"]) == 0
+    po_draft_id = r["id"]
+
+    r = precheck_csv_bytes(client, bid, "invoice", inv_content, "inv_flow.csv", operator="test_op")
+    assert "error" not in r
+    assert r["file_type"] == "INVOICE"
+    inv_draft_id = r["id"]
+
+    r = confirm_draft_api(client, bid, po_draft_id, operator="test_op")
+    assert r["success"] is True
+    assert r["imported_count"] == 2
+
+    r = confirm_draft_api(client, bid, inv_draft_id, operator="test_op")
+    assert r["success"] is True
+    assert r["imported_count"] == 2
+
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    results = get_results(client, bid)
+    assert len(results) == 2
+    assert all(r["match_type"] == "EXACT" for r in results)
+
+    from models import AuditLog
+    with client.application.app_context():
+        logs = AuditLog.query.filter_by(batch_id=bid).all()
+        actions = [l.action for l in logs]
+        assert "DRAFT_CREATED_PO" in actions
+        assert "DRAFT_CREATED_INVOICE" in actions
+        assert "DRAFT_CONFIRMED_PO" in actions
+        assert "DRAFT_CONFIRMED_INVOICE" in actions
+        assert "MATCH" in actions
+
+
+def test_precheck_draft_not_found_returns_404(client, sample_dir):
+    """访问不存在的草稿返回 404"""
+    bid = create_batch(client, "test-precheck-404")
+
+    r = client.get(f"/api/batches/{bid}/drafts/99999")
+    assert r.status_code == 404
+
+    r = client.post(f"/api/batches/{bid}/drafts/99999/confirm")
+    assert r.status_code == 404
+
+    r = client.post(f"/api/batches/{bid}/drafts/99999/discard")
+    assert r.status_code == 404
+
+
+def test_precheck_draft_wrong_batch_returns_400(client, sample_dir):
+    """草稿不属于该批次返回 400"""
+    bid1 = create_batch(client, "test-precheck-batch1")
+    bid2 = create_batch(client, "test-precheck-batch2")
+
+    r = precheck_file_api(client, bid1, "po", sample_dir, "purchase_orders.csv")
+    draft_id = r["id"]
+
+    r = client.get(f"/api/batches/{bid2}/drafts/{draft_id}")
+    assert r.status_code == 400
+    body = r.get_json()
+    assert "不属于该批次" in body.get("error", "")
+
+    r = client.post(f"/api/batches/{bid2}/drafts/{draft_id}/confirm")
+    assert r.status_code == 400
+    body = r.get_json()
+    assert "不属于该批次" in body.get("error", "")
+
+    r = client.post(f"/api/batches/{bid2}/drafts/{draft_id}/discard")
+    assert r.status_code == 400
+    body = r.get_json()
+    assert "不属于该批次" in body.get("error", "")
+
+
+def test_precheck_duplicate_po_warning(client, sample_dir):
+    """采购单号重复检测"""
+    bid = create_batch(client, "test-precheck-dup-po")
+
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-001,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-001,V001,供应商A,20000.00,2024-01-01\n"
+    )
+    r = precheck_csv_bytes(client, bid, "po", po_csv, "dup_po.csv")
+    assert "error" not in r
+    assert any("DUPLICATE_PO" == issue["issue_code"] for issue in r["issues"]), "应检测到重复采购单号警告"
+    assert any("采购单号重复" in issue["message"] for issue in r["issues"])
+
+
+def test_index_page_has_precheck_ui(client, sample_dir):
+    """前端页面包含预检 UI 元素"""
+    r = client.get("/")
+    assert r.status_code == 200
+    html = r.data.decode("utf-8")
+
+    assert "预检模式" in html, "页面应包含'预检模式'"
+    assert "预检结果" in html, "页面应包含'预检结果'区域"
+    assert "容差配置快照" in html, "页面应包含'容差配置快照'"
+    assert "确认导入" in html, "页面应包含'确认导入'按钮"
+    assert "预检详细报告" in html, "页面应包含'预检详细报告'"
+

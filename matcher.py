@@ -2,9 +2,11 @@ import csv
 import io
 import json
 from datetime import datetime, timezone
+import hashlib
 from models import (
     db, Batch, PurchaseOrder, Invoice, MatchResult, ExceptionItem,
     ToleranceHistory, AuditLog, PayableRecalcNote, NoteComparison,
+    ImportDraft, ImportDraftIssue,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
@@ -13,6 +15,9 @@ from models import (
     EXCEPTION_DUPLICATE_INVOICE,
     EXCEPTION_STATUS_PENDING, RESULT_STATUS_PENDING, RESULT_STATUS_REJECTED,
     REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED,
+    DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFIRMED, DRAFT_STATUS_DISCARDED,
+    DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
+    PRECHECK_ERROR, PRECHECK_WARNING, PRECHECK_INFO,
     compute_rule_version, compute_note_content_hash,
 )
 
@@ -1007,4 +1012,416 @@ def batch_update_comparison_review(batch_id, comparison_ids, review_status, revi
         "success_ids": success_ids,
         "conflict_count": len(conflicts),
         "conflicts": conflicts,
+    }
+
+
+def _compute_file_hash(content):
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def check_vendor_consistency(rows, file_type):
+    """检查供应商是否一致"""
+    vendor_codes = set()
+    vendor_names = set()
+    warnings = []
+
+    for row in rows:
+        code = row.get("vendor_code", "").strip()
+        name = row.get("vendor_name", "").strip()
+        if code:
+            vendor_codes.add(code)
+        if name:
+            vendor_names.add(name)
+
+    if len(vendor_codes) > 1:
+        warnings.append(
+            f"文件包含 {len(vendor_codes)} 个不同的供应商编码: {', '.join(sorted(vendor_codes))}"
+        )
+    if len(vendor_names) > 1:
+        warnings.append(
+            f"文件包含 {len(vendor_names)} 个不同的供应商名称: {', '.join(sorted(vendor_names))}"
+        )
+
+    return warnings
+
+
+def check_duplicate_po_numbers(rows):
+    """检查采购单号重复"""
+    seen = {}
+    duplicates = []
+    for i, row in enumerate(rows, 2):
+        po_num = row.get("po_number", "").strip()
+        if not po_num:
+            continue
+        if po_num in seen:
+            duplicates.append(
+                f"采购单号重复: '{po_num}' 出现在第{seen[po_num]}行和第{i}行"
+            )
+        else:
+            seen[po_num] = i
+    return duplicates
+
+
+def precheck_file(file_content, filename, file_type, batch=None):
+    """
+    预检文件，返回预检报告。
+    不写入数据库，只做解析和校验。
+    """
+    required_columns = PO_REQUIRED_COLUMNS if file_type == DRAFT_FILE_TYPE_PO else INVOICE_REQUIRED_COLUMNS
+    validate_row_fn = validate_po_row if file_type == DRAFT_FILE_TYPE_PO else validate_invoice_row
+
+    if isinstance(file_content, bytes):
+        file_content = file_content.decode("utf-8-sig")
+
+    headers, rows = parse_file((file_content, filename), filename=filename)
+
+    issues = []
+    report = {
+        "filename": filename,
+        "file_type": file_type,
+        "row_count": len(rows),
+        "headers": headers,
+        "summary": {
+            "error_count": 0,
+            "warning_count": 0,
+            "info_count": 0,
+            "valid_rows": 0,
+            "invalid_rows": 0,
+        },
+        "missing_columns": [],
+        "issues": [],
+    }
+
+    missing = validate_columns(headers, required_columns)
+    if missing:
+        report["missing_columns"] = missing
+        for col in missing:
+            issues.append({
+                "type": PRECHECK_ERROR,
+                "code": "MISSING_COLUMN",
+                "row_number": None,
+                "column_name": col,
+                "message": f"缺少必填列: {col}",
+                "detail": None,
+            })
+
+    has_row_errors = False
+    for i, row in enumerate(rows, 2):
+        row_errors = validate_row_fn(row, i)
+        for err in row_errors:
+            issues.append({
+                "type": PRECHECK_ERROR,
+                "code": "INVALID_ROW",
+                "row_number": i,
+                "column_name": None,
+                "message": err,
+                "detail": {"row": row},
+            })
+            has_row_errors = True
+
+        if row.get("amount"):
+            try:
+                amount = float(row["amount"])
+                if amount < 0:
+                    issues.append({
+                        "type": PRECHECK_WARNING,
+                        "code": "NEGATIVE_AMOUNT",
+                        "row_number": i,
+                        "column_name": "amount",
+                        "message": f"第{i}行: 金额为负数 {row['amount']}",
+                        "detail": {"row": row},
+                    })
+                if amount == 0:
+                    issues.append({
+                        "type": PRECHECK_WARNING,
+                        "code": "ZERO_AMOUNT",
+                        "row_number": i,
+                        "column_name": "amount",
+                        "message": f"第{i}行: 金额为0",
+                        "detail": {"row": row},
+                    })
+            except (ValueError, TypeError):
+                pass
+
+    if file_type == DRAFT_FILE_TYPE_INVOICE:
+        dup_invoices = check_duplicate_invoices(rows)
+        for dup in dup_invoices:
+            issues.append({
+                "type": PRECHECK_ERROR,
+                "code": "DUPLICATE_INVOICE",
+                "row_number": None,
+                "column_name": "invoice_number",
+                "message": dup,
+                "detail": None,
+            })
+
+    if file_type == DRAFT_FILE_TYPE_PO:
+        dup_pos = check_duplicate_po_numbers(rows)
+        for dup in dup_pos:
+            issues.append({
+                "type": PRECHECK_WARNING,
+                "code": "DUPLICATE_PO",
+                "row_number": None,
+                "column_name": "po_number",
+                "message": dup,
+                "detail": None,
+            })
+
+    vendor_warnings = check_vendor_consistency(rows, file_type)
+    for warning in vendor_warnings:
+        issues.append({
+            "type": PRECHECK_WARNING,
+            "code": "VENDOR_INCONSISTENT",
+            "row_number": None,
+            "column_name": "vendor_code",
+            "message": warning,
+            "detail": None,
+        })
+
+    if batch:
+        existing_vendor = None
+        if file_type == DRAFT_FILE_TYPE_PO and batch.invoices:
+            existing_vendor = batch.invoices[0].vendor_code
+        elif file_type == DRAFT_FILE_TYPE_INVOICE and batch.purchase_orders:
+            existing_vendor = batch.purchase_orders[0].vendor_code
+
+        if existing_vendor and rows:
+            file_vendors = set(row.get("vendor_code", "").strip() for row in rows if row.get("vendor_code"))
+            if existing_vendor not in file_vendors:
+                issues.append({
+                    "type": PRECHECK_WARNING,
+                    "code": "VENDOR_MISMATCH",
+                    "row_number": None,
+                    "column_name": "vendor_code",
+                    "message": f"当前批次已有对方单据的供应商为 {existing_vendor}，本文件不包含该供应商，可能导致匹配失败",
+                    "detail": {
+                        "existing_vendor": existing_vendor,
+                        "file_vendors": list(file_vendors),
+                    },
+                })
+
+    error_count = sum(1 for i in issues if i["type"] == PRECHECK_ERROR)
+    warning_count = sum(1 for i in issues if i["type"] == PRECHECK_WARNING)
+    info_count = sum(1 for i in issues if i["type"] == PRECHECK_INFO)
+
+    report["summary"]["error_count"] = error_count
+    report["summary"]["warning_count"] = warning_count
+    report["summary"]["info_count"] = info_count
+    report["summary"]["valid_rows"] = len(rows) if not has_row_errors else sum(
+        1 for i, row in enumerate(rows, 2)
+        if not validate_row_fn(row, i)
+    )
+    report["summary"]["invalid_rows"] = len(rows) - report["summary"]["valid_rows"]
+    report["issues"] = issues
+
+    return report
+
+
+def create_import_draft(batch_id, file_content, filename, file_type, operator="system"):
+    """
+    创建导入草稿，执行预检并保存结果。
+    处理旧草稿冲突：同批次同类型的旧草稿标记为丢弃。
+    """
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    if isinstance(file_content, bytes):
+        content_str = file_content.decode("utf-8-sig")
+    else:
+        content_str = file_content
+
+    file_hash = _compute_file_hash(content_str)
+
+    existing_pending = ImportDraft.query.filter_by(
+        batch_id=batch_id,
+        file_type=file_type,
+        status=DRAFT_STATUS_PENDING,
+    ).first()
+
+    conflict_info = None
+    if existing_pending:
+        if existing_pending.file_hash == file_hash:
+            return existing_pending, False, None
+
+        conflict_info = {
+            "old_draft_id": existing_pending.id,
+            "old_filename": existing_pending.filename,
+            "old_created_at": existing_pending.created_at.isoformat(),
+        }
+        existing_pending.status = DRAFT_STATUS_DISCARDED
+        db.session.flush()
+
+        log = AuditLog(
+            batch_id=batch_id,
+            action="DRAFT_CONFLICT_DISCARDED",
+            detail=f"同批次同类型旧草稿 #{existing_pending.id}({existing_pending.filename}) 因重新上传被自动丢弃",
+            operator=operator,
+        )
+        db.session.add(log)
+
+    report = precheck_file(content_str, filename, file_type, batch)
+
+    rule_version = compute_rule_version(batch.tolerance_pct, batch.tolerance_abs)
+
+    draft = ImportDraft(
+        batch_id=batch_id,
+        file_type=file_type,
+        filename=filename,
+        status=DRAFT_STATUS_PENDING,
+        row_count=report["row_count"],
+        valid_row_count=report["summary"]["valid_rows"],
+        error_count=report["summary"]["error_count"],
+        warning_count=report["summary"]["warning_count"],
+        tolerance_pct=batch.tolerance_pct,
+        tolerance_abs=batch.tolerance_abs,
+        rule_version=rule_version,
+        file_content=content_str,
+        file_hash=file_hash,
+        parsed_data=json.dumps(report["issues"], ensure_ascii=False),
+        precheck_report=json.dumps(report, ensure_ascii=False),
+        operator=operator,
+    )
+    db.session.add(draft)
+    db.session.flush()
+
+    for issue in report["issues"]:
+        db_issue = ImportDraftIssue(
+            draft_id=draft.id,
+            issue_type=issue["type"],
+            issue_code=issue["code"],
+            row_number=issue["row_number"],
+            column_name=issue["column_name"],
+            message=issue["message"],
+            detail=json.dumps(issue["detail"], ensure_ascii=False) if issue["detail"] else None,
+        )
+        db.session.add(db_issue)
+
+    log_action = "DRAFT_CREATED_PO" if file_type == DRAFT_FILE_TYPE_PO else "DRAFT_CREATED_INVOICE"
+    log_detail = (
+        f"创建{'采购单' if file_type == DRAFT_FILE_TYPE_PO else '发票'}草稿: {filename}, "
+        f"共{report['row_count']}行, "
+        f"错误{report['summary']['error_count']}个, "
+        f"警告{report['summary']['warning_count']}个"
+    )
+    if conflict_info:
+        log_detail += f" (冲突: 旧草稿 #{conflict_info['old_draft_id']} 被丢弃)"
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action=log_action,
+        detail=log_detail,
+        operator=operator,
+    )
+    db.session.add(log)
+
+    db.session.commit()
+    db.session.refresh(draft)
+
+    return draft, True, conflict_info
+
+
+def get_latest_draft(batch_id, file_type=None):
+    """获取最新草稿"""
+    query = ImportDraft.query.filter_by(batch_id=batch_id)
+    if file_type:
+        query = query.filter_by(file_type=file_type)
+    return query.order_by(ImportDraft.created_at.desc()).first()
+
+
+def list_drafts(batch_id, file_type=None, status=None):
+    """列出草稿"""
+    query = ImportDraft.query.filter_by(batch_id=batch_id)
+    if file_type:
+        query = query.filter_by(file_type=file_type)
+    if status:
+        query = query.filter_by(status=status)
+    return query.order_by(ImportDraft.created_at.desc()).all()
+
+
+def get_draft(draft_id):
+    """获取单个草稿"""
+    return ImportDraft.query.get(draft_id)
+
+
+def confirm_draft(draft_id, operator="system"):
+    """
+    确认草稿，将数据写入正式表。
+    确认后草稿状态变为 CONFIRMED。
+    """
+    draft = ImportDraft.query.get(draft_id)
+    if not draft:
+        raise ValidationError(["草稿不存在"])
+
+    if draft.status != DRAFT_STATUS_PENDING:
+        raise ValidationError([f"草稿状态为 '{draft.status}'，不允许确认"])
+
+    batch = Batch.query.get(draft.batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    try:
+        if draft.file_type == DRAFT_FILE_TYPE_PO:
+            count = validate_and_import_po(batch.id, draft.file_content, draft.filename)
+        else:
+            count = validate_and_import_invoice(batch.id, draft.file_content, draft.filename)
+
+        draft.status = DRAFT_STATUS_CONFIRMED
+        db.session.flush()
+
+        log_action = "DRAFT_CONFIRMED_PO" if draft.file_type == DRAFT_FILE_TYPE_PO else "DRAFT_CONFIRMED_INVOICE"
+        log = AuditLog(
+            batch_id=batch.id,
+            action=log_action,
+            detail=f"确认{'采购单' if draft.file_type == DRAFT_FILE_TYPE_PO else '发票'}草稿 #{draft_id}，写入 {count} 行数据",
+            operator=operator,
+        )
+        db.session.add(log)
+
+        db.session.commit()
+
+        return {
+            "success": True,
+            "imported_count": count,
+            "draft_id": draft_id,
+        }
+
+    except ValidationError:
+        db.session.rollback()
+        raise
+    except Exception as e:
+        db.session.rollback()
+        raise ValidationError([str(e)])
+
+
+def discard_draft(draft_id, operator="system"):
+    """
+    丢弃草稿，不写入数据。
+    """
+    draft = ImportDraft.query.get(draft_id)
+    if not draft:
+        raise ValidationError(["草稿不存在"])
+
+    if draft.status != DRAFT_STATUS_PENDING:
+        raise ValidationError([f"草稿状态为 '{draft.status}'，不允许丢弃"])
+
+    draft.status = DRAFT_STATUS_DISCARDED
+    db.session.flush()
+
+    log_action = "DRAFT_DISCARDED_PO" if draft.file_type == DRAFT_FILE_TYPE_PO else "DRAFT_DISCARDED_INVOICE"
+    log = AuditLog(
+        batch_id=draft.batch_id,
+        action=log_action,
+        detail=f"丢弃{'采购单' if draft.file_type == DRAFT_FILE_TYPE_PO else '发票'}草稿 #{draft_id} ({draft.filename})",
+        operator=operator,
+    )
+    db.session.add(log)
+
+    db.session.commit()
+
+    return {
+        "success": True,
+        "draft_id": draft_id,
     }

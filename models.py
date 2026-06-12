@@ -48,6 +48,16 @@ REVIEW_STATUS_PENDING = "PENDING"
 REVIEW_STATUS_CONFIRMED = "CONFIRMED"
 REVIEW_STATUS_IGNORED = "IGNORED"
 
+DRAFT_STATUS_PENDING = "PENDING"
+DRAFT_STATUS_CONFIRMED = "CONFIRMED"
+DRAFT_STATUS_DISCARDED = "DISCARDED"
+DRAFT_FILE_TYPE_PO = "PO"
+DRAFT_FILE_TYPE_INVOICE = "INVOICE"
+
+PRECHECK_ERROR = "ERROR"
+PRECHECK_WARNING = "WARNING"
+PRECHECK_INFO = "INFO"
+
 
 def compute_rule_version(tolerance_pct, tolerance_abs):
     raw = f"{tolerance_pct}:{tolerance_abs}"
@@ -376,6 +386,80 @@ class NoteComparison(db.Model):
             "review_remark": self.review_remark,
             "reviewed_by": self.reviewed_by,
             "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ImportDraft(db.Model):
+    __tablename__ = "import_drafts"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    file_type = db.Column(db.String(10), nullable=False)
+    filename = db.Column(db.String(500), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default=DRAFT_STATUS_PENDING)
+    row_count = db.Column(db.Integer, default=0)
+    valid_row_count = db.Column(db.Integer, default=0)
+    error_count = db.Column(db.Integer, default=0)
+    warning_count = db.Column(db.Integer, default=0)
+    tolerance_pct = db.Column(db.Float, nullable=False)
+    tolerance_abs = db.Column(db.Float, nullable=False)
+    rule_version = db.Column(db.String(50), nullable=False)
+    file_content = db.Column(db.Text, nullable=False)
+    file_hash = db.Column(db.String(64), nullable=False)
+    parsed_data = db.Column(db.Text)
+    precheck_report = db.Column(db.Text)
+    operator = db.Column(db.String(100), default="system")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="import_drafts")
+    issues = db.relationship("ImportDraftIssue", backref="draft", cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "file_type": self.file_type,
+            "filename": self.filename,
+            "status": self.status,
+            "row_count": self.row_count,
+            "valid_row_count": self.valid_row_count,
+            "error_count": self.error_count,
+            "warning_count": self.warning_count,
+            "tolerance_pct": self.tolerance_pct,
+            "tolerance_abs": self.tolerance_abs,
+            "rule_version": self.rule_version,
+            "file_hash": self.file_hash,
+            "operator": self.operator,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "precheck_report": json.loads(self.precheck_report) if self.precheck_report else None,
+            "issues": [i.to_dict() for i in self.issues],
+        }
+
+
+class ImportDraftIssue(db.Model):
+    __tablename__ = "import_draft_issues"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    draft_id = db.Column(db.Integer, db.ForeignKey("import_drafts.id"), nullable=False)
+    issue_type = db.Column(db.String(10), nullable=False)
+    issue_code = db.Column(db.String(50), nullable=False)
+    row_number = db.Column(db.Integer)
+    column_name = db.Column(db.String(100))
+    message = db.Column(db.Text, nullable=False)
+    detail = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "draft_id": self.draft_id,
+            "issue_type": self.issue_type,
+            "issue_code": self.issue_code,
+            "row_number": self.row_number,
+            "column_name": self.column_name,
+            "message": self.message,
+            "detail": json.loads(self.detail) if self.detail else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

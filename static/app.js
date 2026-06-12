@@ -23,6 +23,8 @@ createApp({
     const selectedComparisonIds = ref(new Set());
     const batchReviewForm = reactive({ remark: "" });
     const batchConflictResult = ref(null);
+    const poDraft = ref(null);
+    const invoiceDraft = ref(null);
 
     const createForm = reactive({ name: "", tolerance_pct: 2.0, tolerance_abs: 100.0 });
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
@@ -96,6 +98,20 @@ createApp({
       compareForm.noteAId = "";
       compareForm.noteBId = "";
       reviewForm.remark = "";
+      poDraft.value = null;
+      invoiceDraft.value = null;
+      loadDrafts(id);
+    }
+
+    async function loadDrafts(batchId) {
+      const poData = await api(`/api/batches/${batchId}/drafts/latest?file_type=PO`);
+      if (poData && poData.draft && poData.draft.status === "PENDING") {
+        poDraft.value = poData.draft;
+      }
+      const invData = await api(`/api/batches/${batchId}/drafts/latest?file_type=INVOICE`);
+      if (invData && invData.draft && invData.draft.status === "PENDING") {
+        invoiceDraft.value = invData.draft;
+      }
     }
 
     async function createBatch() {
@@ -113,24 +129,36 @@ createApp({
       }
     }
 
-    async function uploadFile(event, type) {
+    async function precheckFile(event, type) {
       const file = event.target.files[0];
       if (!file) return;
       const formData = new FormData();
       formData.append("file", file);
-      const url = type === "po" ? `/api/batches/${currentBatch.value.id}/upload-po` : `/api/batches/${currentBatch.value.id}/upload-invoice`;
+      formData.append("operator", "web_user");
+      const url = type === "po" ? `/api/batches/${currentBatch.value.id}/precheck-po` : `/api/batches/${currentBatch.value.id}/precheck-invoice`;
       try {
         const res = await fetch(url, { method: "POST", body: formData });
         const data = await res.json();
         if (!res.ok) {
-          const detail = data.details ? data.details.join("; ") : data.error || "上传失败";
+          const detail = data.details ? data.details.join("; ") : data.error || "预检失败";
           showToast(detail, "error");
           return;
         }
-        showToast(data.message);
-        await openBatch(currentBatch.value.id);
+        if (type === "po") {
+          poDraft.value = data;
+        } else {
+          invoiceDraft.value = data;
+        }
+        let msg = `预检完成: ${data.row_count} 行, ${data.error_count} 错误, ${data.warning_count} 警告`;
+        if (data.conflict) {
+          msg += ` (旧草稿 #${data.conflict.old_draft_id} 已自动丢弃)`;
+        }
+        if (!data.is_new) {
+          msg = "文件内容未变化，使用已有草稿";
+        }
+        showToast(msg, data.error_count > 0 ? "error" : "success");
       } catch (e) {
-        showToast("上传错误: " + e.message, "error");
+        showToast("预检错误: " + e.message, "error");
       }
       event.target.value = "";
     }
@@ -140,14 +168,73 @@ createApp({
       if (!file) return;
       const formData = new FormData();
       formData.append("file", file);
-      const url = type === "po" ? `/api/batches/${currentBatch.value.id}/upload-po` : `/api/batches/${currentBatch.value.id}/upload-invoice`;
+      formData.append("operator", "web_user");
+      const url = type === "po" ? `/api/batches/${currentBatch.value.id}/precheck-po` : `/api/batches/${currentBatch.value.id}/precheck-invoice`;
       fetch(url, { method: "POST", body: formData })
         .then(r => r.json())
         .then(data => {
           if (data.error) { showToast(data.details ? data.details.join("; ") : data.error, "error"); return; }
-          showToast(data.message);
-          openBatch(currentBatch.value.id);
+          if (type === "po") {
+            poDraft.value = data;
+          } else {
+            invoiceDraft.value = data;
+          }
+          let msg = `预检完成: ${data.row_count} 行, ${data.error_count} 错误, ${data.warning_count} 警告`;
+          if (data.conflict) {
+            msg += ` (旧草稿 #${data.conflict.old_draft_id} 已自动丢弃)`;
+          }
+          if (!data.is_new) {
+            msg = "文件内容未变化，使用已有草稿";
+          }
+          showToast(msg, data.error_count > 0 ? "error" : "success");
         });
+    }
+
+    async function confirmDraft(draftId) {
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/drafts/${draftId}/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "确认失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast(`导入成功，共 ${data.imported_count} 行`);
+        poDraft.value = null;
+        invoiceDraft.value = null;
+        await openBatch(currentBatch.value.id);
+      } catch (e) {
+        showToast("确认错误: " + e.message, "error");
+      }
+    }
+
+    async function discardDraft(draftId) {
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/drafts/${draftId}/discard`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "丢弃失败";
+          showToast(detail, "error");
+          return;
+        }
+        if (poDraft.value && poDraft.value.id === draftId) {
+          poDraft.value = null;
+        }
+        if (invoiceDraft.value && invoiceDraft.value.id === draftId) {
+          invoiceDraft.value = null;
+        }
+        showToast("草稿已丢弃");
+      } catch (e) {
+        showToast("丢弃错误: " + e.message, "error");
+      }
     }
 
     async function updateTolerance() {
@@ -432,11 +519,13 @@ createApp({
       createForm, toleranceForm, compareForm, reviewForm,
       recalcNotes, comparisonResult, comparisonHistory, comparisonFilter, compareError,
       selectedComparisonIds, batchReviewForm, batchConflictResult,
+      poDraft, invoiceDraft,
       canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons,
-      openBatch, createBatch, uploadFile, handleDrop, updateTolerance, runMatch,
+      openBatch, createBatch, precheckFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
       exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
       toggleComparisonSelect, toggleSelectAllComparisons, doBatchReview,
+      confirmDraft, discardDraft,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };
