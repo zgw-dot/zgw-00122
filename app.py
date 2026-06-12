@@ -442,7 +442,7 @@ def review_comparison(batch_id, comparison_id):
     batch = Batch.query.get_or_404(batch_id)
     comparison = get_comparison(comparison_id)
     if comparison is None:
-        return jsonify({"error": "对比记录不存在"}), 404
+        return jsonify({"error": "对比记录不存在"}), 400
     if comparison.batch_id != batch_id:
         return jsonify({"error": "对比记录不属于该批次"}), 400
 

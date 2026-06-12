@@ -1250,14 +1250,40 @@ def test_review_comparison_conflict_ignored_then_confirm(client, sample_dir):
 
 
 def test_review_comparison_not_found(client, sample_dir):
-    """冲突场景：对比记录不存在 → 返回 404"""
+    """冲突场景：对比记录不存在 → 返回 400（复核冲突统一 400）"""
     bid = create_batch(client, "test-review-notfound")
     match_and_resolve_all(client, bid, sample_dir)
 
     r = review_comparison_api(client, bid, 99999, "CONFIRMED")
-    assert r.status_code == 404, f"不存在的对比记录应返回 404，实际 {r.status_code}"
+    assert r.status_code == 400, f"不存在的对比记录应返回 400，实际 {r.status_code}"
     body = r.get_json()
     assert "不存在" in body.get("error", ""), f"错误信息应提示不存在: {body}"
+
+
+def test_review_not_found_returns_400_json_error(client, sample_dir):
+    """复核不存在记录返回 400 + 可读 JSON error，不是 404 或 traceback"""
+    bid = create_batch(client, "test-review-notfound-json")
+    match_and_resolve_all(client, bid, sample_dir)
+
+    r = review_comparison_api(client, bid, 99999, "CONFIRMED")
+
+    # 状态码必须是 400
+    assert r.status_code == 400, f"期望 400，实际 {r.status_code}"
+
+    # Content-Type 必须是 JSON
+    assert "application/json" in r.content_type, f"期望 JSON 响应，实际 {r.content_type}"
+
+    # 响应体必须有 error 字段且可读
+    body = r.get_json()
+    assert body is not None, "响应体必须是合法 JSON"
+    assert "error" in body, "响应必须包含 error 字段"
+    assert isinstance(body["error"], str) and len(body["error"]) > 0, "error 必须是非空字符串"
+    assert "对比记录不存在" == body["error"], f"错误信息不匹配: {body['error']}"
+
+    # 不能是 HTML 错误页或 traceback
+    raw = r.data.decode("utf-8", errors="replace")
+    assert "<!DOCTYPE" not in raw, "不应返回 HTML 错误页"
+    assert "Traceback" not in raw, "不应返回 traceback"
 
 
 def test_review_comparison_filter_by_status(client, sample_dir):
