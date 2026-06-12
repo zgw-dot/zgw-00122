@@ -600,3 +600,120 @@ def test_recalc_note_amount_aligned_with_batch_detail(client, sample_dir):
     assert exported_payable == api_payable, (
         f"导出应付 {exported_payable} != 接口 {api_payable}"
     )
+
+
+def test_recalc_note_affected_docs_only_changed():
+    """回归测试：两条容差异常，只改 A 的备注，v2 应只列出 A 单据，且 B 不出现。
+
+    数据设计（容差 0.1% / ¥1，确保两条都是超容差）：
+      PO:  PO-A, V001, 供应商A, 10000.00, 2024-01-01  (INV-A: 10500 → 差500 → 超容差)
+           PO-B, V002, 供应商B, 20000.00, 2024-01-01  (INV-B: 21000 → 差1000 → 超容差)
+      INV: INV-A, V001, 供应商A, 10500.00, 2024-01-02
+           INV-B, V002, 供应商B, 21000.00, 2024-01-02
+    """
+    from app import create_app
+    from models import db
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp()
+    app = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": tmp_dir,
+    })
+    with app.app_context():
+        db.create_all()
+    client = app.test_client()
+
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-A,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-B,V002,供应商B,20000.00,2024-01-01\n"
+    )
+    inv_csv = (
+        "invoice_number,vendor_code,vendor_name,amount,invoice_date\n"
+        "INV-A,V001,供应商A,10500.00,2024-01-02\n"
+        "INV-B,V002,供应商B,21000.00,2024-01-02\n"
+    )
+
+    bid = create_batch(client, "test-affected-docs", pct=0.1, ab=1)
+    upload_csv_bytes(client, bid, "po", po_csv, "po.csv")
+    upload_csv_bytes(client, bid, "invoice", inv_csv, "inv.csv")
+
+    r = client.post(f"/api/batches/{bid}/match")
+    assert r.status_code == 200
+
+    note_v1 = client.get(f"/api/batches/{bid}/recalc-notes/latest").get_json()["note"]
+    assert note_v1["version"] == 1
+    assert "PO-A" in note_v1["po_numbers"], "v1 应列出全量PO"
+    assert "PO-B" in note_v1["po_numbers"], "v1 应列出全量PO"
+    assert "INV-A" in note_v1["invoice_numbers"], "v1 应列出全量发票"
+    assert "INV-B" in note_v1["invoice_numbers"], "v1 应列出全量发票"
+
+    exs = client.get(f"/api/batches/{bid}/exceptions").get_json()["exceptions"]
+    assert len(exs) == 2, f"应有 2 条异常，实际 {len(exs)}"
+
+    exc_a = None
+    for e in exs:
+        if e.get("po_number") == "PO-A":
+            exc_a = e
+            break
+    assert exc_a is not None, "找不到 PO-A 对应的异常"
+
+    r = client.put(
+        f"/api/batches/{bid}/exceptions/{exc_a['id']}/remark",
+        json={"remarks": "财务只改了A条的意见"},
+    )
+    assert r.status_code == 200
+
+    note_v2 = client.get(f"/api/batches/{bid}/recalc-notes/latest").get_json()["note"]
+    assert note_v2["version"] == 2, f"应生成 v2，实际 v{note_v2['version']}"
+    assert note_v2["po_numbers"] == ["PO-A"], f"v2 应只含 PO-A，实际 {note_v2['po_numbers']}"
+    assert note_v2["invoice_numbers"] == ["INV-A"], f"v2 应只含 INV-A，实际 {note_v2['invoice_numbers']}"
+    assert "PO-B" not in note_v2["po_numbers"], "v2 不应包含未变化的 PO-B"
+    assert "INV-B" not in note_v2["invoice_numbers"], "v2 不应包含未变化的 INV-B"
+    assert note_v2["change_source"] == "EXCEPTION_REMARK"
+
+    r = client.post(f"/api/batches/{bid}/recalc-notes/generate", json={"change_source": "MANUAL"})
+    assert r.status_code == 200
+    assert r.get_json()["is_new"] is False, "无变化重复生成不应新增"
+
+    all_notes = client.get(f"/api/batches/{bid}/recalc-notes").get_json()["notes"]
+    assert len(all_notes) == 2, f"仍应为 2 个版本，实际 {len(all_notes)}"
+
+    api_payable = client.get(f"/api/batches/{bid}").get_json()["summary"]["payable_total"]
+    latest_note = client.get(f"/api/batches/{bid}/recalc-notes/latest").get_json()["note"]
+    assert latest_note["current_total"] == api_payable, "说明金额应与批次详情对齐"
+    assert latest_note["version"] == 2, "最新说明版本应为 2"
+
+    r = client.get(f"/api/batches/{bid}/export")
+    assert r.status_code == 200
+    with io.StringIO(r.data.decode("utf-8-sig")) as f:
+        rows = list(csv.reader(f))
+
+    in_summary = False
+    exported_version = None
+    exported_summary = None
+    exported_payable = None
+    for row in rows:
+        if not row:
+            continue
+        if row[0] == "汇总信息":
+            in_summary = True
+            continue
+        if in_summary and row[0] == "应付合计":
+            exported_payable = float(row[1])
+        if in_summary and row[0] == "重算说明版本":
+            exported_version = int(row[1])
+        if in_summary and row[0] == "重算说明摘要":
+            exported_summary = row[1] if len(row) > 1 else ""
+
+    assert exported_payable == api_payable, "导出应付应与接口对齐"
+    assert exported_version == 2, f"导出版本应为 2，实际 {exported_version}"
+    assert exported_summary is not None, "导出应含重算说明摘要"
+    assert exported_summary == latest_note["change_summary"], "导出摘要应等于最新说明摘要"
+
+    with app.app_context():
+        db.session.remove()
+        db.drop_all()
