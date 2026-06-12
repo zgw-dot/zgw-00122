@@ -21,13 +21,35 @@ INVOICE_REQUIRED_COLUMNS = ["invoice_number", "vendor_code", "vendor_name", "amo
 class ValidationError(Exception):
     def __init__(self, errors):
         self.errors = errors
-        super().__init__("; ".join(errors))
+        self.details = errors if isinstance(errors, list) else [errors]
+        super().__init__("; ".join(self.details))
+
+
+def _extract_storage(file_storage, fallback_filename=None):
+    """Return (read_text_fn, filename, is_excel) from either FileStorage or (text, filename) tuple."""
+    if isinstance(file_storage, tuple):
+        content, fname = file_storage
+        fname = fallback_filename or fname or ""
+
+        def read_text():
+            return content
+
+        return read_text, fname, fname.endswith((".xlsx", ".xls"))
+    # werkzeug FileStorage or similar
+    fname = getattr(file_storage, "filename", None) or fallback_filename or ""
+
+    def read_text():
+        raw = file_storage.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8-sig")
+        return raw
+
+    return read_text, fname, fname.endswith((".xlsx", ".xls"))
 
 
 def parse_csv_file(file_storage):
-    raw = file_storage.read()
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8-sig")
+    read_text, _, _ = _extract_storage(file_storage)
+    raw = read_text()
     reader = csv.DictReader(io.StringIO(raw))
     rows = []
     headers = reader.fieldnames or []
@@ -38,7 +60,11 @@ def parse_csv_file(file_storage):
 
 def parse_excel_file(file_storage):
     from openpyxl import load_workbook
-    wb = load_workbook(filename=io.BytesIO(file_storage.read()), read_only=True)
+    read_text, _, _ = _extract_storage(file_storage)
+    raw = read_text()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    wb = load_workbook(filename=io.BytesIO(raw), read_only=True)
     ws = wb.active
     rows_iter = ws.iter_rows(values_only=True)
     headers = [str(h).strip().lower() if h else "" for h in next(rows_iter)]
@@ -53,9 +79,9 @@ def parse_excel_file(file_storage):
     return headers, rows
 
 
-def parse_file(file_storage):
-    filename = file_storage.filename or ""
-    if filename.endswith((".xlsx", ".xls")):
+def parse_file(file_storage, filename=None):
+    _, fname, is_excel = _extract_storage(file_storage, fallback_filename=filename)
+    if is_excel:
         return parse_excel_file(file_storage)
     return parse_csv_file(file_storage)
 
@@ -348,8 +374,14 @@ def process_batch(batch_id):
         raise ValidationError([str(e)])
 
 
-def validate_and_import_po(batch, file_storage):
-    headers, rows = parse_file(file_storage)
+def validate_and_import_po(batch_or_id, file_storage_or_content, filename=None):
+    batch = batch_or_id if isinstance(batch_or_id, Batch) else Batch.query.get(batch_or_id)
+    if isinstance(file_storage_or_content, str):
+        file_storage = (file_storage_or_content, filename or batch.po_filename or "po.csv")
+    else:
+        file_storage = file_storage_or_content
+    _, fname, _ = _extract_storage(file_storage, fallback_filename=filename)
+    headers, rows = parse_file(file_storage, filename=filename)
     missing = validate_columns(headers, PO_REQUIRED_COLUMNS)
     if missing:
         raise ValidationError([f"采购单文件缺少列: {', '.join(missing)}"])
@@ -363,14 +395,21 @@ def validate_and_import_po(batch, file_storage):
 
     PurchaseOrder.query.filter_by(batch_id=batch.id).delete()
     import_purchase_orders(batch, rows)
-    batch.po_filename = file_storage.filename
-    log = AuditLog(batch_id=batch.id, action="UPLOAD_PO", detail=f"上传采购单 {file_storage.filename}，共{len(rows)}条")
+    batch.po_filename = fname
+    log = AuditLog(batch_id=batch.id, action="UPLOAD_PO", detail=f"上传采购单 {fname}，共{len(rows)}条")
     db.session.add(log)
     db.session.commit()
+    return len(rows)
 
 
-def validate_and_import_invoice(batch, file_storage):
-    headers, rows = parse_file(file_storage)
+def validate_and_import_invoice(batch_or_id, file_storage_or_content, filename=None):
+    batch = batch_or_id if isinstance(batch_or_id, Batch) else Batch.query.get(batch_or_id)
+    if isinstance(file_storage_or_content, str):
+        file_storage = (file_storage_or_content, filename or batch.invoice_filename or "inv.csv")
+    else:
+        file_storage = file_storage_or_content
+    _, fname, _ = _extract_storage(file_storage, fallback_filename=filename)
+    headers, rows = parse_file(file_storage, filename=filename)
     missing = validate_columns(headers, INVOICE_REQUIRED_COLUMNS)
     if missing:
         raise ValidationError([f"发票文件缺少列: {', '.join(missing)}"])
@@ -387,7 +426,8 @@ def validate_and_import_invoice(batch, file_storage):
 
     Invoice.query.filter_by(batch_id=batch.id).delete()
     import_invoices(batch, rows)
-    batch.invoice_filename = file_storage.filename
-    log = AuditLog(batch_id=batch.id, action="UPLOAD_INVOICE", detail=f"上传发票 {file_storage.filename}，共{len(rows)}条")
+    batch.invoice_filename = fname
+    log = AuditLog(batch_id=batch.id, action="UPLOAD_INVOICE", detail=f"上传发票 {fname}，共{len(rows)}条")
     db.session.add(log)
     db.session.commit()
+    return len(rows)

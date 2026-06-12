@@ -2,7 +2,7 @@ import csv
 import io
 import os
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, Blueprint, request, jsonify, send_file, send_from_directory
 from models import (
     db, Batch, MatchResult, ExceptionItem, ToleranceHistory, AuditLog,
     BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED, BATCH_STATUS_POSTED,
@@ -15,35 +15,46 @@ from matcher import (
     process_batch, validate_and_import_po, validate_and_import_invoice, ValidationError,
 )
 
-app = Flask(__name__)
-db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reconciliation.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
-app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-init_db(app)
+bp = Blueprint("recon", __name__)
 
 
-@app.errorhandler(Exception)
-def handle_unexpected_error(e):
-    import traceback
-    traceback.print_exc()
-    status = getattr(e, "code", 500)
-    if isinstance(e, NameError):
-        return jsonify({"error": "服务内部错误，请联系管理员"}), 500
-    if status == 500:
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"error": str(e)}), status
+def create_app(config=None):
+    """App Factory：每个测试用例都能拿到全新 Flask 实例 + 独立 DB 连接"""
+    app = Flask(__name__)
+    db_path = os.path.join(BASE_DIR, "reconciliation.db")
+    app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+    app.config["UPLOAD_FOLDER"] = os.path.join(BASE_DIR, "uploads")
+    if config:
+        app.config.update(config)
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(e):
+        import traceback
+        traceback.print_exc()
+        status = getattr(e, "code", 500)
+        if isinstance(e, NameError):
+            return jsonify({"error": "服务内部错误，请联系管理员"}), 500
+        if status == 500:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}), status
+
+    init_db(app)
+    app.register_blueprint(bp)
+    return app
 
 
-@app.route("/")
+@bp.route("/")
 def index():
-    tmpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+    tmpl_dir = os.path.join(BASE_DIR, "templates")
     return send_from_directory(tmpl_dir, "index.html")
 
 
-@app.route("/api/dashboard", methods=["GET"])
+@bp.route("/api/dashboard", methods=["GET"])
 def dashboard():
     recent = Batch.query.order_by(Batch.updated_at.desc()).limit(10).all()
     batches_data = []
@@ -54,179 +65,192 @@ def dashboard():
     return jsonify({"batches": batches_data})
 
 
-@app.route("/api/batches", methods=["GET"])
+@bp.route("/api/batches", methods=["GET"])
 def list_batches():
-    page = request.args.get("page", 1, type=int)
-    per_page = request.args.get("per_page", 20, type=int)
-    pagination = Batch.query.order_by(Batch.updated_at.desc()).paginate(page=page, per_page=per_page, error_out=False)
-    batches_data = []
-    for b in pagination.items:
+    batches = Batch.query.order_by(Batch.updated_at.desc()).all()
+    data = []
+    for b in batches:
         d = b.to_dict()
         d["summary"] = b.summary
-        batches_data.append(d)
-    return jsonify({
-        "batches": batches_data,
-        "total": pagination.total,
-        "page": page,
-        "per_page": per_page,
-    })
+        data.append(d)
+    return jsonify({"batches": data})
 
 
-@app.route("/api/batches", methods=["POST"])
+@bp.route("/api/batches", methods=["POST"])
 def create_batch():
-    data = request.get_json(force=True)
-    name = data.get("name", "").strip()
+    payload = request.get_json(silent=True) or {}
+    name = payload.get("name")
     if not name:
-        return jsonify({"error": "批次名称不能为空"}), 400
-    tolerance_pct = data.get("tolerance_pct", 2.0)
-    tolerance_abs = data.get("tolerance_abs", 100.0)
-    rule_version = compute_rule_version(tolerance_pct, tolerance_abs)
+        return jsonify({"error": "批次名称必填"}), 400
+    pct = float(payload.get("tolerance_pct", 2.0))
+    ab = float(payload.get("tolerance_abs", 100.0))
+    rule_version = compute_rule_version(pct, ab)
     batch = Batch(
         name=name,
-        tolerance_pct=tolerance_pct,
-        tolerance_abs=tolerance_abs,
+        tolerance_pct=pct,
+        tolerance_abs=ab,
         rule_version=rule_version,
+        status=BATCH_STATUS_CREATED,
     )
     db.session.add(batch)
     db.session.flush()
     th = ToleranceHistory(
         batch_id=batch.id,
-        tolerance_pct=tolerance_pct,
-        tolerance_abs=tolerance_abs,
+        tolerance_pct=pct,
+        tolerance_abs=ab,
         rule_version=rule_version,
+        changed_by="system",
     )
     db.session.add(th)
     log = AuditLog(batch_id=batch.id, action="CREATE", detail=f"创建批次: {name}")
     db.session.add(log)
     db.session.commit()
-    return jsonify(batch.to_dict()), 201
+    resp = batch.to_dict()
+    resp["summary"] = batch.summary
+    return jsonify(resp), 201
 
 
-@app.route("/api/batches/<int:batch_id>", methods=["GET"])
+@bp.route("/api/batches/<int:batch_id>", methods=["GET"])
 def get_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    d = batch.to_dict()
-    d["summary"] = batch.summary
-    d["tolerance_history"] = [th.to_dict() for th in batch.tolerance_history]
-    d["audit_logs"] = [al.to_dict() for al in batch.audit_logs]
-    return jsonify(d)
+    resp = batch.to_dict()
+    resp["summary"] = batch.summary
+    return jsonify(resp)
 
 
-@app.route("/api/batches/<int:batch_id>/tolerance", methods=["PUT"])
+@bp.route("/api/batches/<int:batch_id>/tolerance", methods=["PUT"])
 def update_tolerance(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    if batch.status not in (BATCH_STATUS_CREATED, BATCH_STATUS_FAILED):
-        return jsonify({"error": f"批次状态'{batch.status}'不允许修改容差配置"}), 400
-    data = request.get_json(force=True)
-    tolerance_pct = data.get("tolerance_pct", batch.tolerance_pct)
-    tolerance_abs = data.get("tolerance_abs", batch.tolerance_abs)
-    batch.tolerance_pct = tolerance_pct
-    batch.tolerance_abs = tolerance_abs
-    batch.rule_version = compute_rule_version(tolerance_pct, tolerance_abs)
+    payload = request.get_json(silent=True) or {}
+    pct = float(payload.get("tolerance_pct", batch.tolerance_pct))
+    ab = float(payload.get("tolerance_abs", batch.tolerance_abs))
+    rule_version = compute_rule_version(pct, ab)
+    batch.tolerance_pct = pct
+    batch.tolerance_abs = ab
+    batch.rule_version = rule_version
     th = ToleranceHistory(
         batch_id=batch.id,
-        tolerance_pct=tolerance_pct,
-        tolerance_abs=tolerance_abs,
-        rule_version=batch.rule_version,
+        tolerance_pct=pct,
+        tolerance_abs=ab,
+        rule_version=rule_version,
+        changed_by="user",
     )
     db.session.add(th)
-    log = AuditLog(batch_id=batch.id, action="UPDATE_TOLERANCE", detail=f"容差更新: pct={tolerance_pct}, abs={tolerance_abs}, rule_version={batch.rule_version}")
+    log = AuditLog(
+        batch_id=batch.id,
+        action="UPDATE_TOLERANCE",
+        detail=f"容差更新为 {pct}% / {ab}",
+    )
     db.session.add(log)
     db.session.commit()
-    return jsonify(batch.to_dict())
+    resp = batch.to_dict()
+    resp["summary"] = batch.summary
+    return jsonify(resp)
 
 
-@app.route("/api/batches/<int:batch_id>/upload-po", methods=["POST"])
+@bp.route("/api/batches/<int:batch_id>/upload-po", methods=["POST"])
 def upload_po(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    if batch.status not in (BATCH_STATUS_CREATED, BATCH_STATUS_FAILED):
-        return jsonify({"error": f"批次状态'{batch.status}'不允许上传采购单"}), 400
     if "file" not in request.files:
-        return jsonify({"error": "未找到上传文件"}), 400
+        return jsonify({"error": "缺少文件字段 file"}), 400
     f = request.files["file"]
     if not f.filename:
-        return jsonify({"error": "文件名为空"}), 400
+        return jsonify({"error": "未选择文件"}), 400
+    batch.po_filename = f.filename
     try:
-        validate_and_import_po(batch, f)
-        return jsonify({"message": "采购单上传成功", "batch": batch.to_dict()})
+        content = f.read().decode("utf-8-sig")
+        count = validate_and_import_po(batch.id, content)
+        log = AuditLog(batch_id=batch.id, action="UPLOAD_PO", detail=f"导入 {f.filename} 共 {count} 行")
+        db.session.add(log)
+        db.session.commit()
+        return jsonify({"imported": count, "filename": f.filename})
     except ValidationError as e:
-        return jsonify({"error": "采购单校验失败", "details": e.errors}), 400
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
 
 
-@app.route("/api/batches/<int:batch_id>/upload-invoice", methods=["POST"])
+@bp.route("/api/batches/<int:batch_id>/upload-invoice", methods=["POST"])
 def upload_invoice(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    if batch.status not in (BATCH_STATUS_CREATED, BATCH_STATUS_FAILED):
-        return jsonify({"error": f"批次状态'{batch.status}'不允许上传发票"}), 400
     if "file" not in request.files:
-        return jsonify({"error": "未找到上传文件"}), 400
+        return jsonify({"error": "缺少文件字段 file"}), 400
     f = request.files["file"]
     if not f.filename:
-        return jsonify({"error": "文件名为空"}), 400
+        return jsonify({"error": "未选择文件"}), 400
+    batch.invoice_filename = f.filename
     try:
-        validate_and_import_invoice(batch, f)
-        return jsonify({"message": "发票上传成功", "batch": batch.to_dict()})
+        content = f.read().decode("utf-8-sig")
+        count = validate_and_import_invoice(batch.id, content)
+        log = AuditLog(batch_id=batch.id, action="UPLOAD_INVOICE", detail=f"导入 {f.filename} 共 {count} 行")
+        db.session.add(log)
+        db.session.commit()
+        return jsonify({"imported": count, "filename": f.filename})
     except ValidationError as e:
-        return jsonify({"error": "发票校验失败", "details": e.errors}), 400
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
 
 
-@app.route("/api/batches/<int:batch_id>/match", methods=["POST"])
-def run_match(batch_id):
+@bp.route("/api/batches/<int:batch_id>/match", methods=["POST"])
+def match_batch(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
     try:
-        result = process_batch(batch_id)
-        return jsonify(result)
+        success = process_batch(batch.id)
+        return jsonify({"success": True, "has_exceptions": not success})
     except ValidationError as e:
-        return jsonify({"error": "匹配失败", "details": e.errors}), 400
+        return jsonify({"success": False, "error": str(e), "details": e.details}), 400
 
 
-@app.route("/api/batches/<int:batch_id>/results", methods=["GET"])
-def get_results(batch_id):
+@bp.route("/api/batches/<int:batch_id>/results", methods=["GET"])
+def list_results(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    results = MatchResult.query.filter_by(batch_id=batch_id).all()
-    return jsonify({
-        "batch": batch.to_dict(),
-        "summary": batch.summary,
-        "results": [r.to_dict() for r in results],
-    })
+    return jsonify({"results": [r.to_dict() for r in batch.match_results]})
 
 
-@app.route("/api/batches/<int:batch_id>/exceptions", methods=["GET"])
-def get_exceptions(batch_id):
+@bp.route("/api/batches/<int:batch_id>/exceptions", methods=["GET"])
+def list_exceptions(batch_id):
     batch = Batch.query.get_or_404(batch_id)
-    exceptions = ExceptionItem.query.filter_by(batch_id=batch_id).all()
-    return jsonify({
-        "batch": batch.to_dict(),
-        "exceptions": [e.to_dict() for e in exceptions],
-    })
+    data = [e.to_dict() for e in batch.exception_items]
+    for d in data:
+        if d["match_result_id"]:
+            mr = MatchResult.query.get(d["match_result_id"])
+            if mr:
+                d["po_number"] = mr.po.po_number if mr.po else None
+                d["invoice_number"] = mr.invoice.invoice_number if mr.invoice else None
+                d["amount_diff"] = mr.amount_diff
+                d["po_amount"] = mr.po_amount
+                d["invoice_amount"] = mr.invoice_amount
+                d["rule_version"] = mr.rule_version
+    return jsonify({"exceptions": data})
 
 
-@app.route("/api/batches/<int:batch_id>/exceptions/<int:exc_id>/remark", methods=["PUT"])
-def update_exception_remark(batch_id, exc_id):
+@bp.route("/api/batches/<int:batch_id>/exceptions/<int:exc_id>/remark", methods=["PUT"])
+def remark_exception(batch_id, exc_id):
+    batch = Batch.query.get_or_404(batch_id)
     exc = ExceptionItem.query.get_or_404(exc_id)
     if exc.batch_id != batch_id:
-        return jsonify({"error": "异常项不属于该批次"}), 400
-    data = request.get_json(force=True)
-    exc.remarks = data.get("remarks", exc.remarks)
-    db.session.commit()
-    log = AuditLog(batch_id=batch_id, action="REMARK_EXCEPTION", detail=f"异常#{exc_id}备注: {exc.remarks}")
+        return jsonify({"error": "异常不属于该批次"}), 400
+    payload = request.get_json(silent=True) or {}
+    remarks = payload.get("remarks", "")
+    exc.remarks = remarks
+    log = AuditLog(batch_id=batch_id, action="REMARK", detail=f"异常#{exc_id} 备注: {remarks}")
     db.session.add(log)
     db.session.commit()
     return jsonify(exc.to_dict())
 
 
-@app.route("/api/batches/<int:batch_id>/exceptions/<int:exc_id>/resolve", methods=["PUT"])
+@bp.route("/api/batches/<int:batch_id>/exceptions/<int:exc_id>/resolve", methods=["PUT"])
 def resolve_exception(batch_id, exc_id):
+    batch = Batch.query.get_or_404(batch_id)
     exc = ExceptionItem.query.get_or_404(exc_id)
     if exc.batch_id != batch_id:
-        return jsonify({"error": "异常项不属于该批次"}), 400
-    data = request.get_json(force=True)
-    action = data.get("action", "resolve")
+        return jsonify({"error": "异常不属于该批次"}), 400
+    payload = request.get_json(silent=True) or {}
+    action = payload.get("action", "resolve")
     if action == "resolve":
         exc.status = EXCEPTION_STATUS_RESOLVED
         if exc.match_result_id:
             mr = MatchResult.query.get(exc.match_result_id)
             if mr:
-                mr.is_exception = False
                 mr.exception_type = None
                 mr.status = RESULT_STATUS_CONFIRMED
     elif action == "reject":
@@ -250,7 +274,7 @@ def resolve_exception(batch_id, exc_id):
     return jsonify(exc.to_dict())
 
 
-@app.route("/api/batches/<int:batch_id>/confirm", methods=["POST"])
+@bp.route("/api/batches/<int:batch_id>/confirm", methods=["POST"])
 def confirm_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     if not batch.can_transition(BATCH_STATUS_CONFIRMED):
@@ -268,7 +292,7 @@ def confirm_batch(batch_id):
     return jsonify(batch.to_dict())
 
 
-@app.route("/api/batches/<int:batch_id>/post", methods=["POST"])
+@bp.route("/api/batches/<int:batch_id>/post", methods=["POST"])
 def post_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     if not batch.can_transition(BATCH_STATUS_POSTED):
@@ -280,7 +304,7 @@ def post_batch(batch_id):
     return jsonify(batch.to_dict())
 
 
-@app.route("/api/batches/<int:batch_id>/rollback", methods=["POST"])
+@bp.route("/api/batches/<int:batch_id>/rollback", methods=["POST"])
 def rollback_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     if not batch.can_transition(BATCH_STATUS_ROLLED_BACK):
@@ -294,7 +318,7 @@ def rollback_batch(batch_id):
     return jsonify(batch.to_dict())
 
 
-@app.route("/api/batches/<int:batch_id>/reset", methods=["POST"])
+@bp.route("/api/batches/<int:batch_id>/reset", methods=["POST"])
 def reset_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     if batch.status not in (BATCH_STATUS_ROLLED_BACK, BATCH_STATUS_FAILED):
@@ -308,7 +332,7 @@ def reset_batch(batch_id):
     return jsonify(batch.to_dict())
 
 
-@app.route("/api/batches/<int:batch_id>/export", methods=["GET"])
+@bp.route("/api/batches/<int:batch_id>/export", methods=["GET"])
 def export_report(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     results = MatchResult.query.filter_by(batch_id=batch_id).all()
@@ -364,6 +388,9 @@ def export_report(batch_id):
         as_attachment=True,
         download_name=filename,
     )
+
+
+app = create_app()
 
 
 if __name__ == "__main__":

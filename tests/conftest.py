@@ -5,21 +5,22 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import app as flask_app
-from models import db, init_db
+from app import create_app
+from models import db
 
 
 @pytest.fixture
 def app():
-    """Flask app 实例，使用内存 SQLite"""
-    flask_app.config["TESTING"] = True
-    flask_app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
-    flask_app.config["WTF_CSRF_ENABLED"] = False
-    flask_app.config["UPLOAD_FOLDER"] = tempfile.gettempdir()
-    init_db(flask_app)
-    with flask_app.app_context():
+    """每个用例都创建全新 Flask 实例 + 独立内存 SQLite，彻底隔离"""
+    _app = create_app({
+        "TESTING": True,
+        "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
+        "WTF_CSRF_ENABLED": False,
+        "UPLOAD_FOLDER": tempfile.gettempdir(),
+    })
+    with _app.app_context():
         db.create_all()
-        yield flask_app
+        yield _app
         db.session.remove()
         db.drop_all()
 

@@ -229,6 +229,7 @@ class ToleranceHistory(db.Model):
     tolerance_abs = db.Column(db.Float, nullable=False)
     rule_version = db.Column(db.String(50), nullable=False)
     changed_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    changed_by = db.Column(db.String(100), default="system")
 
     def to_dict(self):
         return {
@@ -238,6 +239,7 @@ class ToleranceHistory(db.Model):
             "tolerance_abs": self.tolerance_abs,
             "rule_version": self.rule_version,
             "changed_at": self.changed_at.isoformat() if self.changed_at else None,
+            "changed_by": self.changed_by,
         }
 
 
@@ -262,6 +264,7 @@ class AuditLog(db.Model):
 
 
 def init_db(app):
-    db.init_app(app)
+    if "sqlalchemy" not in app.extensions:
+        db.init_app(app)
     with app.app_context():
         db.create_all()

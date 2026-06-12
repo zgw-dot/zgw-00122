@@ -18,6 +18,7 @@ import io
 import os
 import sys
 import tempfile
+from io import BytesIO
 
 import pytest
 
@@ -78,7 +79,7 @@ def resolve_all_exceptions(client, bid):
 # ---------- 测试用例 ----------
 
 def test_confirm_batch_success_no_nameerror(client, sample_dir):
-    """确认入账成功，且不暴露 NameError 或 Python 堆栈"""
+    """确认入账/入账链路成功，且任何错误都不暴露 NameError 或 Python 堆栈"""
     bid = create_batch(client, "test-confirm-no-nameerror")
     upload_file(client, bid, "po", sample_dir, "purchase_orders.csv")
     upload_file(client, bid, "invoice", sample_dir, "invoices.csv")
@@ -88,72 +89,116 @@ def test_confirm_batch_success_no_nameerror(client, sample_dir):
     body = r.get_json()
     assert "success" in body, f"match 响应结构异常: {body}"
 
-    resolve_all_exceptions(client, bid)
-
-    # 确认入账——关键路径，之前这里会因 RESULT_STATUS_PENDING 未定义触发 NameError
+    # --- a) 有 pending 异常时调用 /confirm：应返回可读业务错误（400 JSON，不含 NameError/traceback） ---
     r = client.post(f"/api/batches/{bid}/confirm")
-
-    # 1. 返回 JSON，不包含 NameError 或 traceback
     assert r.content_type.startswith("application/json"), f"返回类型不是 JSON: {r.content_type}"
     body = r.get_json()
-    body_str = str(body).lower()
-    assert "nameerror" not in body_str, f"响应暴露了 NameError: {body}"
-    assert "traceback" not in body_str, f"响应暴露了 traceback: {body}"
+    err_str = str(body.get("error", "")).lower()
+    assert "nameerror" not in err_str, f"响应暴露了 NameError: {body}"
+    assert "traceback" not in err_str, f"响应暴露了 traceback: {body}"
+    assert r.status_code == 400, f"存在 pending 异常时 /confirm 应返回 400，实际 {r.status_code}: {body}"
+    assert "未处理异常" in body.get("error", ""), f"错误信息应含'未处理异常'，实际 {body}"
 
-    # 2. 确认入账成功，状态正确
-    assert r.status_code == 200, f"确认入账失败: {body}"
-    assert body["status"] == "CONFIRMED", f"确认后状态不对: {body['status']}"
+    # --- b) 解决所有异常：app.py 会 auto-confirm（因为全部 resolve 完状态 == EXCEPTION_PENDING → CONFIRMED） ---
+    resolve_all_exceptions(client, bid)
+    batch_after = client.get(f"/api/batches/{bid}").get_json()
+    assert batch_after["status"] == "CONFIRMED", f"auto-confirm 后状态应为 CONFIRMED，实际 {batch_after['status']}"
 
-    # 3. 入账接口也正常
+    # --- c) 再调 /confirm：已确认的返回状态流转错误（仍是 JSON，不含 NameError） ---
+    r = client.post(f"/api/batches/{bid}/confirm")
+    assert r.content_type.startswith("application/json")
+    body = r.get_json()
+    assert "nameerror" not in str(body.get("error", "")).lower()
+    assert r.status_code == 400, f"已 CONFIRMED 时再 /confirm 应 400: {body}"
+
+    # --- d) 入账 /post：这是原先 RESULT_STATUS_PENDING NameError 真正会打到的分支之一 ---
     r = client.post(f"/api/batches/{bid}/post")
+    assert r.content_type.startswith("application/json"), f"返回类型不是 JSON: {r.content_type}"
+    body = r.get_json()
+    assert "nameerror" not in str(body.get("error", "")).lower(), f"/post 暴露了 NameError: {body}"
+    assert "traceback" not in str(body.get("error", "")).lower(), f"/post 暴露了 traceback: {body}"
+    assert r.status_code == 200, f"/post 失败: {body}"
+    assert body["status"] == "POSTED", f"入账后状态应为 POSTED，实际 {body['status']}"
+
+
+def upload_csv_bytes(client, bid, typ, csv_text, filename="data.csv"):
+    """上传字符串形式的 CSV"""
+    data = {"file": (BytesIO(csv_text.encode("utf-8-sig")), filename)}
+    r = client.post(f"/api/batches/{bid}/upload-{typ}", data=data, content_type="multipart/form-data")
+    return r.get_json() if r.content_type.startswith("application/json") else {"status_code": r.status_code, "raw": r.data.decode("utf-8", errors="replace")}
+
+
+def test_over_tolerance_single_exception_with_both_sides(client):
+    """同供应商同 PO 超容差只生成 1 条归并异常，带两边单据、差额、规则版本、备注入口
+
+    数据设计（容差 0.5% / ¥10，故意让 PO-001 与 INV-001 的差额 500 元远超容差）：
+      PO:  PO-001, V001, 供应商A, 10000.00, 2024-01-01
+           PO-002, V002, 供应商B, 20000.00, 2024-01-01
+      INV: INV-001, V001, 供应商A, 10500.00, 2024-01-02   (差额 500=5% > 0.5%，触发 OVER_TOLERANCE)
+           INV-002, V002, 供应商B, 20000.00, 2024-01-02   (精确匹配)
+    预期：1 条 EXACT、1 条 OVER_TOLERANCE、0 条 UNMATCHED_PO/INVOICE，仅 1 条超容差异常项。
+    """
+    po_csv = (
+        "po_number,vendor_code,vendor_name,amount,po_date\n"
+        "PO-001,V001,供应商A,10000.00,2024-01-01\n"
+        "PO-002,V002,供应商B,20000.00,2024-01-01\n"
+    )
+    inv_csv = (
+        "invoice_number,vendor_code,vendor_name,amount,invoice_date\n"
+        "INV-001,V001,供应商A,10500.00,2024-01-02\n"
+        "INV-002,V002,供应商B,20000.00,2024-01-02\n"
+    )
+
+    bid = create_batch(client, "test-over-tol-single", pct=0.5, ab=10)
+    upload_csv_bytes(client, bid, "po", po_csv, "po.csv")
+    upload_csv_bytes(client, bid, "invoice", inv_csv, "inv.csv")
+
+    r = client.post(f"/api/batches/{bid}/match")
     assert r.status_code == 200
-    assert r.get_json()["status"] == "POSTED"
-
-
-def test_over_tolerance_single_exception_with_both_sides(client, sample_dir):
-    """同供应商同 PO 超容差只生成一条带两边单据、差额、规则版本、备注入口的异常"""
-    # 用严格容差触发 OVER_TOLERANCE
-    bid = create_batch(client, "test-over-tol", pct=0.5, ab=10)
-    upload_file(client, bid, "po", sample_dir, "purchase_orders.csv")
-    upload_file(client, bid, "invoice", sample_dir, "invoices.csv")
-
-    client.post(f"/api/batches/{bid}/match")
 
     results = get_results(client, bid)
     exceptions = get_exceptions(client, bid)
 
-    over_tol = [r for r in results if r["match_type"] == "OVER_TOLERANCE"]
-    unmatched_po = [r for r in results if r["match_type"] == "UNMATCHED_PO"]
-    unmatched_inv = [r for r in results if r["match_type"] == "UNMATCHED_INVOICE"]
+    exact = [x for x in results if x["match_type"] == "EXACT"]
+    over_tol = [x for x in results if x["match_type"] == "OVER_TOLERANCE"]
+    unmatched_po = [x for x in results if x["match_type"] == "UNMATCHED_PO"]
+    unmatched_inv = [x for x in results if x["match_type"] == "UNMATCHED_INVOICE"]
 
-    # 1. OVER_TOLERANCE 归并记录存在（原来的 bug 是 0 条，拆成 UNMATCHED_PO + UNMATCHED_INVOICE）
-    assert len(over_tol) >= 2, f"OVER_TOLERANCE 记录应为 ≥2，实际 {len(over_tol)}"
+    # 1. 严格 1 条 OVER_TOLERANCE（原 bug：拆成 UNMATCHED_PO + UNMATCHED_INVOICE，over_tol=0）
+    assert len(over_tol) == 1, f"OVER_TOLERANCE 严格等于 1，实际 {len(over_tol)}"
 
-    # 2. 每条归并记录都含两边单据、差额、规则版本
-    for r in over_tol:
-        assert r["po_number"], f"记录 {r['id']} 缺 po_number"
-        assert r["invoice_number"], f"记录 {r['id']} 缺 invoice_number"
-        assert r["po_amount"] is not None, f"记录 {r['id']} 缺 po_amount"
-        assert r["invoice_amount"] is not None, f"记录 {r['id']} 缺 invoice_amount"
-        assert r["amount_diff"] is not None and r["amount_diff"] > 0, f"记录 {r['id']} 缺 amount_diff"
-        assert r["rule_version"], f"记录 {r['id']} 缺 rule_version"
-        assert r["is_exception"] is True, f"记录 {r['id']} is_exception 应为 True"
+    # 2. 严格 1 条 EXACT，且没有任何孤立 UNMATCHED
+    assert len(exact) == 1, f"EXACT 严格等于 1，实际 {len(exact)}"
+    assert len(unmatched_po) == 0, f"UNMATCHED_PO 严格等于 0，实际 {len(unmatched_po)}"
+    assert len(unmatched_inv) == 0, f"UNMATCHED_INVOICE 严格等于 0，实际 {len(unmatched_inv)}"
 
-    # 3. 不会拆成两条孤立异常（UNMATCHED_PO/INVOICE 只应各有 1 条，来自 V004/V005）
-    assert len(unmatched_po) == 1, f"UNMATCHED_PO 应为 1（V004），实际 {len(unmatched_po)}"
-    assert len(unmatched_inv) == 1, f"UNMATCHED_INVOICE 应为 1（V005），实际 {len(unmatched_inv)}"
+    # 3. 归并记录字段齐全
+    r0 = over_tol[0]
+    assert r0["po_number"] == "PO-001", f"po_number 不对: {r0['po_number']}"
+    assert r0["invoice_number"] == "INV-001", f"invoice_number 不对: {r0['invoice_number']}"
+    assert r0["po_amount"] == 10000.0, f"po_amount 不对: {r0['po_amount']}"
+    assert r0["invoice_amount"] == 10500.0, f"invoice_amount 不对: {r0['invoice_amount']}"
+    assert r0["amount_diff"] == 500.0, f"amount_diff 不对，期望 500: {r0['amount_diff']}"
+    assert r0["rule_version"], f"rule_version 缺失"
+    assert r0["is_exception"] is True, f"is_exception 应为 True"
+    assert r0["status"] == "PENDING", f"匹配结果 status 应为 PENDING，实际 {r0.get('status')}"
 
-    # 4. 超容差异常存在，且有备注入口（exceptions 表有对应记录）
-    over_ex = [e for e in exceptions if e.get("detail") and "超出容差" in e["detail"]]
-    assert len(over_ex) == len(over_tol), f"超容差异常数 {len(over_ex)} 与归并记录数 {len(over_tol)} 不一致"
+    # 4. 异常项严格 1 条（含 EXCEPTION_PENDING 状态 + "超出容差" 详情 + match_result_id 关联）
+    over_ex = [e for e in exceptions if (e.get("detail") or "").find("超出容差") != -1]
+    assert len(over_ex) == 1, f"超容差异常项严格 1 条，实际 {len(over_ex)}"
+    ex0 = over_ex[0]
+    assert ex0["match_result_id"] == r0["id"], "异常项没有关联到归并后的 match_result"
+    assert ex0["status"] == EXCEPTION_STATUS_PENDING, f"异常状态应为 PENDING: {ex0['status']}"
 
-    # 5. 可以逐条加备注（备注入口正常）
-    for e in over_ex:
-        r = client.put(f"/api/batches/{bid}/exceptions/{e['id']}/remark", json={"remarks": f"超容差备注{e['id']}"})
-        assert r.status_code == 200
-        updated = client.get(f"/api/batches/{bid}/exceptions").get_json()["exceptions"]
-        target = next(x for x in updated if x["id"] == e["id"])
-        assert target["remarks"] == f"超容差备注{e['id']}", "备注写入失败"
+    # 5. 备注入口正常：能写备注并读回
+    r = client.put(
+        f"/api/batches/{bid}/exceptions/{ex0['id']}/remark",
+        json={"remarks": "财务确认该差异为补开税额，同意入账"},
+    )
+    assert r.status_code == 200
+    updated = client.get(f"/api/batches/{bid}/exceptions").get_json()["exceptions"]
+    target = next(x for x in updated if x["id"] == ex0["id"])
+    assert target["remarks"] == "财务确认该差异为补开税额，同意入账", "备注写入失败"
 
 
 def test_missing_columns_no_partial_result(client, sample_dir):
