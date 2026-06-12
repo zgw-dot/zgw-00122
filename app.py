@@ -160,6 +160,10 @@ def update_tolerance(batch_id):
 
 @bp.route("/api/batches/<int:batch_id>/upload-po", methods=["POST"])
 def upload_po(batch_id):
+    """
+    【已废弃】直接上传采购单（不经过预检）
+    推荐使用 POST /api/batches/{batch_id}/precheck-po 走预检流程
+    """
     batch = Batch.query.get_or_404(batch_id)
     if "file" not in request.files:
         return jsonify({"error": "缺少文件字段 file"}), 400
@@ -170,17 +174,26 @@ def upload_po(batch_id):
     try:
         content = f.read().decode("utf-8-sig")
         count = validate_and_import_po(batch.id, content)
-        log = AuditLog(batch_id=batch.id, action="UPLOAD_PO", detail=f"导入 {f.filename} 共 {count} 行")
+        log = AuditLog(batch_id=batch.id, action="UPLOAD_PO", detail=f"导入 {f.filename} 共 {count} 行 [旧API，已废弃，建议使用预检模式]")
         db.session.add(log)
         db.session.commit()
-        return jsonify({"imported": count, "filename": f.filename})
+        resp = jsonify({"imported": count, "filename": f.filename, "deprecated": True, "notice": "此API已废弃，请使用预检模式: POST /api/batches/{batch_id}/precheck-po"})
+        resp.headers["X-Deprecated"] = "true"
+        resp.headers["X-Warning"] = "Use precheck API instead: POST /api/batches/{batch_id}/precheck-po"
+        return resp
     except ValidationError as e:
         db.session.rollback()
-        return jsonify({"error": str(e), "details": e.details}), 400
+        resp = jsonify({"error": str(e), "details": e.details, "deprecated": True})
+        resp.headers["X-Deprecated"] = "true"
+        return resp, 400
 
 
 @bp.route("/api/batches/<int:batch_id>/upload-invoice", methods=["POST"])
 def upload_invoice(batch_id):
+    """
+    【已废弃】直接上传发票（不经过预检）
+    推荐使用 POST /api/batches/{batch_id}/precheck-invoice 走预检流程
+    """
     batch = Batch.query.get_or_404(batch_id)
     if "file" not in request.files:
         return jsonify({"error": "缺少文件字段 file"}), 400
@@ -191,13 +204,18 @@ def upload_invoice(batch_id):
     try:
         content = f.read().decode("utf-8-sig")
         count = validate_and_import_invoice(batch.id, content)
-        log = AuditLog(batch_id=batch.id, action="UPLOAD_INVOICE", detail=f"导入 {f.filename} 共 {count} 行")
+        log = AuditLog(batch_id=batch.id, action="UPLOAD_INVOICE", detail=f"导入 {f.filename} 共 {count} 行 [旧API，已废弃，建议使用预检模式]")
         db.session.add(log)
         db.session.commit()
-        return jsonify({"imported": count, "filename": f.filename})
+        resp = jsonify({"imported": count, "filename": f.filename, "deprecated": True, "notice": "此API已废弃，请使用预检模式: POST /api/batches/{batch_id}/precheck-invoice"})
+        resp.headers["X-Deprecated"] = "true"
+        resp.headers["X-Warning"] = "Use precheck API instead: POST /api/batches/{batch_id}/precheck-invoice"
+        return resp
     except ValidationError as e:
         db.session.rollback()
-        return jsonify({"error": str(e), "details": e.details}), 400
+        resp = jsonify({"error": str(e), "details": e.details, "deprecated": True})
+        resp.headers["X-Deprecated"] = "true"
+        return resp, 400
 
 
 @bp.route("/api/batches/<int:batch_id>/precheck-po", methods=["POST"])

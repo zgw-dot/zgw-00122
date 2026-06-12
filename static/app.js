@@ -30,7 +30,7 @@ createApp({
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
 
     const tabs = [
-      { key: "upload", label: "文件上传" },
+      { key: "upload", label: "文件上传（预检模式）" },
       { key: "results", label: "匹配结果" },
       { key: "exceptions", label: "异常待确认" },
       { key: "recalc-notes", label: "重算说明" },

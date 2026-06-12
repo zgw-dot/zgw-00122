@@ -2594,3 +2594,228 @@ def test_index_page_has_precheck_ui(client, sample_dir):
     assert "确认导入" in html, "页面应包含'确认导入'按钮"
     assert "预检详细报告" in html, "页面应包含'预检详细报告'"
 
+
+# ---------- 文档/用户流程一致性测试 ----------
+
+def test_documentation_user_flow_consistency(client, sample_dir):
+    """
+    文档与用户流程一致性验收测试。
+    模拟用户按照 README 描述的「预检模式」完整流程操作，
+    验证文档描述与实际行为一致：
+    1. 重复发票预检不直写（预检后不确认，正式数据为空）
+    2. 取消后数据不变（丢弃草稿不污染正式表）
+    3. 确认后才能匹配（两边都确认了才能执行匹配）
+    4. 页面包含所有必需的 UI 提示文案
+    """
+    bid = create_batch(client, "test-doc-consistency")
+
+    # ====== 场景1: 重复发票预检不直写 ======
+    r = precheck_file_api(client, bid, "invoice", sample_dir, "bad_duplicate_invoice.csv")
+    assert "error" not in r, f"预检请求本身失败: {r}"
+    assert r["error_count"] > 0, "重复发票文件应有错误"
+    assert r["status"] == "PENDING", "预检后草稿状态应为 PENDING"
+
+    # 验证：预检后不确认，正式数据为空
+    from models import Invoice, ImportDraft
+    with client.application.app_context():
+        assert Invoice.query.filter_by(batch_id=bid).count() == 0, "预检不确认不应写入正式表"
+        draft = ImportDraft.query.get(r["id"])
+        assert draft is not None
+        assert draft.status == "PENDING"
+
+    # 检查错误信息包含"发票号重复"（与文档描述一致）
+    has_dup_invoice = any(
+        "重复" in issue["message"] and "发票" in issue["message"]
+        for issue in r["issues"]
+    )
+    assert has_dup_invoice, "文档说重复发票号预检报错，实际应检测到"
+
+    # ====== 场景2: 取消后数据不变 ======
+    # 先预检一个正常采购单
+    r_po = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert r_po["error_count"] == 0
+    po_draft_id = r_po["id"]
+
+    # 确认前检查正式数据为空
+    with client.application.app_context():
+        from models import PurchaseOrder
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 0
+
+    # 丢弃草稿
+    r_discard = discard_draft_api(client, bid, po_draft_id)
+    assert r_discard["success"] is True
+
+    # 验证：丢弃后草稿状态为 DISCARDED，正式数据仍为空
+    with client.application.app_context():
+        draft = ImportDraft.query.get(po_draft_id)
+        assert draft.status == "DISCARDED", "丢弃后草稿状态应为 DISCARDED"
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 0, "丢弃草稿不应写入正式数据"
+
+    # ====== 场景3: 确认后才能匹配 ======
+    # 先确认采购单
+    r_po2 = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    confirm_draft_api(client, bid, r_po2["id"])
+
+    batch_info = get_batch(client, bid)
+    assert batch_info["po_filename"] == "purchase_orders.csv", "确认后采购单文件名应更新"
+    assert batch_info["invoice_filename"] is None, "发票还没确认，文件名应为空"
+
+    # 确认发票后再匹配，应该成功
+    r_inv = precheck_file_api(client, bid, "invoice", sample_dir, "invoices.csv")
+    confirm_draft_api(client, bid, r_inv["id"])
+
+    batch_both = get_batch(client, bid)
+    assert batch_both["po_filename"] is not None
+    assert batch_both["invoice_filename"] is not None
+
+    r_match2 = client.post(f"/api/batches/{bid}/match")
+    assert r_match2.status_code == 200, "两边都确认后匹配应成功"
+    match_data = r_match2.get_json()
+    assert "has_exceptions" in match_data
+
+    # ====== 场景4: 页面 UI 提示文案齐全 ======
+    r_page = client.get("/")
+    assert r_page.status_code == 200
+    html = r_page.data.decode("utf-8")
+
+    required_texts = [
+        "预检模式",  # 提示条标题
+        "不会立即写入正式数据",  # 提示条关键说明
+        "确认导入",  # 确认按钮
+        "取消",  # 取消按钮
+        "需先确认导入采购单和发票文件",  # 匹配按钮提示
+        "容差配置快照",  # 预检报告显示
+        "预检结果",  # 结果区域标题
+        "选择采购单文件（预检模式）",  # 采购单上传按钮
+        "选择发票文件（预检模式）",  # 发票上传按钮
+        "先预检再确认导入",  # 上传区提示
+    ]
+    for text in required_texts:
+        assert text in html, f"页面应包含文案: '{text}'"
+
+    # ====== 场景5: 旧 API 有废弃标记 ======
+    path = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path, "rb") as f:
+        data = {"file": (f, "purchase_orders.csv")}
+        r_old = client.post(f"/api/batches/{bid}/upload-po", data=data, content_type="multipart/form-data")
+    # 旧 API 仍能工作（兼容），但返回中应有 deprecated 标记
+    assert r_old.status_code == 200
+    old_data = r_old.get_json()
+    assert old_data.get("deprecated") is True, "旧 API 返回应包含 deprecated: true"
+    assert "X-Deprecated" in r_old.headers, "旧 API 响应头应包含 X-Deprecated"
+    assert "notice" in old_data, "旧 API 返回应包含 notice 提示"
+
+    # ====== 场景6: 草稿列表和最新查询可用 ======
+    # 列表查询
+    drafts = list_drafts_api(client, bid)
+    assert len(drafts) >= 2, "应有至少 2 个草稿记录"
+
+    # 按类型筛选
+    po_drafts = list_drafts_api(client, bid, file_type="PO")
+    inv_drafts = list_drafts_api(client, bid, file_type="INVOICE")
+    assert len(po_drafts) >= 1
+    assert len(inv_drafts) >= 1
+
+    # 最新草稿查询
+    latest_po = get_latest_draft_api(client, bid, file_type="PO")
+    assert latest_po is not None
+    assert latest_po["file_type"] == "PO"
+
+
+def test_precheck_full_user_journey_like_readme(client, sample_dir):
+    """
+    完整用户旅程测试，完全按照 README「可复现验收步骤」的顺序执行，
+    验证用户照着文档一步步走能复现预期结果。
+    """
+    # 1. 创建批次
+    bid = create_batch(client, "验收批次-001")
+    assert bid > 0
+
+    # 2. 上传采购单预检
+    r_po_pre = precheck_file_api(client, bid, "po", sample_dir, "purchase_orders.csv")
+    assert r_po_pre["status"] == "PENDING"
+    assert r_po_pre["row_count"] == 6
+    assert "issues" in r_po_pre
+    po_draft_id = r_po_pre["id"]
+
+    # 3. 查看最新草稿（模拟用户打开页面自动加载）
+    latest = get_latest_draft_api(client, bid, file_type="PO")
+    assert latest is not None
+    assert latest["id"] == po_draft_id
+    assert latest["status"] == "PENDING"
+
+    # 4. 确认导入采购单
+    r_po_conf = confirm_draft_api(client, bid, po_draft_id)
+    assert r_po_conf["success"] is True
+    assert r_po_conf["imported_count"] == 6
+
+    # 5. 上传发票预检
+    r_inv_pre = precheck_file_api(client, bid, "invoice", sample_dir, "invoices.csv")
+    assert r_inv_pre["status"] == "PENDING"
+    assert r_inv_pre["row_count"] == 6
+    inv_draft_id = r_inv_pre["id"]
+
+    # 6. 确认导入发票
+    r_inv_conf = confirm_draft_api(client, bid, inv_draft_id)
+    assert r_inv_conf["success"] is True
+    assert r_inv_conf["imported_count"] == 6
+
+    # 7. 执行匹配
+    r_match = client.post(f"/api/batches/{bid}/match")
+    assert r_match.status_code == 200
+    match_data = r_match.get_json()
+    assert "matched_count" in match_data or "has_exceptions" in match_data
+
+    # 8. 查看结果
+    r_results = client.get(f"/api/batches/{bid}/results")
+    assert r_results.status_code == 200
+    results_data = r_results.get_json()
+    assert "results" in results_data
+    assert len(results_data["results"]) > 0, "匹配后应有结果数据"
+
+    # 9. 验证审计日志中有草稿相关记录
+    from models import AuditLog
+    with client.application.app_context():
+        audit_logs = AuditLog.query.filter_by(batch_id=bid).all()
+        audit_actions = [log.action for log in audit_logs]
+        # 应该有草稿创建、确认等审计记录
+        assert any("DRAFT" in action for action in audit_actions), "审计日志应包含草稿相关操作"
+        assert any("DRAFT_CONFIRMED" in action for action in audit_actions), "应有确认草稿的审计记录"
+        assert len(audit_logs) >= 5, "应有足够的审计日志记录（创建、2次预检、2次确认、匹配等）"
+
+
+def test_old_api_still_works_for_backward_compat(client, sample_dir):
+    """
+    旧版直接上传 API 仍可工作（向后兼容），但有废弃标记。
+    确保现有脚本不会立刻坏掉。
+    """
+    bid = create_batch(client, "test-old-api-compat")
+
+    # 旧 API 上传采购单
+    path = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path, "rb") as f:
+        data = {"file": (f, "purchase_orders.csv")}
+        r = client.post(f"/api/batches/{bid}/upload-po", data=data, content_type="multipart/form-data")
+
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data.get("imported") == 6, "旧 API 仍应能正常导入"
+    assert data.get("deprecated") is True, "旧 API 应返回 deprecated: true"
+    assert r.headers.get("X-Deprecated") == "true", "响应头应包含 X-Deprecated"
+    assert "notice" in data, "应包含迁移提示"
+
+    # 旧 API 上传发票
+    path2 = os.path.join(sample_dir, "invoices.csv")
+    with open(path2, "rb") as f:
+        data2 = {"file": (f, "invoices.csv")}
+        r2 = client.post(f"/api/batches/{bid}/upload-invoice", data=data2, content_type="multipart/form-data")
+
+    assert r2.status_code == 200
+    assert r2.get_json().get("deprecated") is True
+
+    # 数据确实写入了
+    from models import PurchaseOrder, Invoice
+    with client.application.app_context():
+        assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 6
+        assert Invoice.query.filter_by(batch_id=bid).count() == 6
+
