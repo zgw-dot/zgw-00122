@@ -7,8 +7,8 @@ from models import (
     db, Batch, MatchResult, ExceptionItem, ToleranceHistory, AuditLog,
     BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED, BATCH_STATUS_POSTED,
     BATCH_STATUS_ROLLED_BACK, BATCH_STATUS_FAILED,
-    EXCEPTION_DUPLICATE_ROLLBACK, EXCEPTION_STATUS_PENDING,
-    EXCEPTION_STATUS_RESOLVED, RESULT_STATUS_CONFIRMED, RESULT_STATUS_REJECTED,
+    EXCEPTION_STATUS_PENDING, EXCEPTION_STATUS_RESOLVED,
+    RESULT_STATUS_PENDING, RESULT_STATUS_CONFIRMED, RESULT_STATUS_REJECTED,
     VALID_TRANSITIONS, compute_rule_version, init_db,
 )
 from matcher import (
@@ -23,6 +23,18 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 
 init_db(app)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    import traceback
+    traceback.print_exc()
+    status = getattr(e, "code", 500)
+    if isinstance(e, NameError):
+        return jsonify({"error": "服务内部错误，请联系管理员"}), 500
+    if status == 500:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"error": str(e)}), status
 
 
 @app.route("/")

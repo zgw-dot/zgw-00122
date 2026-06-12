@@ -6,7 +6,7 @@ from models import (
     ToleranceHistory, AuditLog,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED,
-    MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE,
+    MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
     MATCH_TYPE_UNMATCHED_PO, MATCH_TYPE_UNMATCHED_INVOICE,
     EXCEPTION_MISSING_FIELD, EXCEPTION_OVER_TOLERANCE,
     EXCEPTION_DUPLICATE_INVOICE,
@@ -203,30 +203,66 @@ def perform_matching(batch):
                 )
                 db.session.add(ei)
         else:
-            mr = MatchResult(
-                batch_id=batch.id,
-                po_id=po.id,
-                invoice_id=None,
-                match_type=MATCH_TYPE_UNMATCHED_PO,
-                po_amount=po.amount,
-                invoice_amount=None,
-                amount_diff=None,
-                is_exception=True,
-                exception_type=EXCEPTION_OVER_TOLERANCE,
-                status=RESULT_STATUS_PENDING,
-                rule_version=rule_version,
-            )
-            db.session.add(mr)
-            db.session.flush()
-            has_exceptions = True
-            ei = ExceptionItem(
-                batch_id=batch.id,
-                match_result_id=mr.id,
-                exception_type=EXCEPTION_OVER_TOLERANCE,
-                detail=f"采购单{po.po_number}(供应商{po.vendor_code})无匹配发票",
-                status=EXCEPTION_STATUS_PENDING,
-            )
-            db.session.add(ei)
+            remaining_invs = [inv for inv in vendor_invs if inv.id not in matched_inv_ids]
+            fallback_inv = None
+            fallback_diff = float("inf")
+            for inv in remaining_invs:
+                diff = abs(po.amount - inv.amount)
+                if diff < fallback_diff:
+                    fallback_inv = inv
+                    fallback_diff = diff
+            if fallback_inv is not None:
+                matched_inv_ids.add(fallback_inv.id)
+                mr = MatchResult(
+                    batch_id=batch.id,
+                    po_id=po.id,
+                    invoice_id=fallback_inv.id,
+                    match_type=MATCH_TYPE_OVER_TOLERANCE,
+                    po_amount=po.amount,
+                    invoice_amount=fallback_inv.amount,
+                    amount_diff=fallback_diff,
+                    is_exception=True,
+                    exception_type=EXCEPTION_OVER_TOLERANCE,
+                    status=RESULT_STATUS_PENDING,
+                    rule_version=rule_version,
+                )
+                db.session.add(mr)
+                db.session.flush()
+                has_exceptions = True
+                ei = ExceptionItem(
+                    batch_id=batch.id,
+                    match_result_id=mr.id,
+                    exception_type=EXCEPTION_OVER_TOLERANCE,
+                    detail=f"采购单{po.po_number}与发票{fallback_inv.invoice_number}金额差异{fallback_diff:.2f}，"
+                           f"超出容差（采购金额{po.amount}，发票金额{fallback_inv.amount}）",
+                    status=EXCEPTION_STATUS_PENDING,
+                )
+                db.session.add(ei)
+            else:
+                mr = MatchResult(
+                    batch_id=batch.id,
+                    po_id=po.id,
+                    invoice_id=None,
+                    match_type=MATCH_TYPE_UNMATCHED_PO,
+                    po_amount=po.amount,
+                    invoice_amount=None,
+                    amount_diff=None,
+                    is_exception=True,
+                    exception_type=EXCEPTION_OVER_TOLERANCE,
+                    status=RESULT_STATUS_PENDING,
+                    rule_version=rule_version,
+                )
+                db.session.add(mr)
+                db.session.flush()
+                has_exceptions = True
+                ei = ExceptionItem(
+                    batch_id=batch.id,
+                    match_result_id=mr.id,
+                    exception_type=EXCEPTION_OVER_TOLERANCE,
+                    detail=f"采购单{po.po_number}(供应商{po.vendor_code})无匹配发票",
+                    status=EXCEPTION_STATUS_PENDING,
+                )
+                db.session.add(ei)
 
     for inv in invoices:
         if inv.id not in matched_inv_ids:

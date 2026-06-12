@@ -219,12 +219,12 @@ createApp({
     }
 
     function matchTypeLabel(t) {
-      const m = { EXACT:"精确匹配", TOLERANCE:"容差匹配", UNMATCHED_PO:"未匹配采购单", UNMATCHED_INVOICE:"未匹配发票" };
+      const m = { EXACT:"精确匹配", TOLERANCE:"容差匹配", OVER_TOLERANCE:"超容差异常", UNMATCHED_PO:"未匹配采购单", UNMATCHED_INVOICE:"未匹配发票" };
       return m[t] || t;
     }
 
     function matchTypeClass(t) {
-      const m = { EXACT:"bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs", TOLERANCE:"bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-xs", UNMATCHED_PO:"bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs", UNMATCHED_INVOICE:"bg-orange-100 text-orange-700 px-2 py-0.5 rounded text-xs" };
+      const m = { EXACT:"bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs", TOLERANCE:"bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-xs", OVER_TOLERANCE:"bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs", UNMATCHED_PO:"bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs", UNMATCHED_INVOICE:"bg-orange-100 text-orange-700 px-2 py-0.5 rounded text-xs" };
       return m[t] || "";
     }
 
