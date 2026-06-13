@@ -25,6 +25,9 @@ from matcher import (
     get_latest_review_summary, get_latest_plan_review_summary,
     create_import_plan, get_plan, list_plans, get_latest_plan,
     confirm_plan, cancel_plan, undo_plan,
+    get_health_rules, update_health_rules, run_health_check,
+    list_health_history, get_health_history_detail,
+    export_health_check_csv, import_health_remarks,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
@@ -897,6 +900,94 @@ def export_report(batch_id):
         as_attachment=True,
         download_name=filename,
     )
+
+
+@bp.route("/api/batches/<int:batch_id>/health-rules", methods=["GET"])
+def get_health_check_rules(batch_id):
+    Batch.query.get_or_404(batch_id)
+    return jsonify(get_health_rules(batch_id))
+
+
+@bp.route("/api/batches/<int:batch_id>/health-rules", methods=["PUT"])
+def update_health_check_rules(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    rules_update = payload.get("rules", {})
+    operator = payload.get("operator", "system")
+    try:
+        result = update_health_rules(batch_id, rules_update, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/health-check", methods=["POST"])
+def run_health_check_api(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    operator = payload.get("operator", "system")
+    try:
+        result = run_health_check(batch_id, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/health-history", methods=["GET"])
+def list_health_history_api(batch_id):
+    Batch.query.get_or_404(batch_id)
+    limit = int(request.args.get("limit", 20))
+    return jsonify({"history": list_health_history(batch_id, limit=limit)})
+
+
+@bp.route("/api/batches/<int:batch_id>/health-history/<int:history_id>", methods=["GET"])
+def get_health_history_api(batch_id, history_id):
+    batch = Batch.query.get_or_404(batch_id)
+    try:
+        detail = get_health_history_detail(history_id)
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 404
+    if detail["batch_id"] != batch_id:
+        return jsonify({"error": "该巡检记录不属于当前批次，跨批次访问被阻断"}), 400
+    return jsonify(detail)
+
+
+@bp.route("/api/batches/<int:batch_id>/health-history/<int:history_id>/export", methods=["GET"])
+def export_health_check(batch_id, history_id):
+    batch = Batch.query.get_or_404(batch_id)
+    try:
+        detail = get_health_history_detail(history_id)
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 404
+    if detail["batch_id"] != batch_id:
+        return jsonify({"error": "该巡检记录不属于当前批次，跨批次导出被阻断"}), 400
+    csv_content = export_health_check_csv(history_id)
+    filename = f"health_check_batch_{batch_id}_{history_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+    return send_file(
+        io.BytesIO(csv_content.encode("utf-8-sig")),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+@bp.route("/api/batches/<int:batch_id>/health-remarks/import", methods=["POST"])
+def import_health_remarks_api(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    operator = request.form.get("operator", "system")
+    try:
+        content = f.read().decode("utf-8-sig")
+        result = import_health_remarks(batch_id, content, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+    except UnicodeDecodeError:
+        return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
 
 
 app = create_app()

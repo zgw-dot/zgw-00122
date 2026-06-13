@@ -3199,3 +3199,109 @@ def test_export_csv_includes_plan_summary(client, sample_dir):
     assert any("batch import plan summary" in l.lower() or "plan #" in l.lower() for l in lines), \
         f"CSV must include plan summary line, got: {[l for l in lines if 'plan' in l.lower() or 'summary' in l.lower()]}"
 
+
+def test_health_check_basic_flow(client, sample_dir):
+    bid = create_batch(client, "health-check-basic")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    with open(path_po, "rb") as f:
+        client.post(f"/api/batches/{bid}/precheck-po",
+                    data={"file": (f, "po.csv"), "operator": "hc_u"},
+                    content_type="multipart/form-data")
+    with open(path_inv, "rb") as f:
+        client.post(f"/api/batches/{bid}/precheck-invoice",
+                    data={"file": (f, "inv.csv"), "operator": "hc_u"},
+                    content_type="multipart/form-data")
+    po_d = client.get(f"/api/batches/{bid}/drafts/latest?file_type=PO").get_json()
+    inv_d = client.get(f"/api/batches/{bid}/drafts/latest?file_type=INVOICE").get_json()
+    client.post(f"/api/batches/{bid}/drafts/{po_d['draft']['id']}/confirm", json={"operator": "hc_u"})
+    client.post(f"/api/batches/{bid}/drafts/{inv_d['draft']['id']}/confirm", json={"operator": "hc_u"})
+    r = client.post(f"/api/batches/{bid}/health-check", json={"operator": "hc_u"})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "summary" in data
+    assert "results" in data
+    assert "history_id" in data
+    assert "rule_version" in data
+    hist = client.get(f"/api/batches/{bid}/health-history").get_json()
+    assert "history" in hist
+    assert len(hist["history"]) >= 1
+    detail = client.get(f"/api/batches/{bid}/health-history/{data['history_id']}").get_json()
+    assert detail["id"] == data["history_id"]
+    assert "results" in detail
+
+
+def test_health_check_rules_update(client, sample_dir):
+    bid = create_batch(client, "health-check-rules")
+    r = client.get(f"/api/batches/{bid}/health-rules")
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "rules" in data
+    assert "rule_version" in data
+    old_version = data["rule_version"]
+    assert data["rules"]["duplicate_po_number"]["enabled"] is True
+    r2 = client.put(f"/api/batches/{bid}/health-rules",
+                    json={"rules": {"duplicate_po_number": {"enabled": False, "severity": "WARNING", "threshold": 2}},
+                          "operator": "rule_editor"})
+    assert r2.status_code == 200
+    data2 = r2.get_json()
+    assert data2["rules"]["duplicate_po_number"]["enabled"] is False
+    assert data2["rule_version"] != old_version
+
+
+def test_health_check_export_csv(client, sample_dir):
+    bid = create_batch(client, "health-check-export")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path_po, "rb") as f:
+        dr = client.post(f"/api/batches/{bid}/precheck-po",
+                         data={"file": (f, "po.csv"), "operator": "hc_exp"},
+                         content_type="multipart/form-data").get_json()
+    client.post(f"/api/batches/{bid}/drafts/{dr['id']}/confirm", json={"operator": "hc_exp"})
+    r = client.post(f"/api/batches/{bid}/health-check", json={"operator": "hc_exp"}).get_json()
+    hid = r["history_id"]
+    exp = client.get(f"/api/batches/{bid}/health-history/{hid}/export")
+    assert exp.status_code == 200
+    body = exp.data.decode("utf-8-sig")
+    assert "数据健康巡检报告" in body
+    assert "巡检问题明细" in body
+
+
+def test_health_check_import_remarks_rule_version_block(client, sample_dir):
+    bid = create_batch(client, "health-check-import")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path_po, "rb") as f:
+        dr = client.post(f"/api/batches/{bid}/precheck-po",
+                         data={"file": (f, "po.csv"), "operator": "hc_imp"},
+                         content_type="multipart/form-data").get_json()
+    client.post(f"/api/batches/{bid}/drafts/{dr['id']}/confirm", json={"operator": "hc_imp"})
+    r = client.post(f"/api/batches/{bid}/health-check", json={"operator": "hc_imp"}).get_json()
+    hid = r["history_id"]
+    exp = client.get(f"/api/batches/{bid}/health-history/{hid}/export").data
+    client.put(f"/api/batches/{bid}/health-rules",
+               json={"rules": {"negative_amount": {"enabled": True, "severity": "BLOCKER", "threshold": 1000}},
+                     "operator": "rule_changer"})
+    import_csv = BytesIO(exp)
+    import_csv.seek(0)
+    r2 = client.post(f"/api/batches/{bid}/health-remarks/import",
+                     data={"file": (import_csv, "health_check.csv"), "operator": "importer"},
+                     content_type="multipart/form-data")
+    assert r2.status_code == 400
+    body = r2.get_json()
+    assert "规则版本不一致" in body.get("error", "") or "version" in body.get("error", "").lower()
+
+
+def test_health_check_cross_batch_blocked(client, sample_dir):
+    bid1 = create_batch(client, "hc-cross-batch-1")
+    bid2 = create_batch(client, "hc-cross-batch-2")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path_po, "rb") as f:
+        dr = client.post(f"/api/batches/{bid1}/precheck-po",
+                         data={"file": (f, "po.csv"), "operator": "hc_cb"},
+                         content_type="multipart/form-data").get_json()
+    client.post(f"/api/batches/{bid1}/drafts/{dr['id']}/confirm", json={"operator": "hc_cb"})
+    r = client.post(f"/api/batches/{bid1}/health-check", json={"operator": "hc_cb"}).get_json()
+    hid = r["history_id"]
+    r2 = client.get(f"/api/batches/{bid2}/health-history/{hid}")
+    assert r2.status_code == 400
+    assert "跨批次" in r2.get_json().get("error", "")
+

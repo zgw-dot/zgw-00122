@@ -72,6 +72,31 @@ PRECHECK_ERROR = "ERROR"
 PRECHECK_WARNING = "WARNING"
 PRECHECK_INFO = "INFO"
 
+HEALTH_SEVERITY_BLOCKER = "BLOCKER"
+HEALTH_SEVERITY_WARNING = "WARNING"
+HEALTH_SEVERITY_INFO = "INFO"
+
+HEALTH_RULE_DUPLICATE_PO = "duplicate_po_number"
+HEALTH_RULE_DUPLICATE_INVOICE = "duplicate_invoice_number"
+HEALTH_RULE_MISSING_COLUMNS = "missing_required_columns"
+HEALTH_RULE_NEGATIVE_AMOUNT = "negative_amount"
+HEALTH_RULE_VENDOR_MISMATCH = "vendor_mismatch"
+HEALTH_RULE_CONFIRMED_OVERRIDE_RISK = "confirmed_override_risk"
+
+DEFAULT_HEALTH_RULES = {
+    HEALTH_RULE_DUPLICATE_PO: {"enabled": True, "severity": HEALTH_SEVERITY_BLOCKER, "threshold": 1},
+    HEALTH_RULE_DUPLICATE_INVOICE: {"enabled": True, "severity": HEALTH_SEVERITY_BLOCKER, "threshold": 1},
+    HEALTH_RULE_MISSING_COLUMNS: {"enabled": True, "severity": HEALTH_SEVERITY_BLOCKER, "threshold": 1},
+    HEALTH_RULE_NEGATIVE_AMOUNT: {"enabled": True, "severity": HEALTH_SEVERITY_WARNING, "threshold": 0},
+    HEALTH_RULE_VENDOR_MISMATCH: {"enabled": True, "severity": HEALTH_SEVERITY_WARNING, "threshold": 1},
+    HEALTH_RULE_CONFIRMED_OVERRIDE_RISK: {"enabled": True, "severity": HEALTH_SEVERITY_INFO, "threshold": 1},
+}
+
+
+def compute_health_rule_version(rules_dict):
+    raw = json.dumps(rules_dict, sort_keys=True)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
 
 def compute_rule_version(tolerance_pct, tolerance_abs):
     raw = f"{tolerance_pct}:{tolerance_abs}"
@@ -97,6 +122,7 @@ class Batch(db.Model):
     exception_items = db.relationship("ExceptionItem", backref="batch", cascade="all, delete-orphan")
     tolerance_history = db.relationship("ToleranceHistory", backref="batch", cascade="all, delete-orphan")
     audit_logs = db.relationship("AuditLog", backref="batch", cascade="all, delete-orphan")
+    health_check_rules = db.relationship("HealthCheckRule", backref="batch", cascade="all, delete-orphan")
 
     def can_transition(self, new_status):
         allowed = VALID_TRANSITIONS.get(self.status, [])
@@ -554,6 +580,97 @@ class PlanSnapshot(db.Model):
             "action": self.action,
             "original_data": json.loads(self.original_data) if self.original_data else None,
             "restored": self.restored,
+        }
+
+
+class HealthCheckRule(db.Model):
+    __tablename__ = "health_check_rules"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    rule_key = db.Column(db.String(100), nullable=False)
+    enabled = db.Column(db.Boolean, nullable=False, default=True)
+    severity = db.Column(db.String(20), nullable=False, default=HEALTH_SEVERITY_WARNING)
+    threshold = db.Column(db.Float, default=0.0)
+    rule_version = db.Column(db.String(50), nullable=False)
+    updated_by = db.Column(db.String(100), default="system")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (db.UniqueConstraint("batch_id", "rule_key", name="uq_batch_rule"),)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "rule_key": self.rule_key,
+            "enabled": self.enabled,
+            "severity": self.severity,
+            "threshold": self.threshold,
+            "rule_version": self.rule_version,
+            "updated_by": self.updated_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class HealthCheckHistory(db.Model):
+    __tablename__ = "health_check_history"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    rule_version = db.Column(db.String(50), nullable=False)
+    operator = db.Column(db.String(100), default="system")
+    source_files = db.Column(db.Text)
+    summary = db.Column(db.Text)
+    blocker_count = db.Column(db.Integer, default=0)
+    warning_count = db.Column(db.Integer, default=0)
+    info_count = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="health_check_history")
+    results = db.relationship("HealthCheckResult", backref="history", cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "rule_version": self.rule_version,
+            "operator": self.operator,
+            "source_files": json.loads(self.source_files) if self.source_files else [],
+            "summary": json.loads(self.summary) if self.summary else None,
+            "blocker_count": self.blocker_count,
+            "warning_count": self.warning_count,
+            "info_count": self.info_count,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class HealthCheckResult(db.Model):
+    __tablename__ = "health_check_results"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    history_id = db.Column(db.Integer, db.ForeignKey("health_check_history.id"), nullable=False)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    rule_key = db.Column(db.String(100), nullable=False)
+    severity = db.Column(db.String(20), nullable=False)
+    category = db.Column(db.String(50))
+    message = db.Column(db.Text, nullable=False)
+    related_numbers = db.Column(db.Text)
+    table_name = db.Column(db.String(50))
+    row_id = db.Column(db.Integer)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "history_id": self.history_id,
+            "batch_id": self.batch_id,
+            "rule_key": self.rule_key,
+            "severity": self.severity,
+            "category": self.category,
+            "message": self.message,
+            "related_numbers": json.loads(self.related_numbers) if self.related_numbers else [],
+            "table_name": self.table_name,
+            "row_id": self.row_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 

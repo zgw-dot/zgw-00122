@@ -373,6 +373,140 @@
           </div>
         </div>
 
+        <div v-if="activeTab==='health-check'">
+          <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 text-sm text-blue-800">
+            <div class="flex items-center gap-2">
+              <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+              <div>
+                <span class="font-medium">数据健康巡检</span>：检查采购单、发票中的重复号、缺列、负金额、供应商不一致、已确认批次覆盖风险等问题，支持导出 CSV 并回导为复核备注。
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+            <div class="lg:col-span-2">
+              <div class="bg-white border border-gray-200 rounded-lg p-4">
+                <div class="flex items-center justify-between mb-4">
+                  <h3 class="font-semibold text-gray-800">巡检结果</h3>
+                  <div class="flex items-center gap-2">
+                    <button @click="runHealthCheck" :disabled="healthLoading" class="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-4 py-1.5 rounded text-sm font-medium transition">
+                      <span v-if="healthLoading">巡检中...</span>
+                      <span v-else>立即巡检</span>
+                    </button>
+                    <button v-if="healthDetail" @click="exportHealthCheck(healthDetail.history_id)" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">导出 CSV</button>
+                    <label class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded text-sm font-medium cursor-pointer transition">
+                      导入备注
+                      <input type="file" accept=".csv" @change="importHealthRemarks" class="hidden">
+                    </label>
+                  </div>
+                </div>
+
+                <div v-if="healthRules" class="mb-4 text-xs text-gray-500">
+                  规则版本：{{ healthRules.rule_version }}
+                </div>
+
+                <div v-if="healthDetail" class="mb-4">
+                  <div class="grid grid-cols-3 gap-3 mb-4">
+                    <div class="bg-red-50 rounded-lg p-3 text-center">
+                      <div class="text-2xl font-bold text-red-700">{{ healthDetail.summary.blocker_count }}</div>
+                      <div class="text-xs text-red-600">阻断</div>
+                    </div>
+                    <div class="bg-yellow-50 rounded-lg p-3 text-center">
+                      <div class="text-2xl font-bold text-yellow-700">{{ healthDetail.summary.warning_count }}</div>
+                      <div class="text-xs text-yellow-600">警告</div>
+                    </div>
+                    <div class="bg-blue-50 rounded-lg p-3 text-center">
+                      <div class="text-2xl font-bold text-blue-700">{{ healthDetail.summary.info_count }}</div>
+                      <div class="text-xs text-blue-600">提示</div>
+                    </div>
+                  </div>
+
+                  <div v-if="healthDetail.results && healthDetail.results.length > 0" class="overflow-x-auto max-h-96 overflow-y-auto">
+                    <table class="w-full text-sm">
+                      <thead class="bg-gray-50 text-gray-600 sticky top-0">
+                        <tr>
+                          <th class="px-3 py-2 text-left w-20">等级</th>
+                          <th class="px-3 py-2 text-left w-32">规则</th>
+                          <th class="px-3 py-2 text-left w-24">分类</th>
+                          <th class="px-3 py-2 text-left">问题描述</th>
+                          <th class="px-3 py-2 text-left w-32">关联单号</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="r in healthDetail.results" :key="r.id || r.message" class="border-t border-gray-100">
+                          <td class="px-3 py-2">
+                            <span :class="['status-badge', severityClass(r.severity)]">{{ severityLabel(r.severity) }}</span>
+                          </td>
+                          <td class="px-3 py-2 text-gray-600 text-xs">{{ r.rule_key }}</td>
+                          <td class="px-3 py-2 text-gray-500 text-xs">{{ r.category }}</td>
+                          <td class="px-3 py-2">{{ r.message }}</td>
+                          <td class="px-3 py-2 text-xs text-gray-500">
+                            <span v-if="r.related_numbers && r.related_numbers.length > 0">{{ r.related_numbers.slice(0, 3).join(', ') }}<span v-if="r.related_numbers.length > 3">...</span></span>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div v-else class="text-center text-gray-400 py-8">
+                    本次巡检未发现问题
+                  </div>
+                </div>
+
+                <div v-else class="text-center text-gray-400 py-12">
+                  点击「立即巡检」开始数据健康检查
+                </div>
+              </div>
+            </div>
+
+            <div class="lg:col-span-1">
+              <div class="bg-white border border-gray-200 rounded-lg p-4">
+                <h3 class="font-semibold text-gray-800 mb-4">巡检规则配置</h3>
+                <div v-if="healthRules" class="space-y-4">
+                  <div v-for="(rule, key) in healthRuleForm" :key="key" class="border-b border-gray-100 pb-3 last:border-b-0">
+                    <div class="flex items-center justify-between mb-2">
+                      <span class="text-sm font-medium text-gray-700">{{ key }}</span>
+                      <label class="inline-flex items-center cursor-pointer">
+                        <input type="checkbox" v-model="rule.enabled" class="sr-only peer">
+                        <div class="relative w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                      </label>
+                    </div>
+                    <div class="flex items-center gap-2 text-xs">
+                      <select v-model="rule.severity" :disabled="!rule.enabled" class="border rounded px-2 py-1 flex-1">
+                        <option value="BLOCKER">阻断</option>
+                        <option value="WARNING">警告</option>
+                        <option value="INFO">提示</option>
+                      </select>
+                      <input type="number" v-model.number="rule.threshold" :disabled="!rule.enabled" step="1" class="w-16 border rounded px-2 py-1" placeholder="阈值">
+                    </div>
+                  </div>
+                  <button @click="saveHealthRules" class="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded text-sm font-medium transition">保存规则</button>
+                </div>
+              </div>
+
+              <div class="bg-white border border-gray-200 rounded-lg p-4 mt-4">
+                <h3 class="font-semibold text-gray-800 mb-3">巡检历史</h3>
+                <div v-if="healthHistory.length > 0" class="space-y-2 max-h-64 overflow-y-auto">
+                  <div v-for="h in healthHistory" :key="h.id"
+                       @click="loadHealthDetail(h.id)"
+                       :class="['p-2 rounded cursor-pointer text-sm border', healthDetail && healthDetail.history_id === h.id ? 'bg-indigo-50 border-indigo-200' : 'bg-gray-50 border-gray-100 hover:bg-gray-100']">
+                    <div class="flex justify-between items-center">
+                      <span class="font-medium text-gray-700">#{{ h.id }}</span>
+                      <span class="text-xs text-gray-500">{{ formatTime(h.created_at) }}</span>
+                    </div>
+                    <div class="text-xs text-gray-600 mt-1">
+                      <span class="text-red-600">{{ h.blocker_count }} 阻断</span> /
+                      <span class="text-yellow-600">{{ h.warning_count }} 警告</span> /
+                      <span class="text-blue-600">{{ h.info_count }} 提示</span>
+                    </div>
+                    <div class="text-xs text-gray-400">{{ h.operator }}</div>
+                  </div>
+                </div>
+                <div v-else class="text-center text-gray-400 text-sm py-4">暂无巡检记录</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div v-if="activeTab==='results'">
           <div v-if="batchSummary" class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
             <div class="bg-green-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-green-700">{{ batchSummary.matched_count }}</div><div class="text-xs text-green-600">匹配成功</div></div>

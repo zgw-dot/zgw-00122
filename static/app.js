@@ -26,12 +26,18 @@ createApp({
     const poDraft = ref(null);
     const invoiceDraft = ref(null);
     const currentPlan = ref(null);
+    const healthRules = ref(null);
+    const healthHistory = ref([]);
+    const healthDetail = ref(null);
+    const healthLoading = ref(false);
 
     const createForm = reactive({ name: "", tolerance_pct: 2.0, tolerance_abs: 100.0 });
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
+    const healthRuleForm = reactive({});
 
     const tabs = [
       { key: "upload", label: "文件上传（预检模式）" },
+      { key: "health-check", label: "数据健康巡检" },
       { key: "results", label: "匹配结果" },
       { key: "exceptions", label: "异常待确认" },
       { key: "recalc-notes", label: "重算说明" },
@@ -112,8 +118,13 @@ createApp({
       poDraft.value = null;
       invoiceDraft.value = null;
       currentPlan.value = null;
+      healthRules.value = null;
+      healthHistory.value = [];
+      healthDetail.value = null;
       loadDrafts(id);
       loadLatestPlan(id);
+      loadHealthRules();
+      loadHealthHistory();
     }
 
     async function loadDrafts(batchId) {
@@ -399,6 +410,114 @@ createApp({
       }
     }
 
+    async function loadHealthRules() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/health-rules`);
+      if (data) {
+        healthRules.value = data;
+        for (const [key, rule] of Object.entries(data.rules || {})) {
+          healthRuleForm[key] = {
+            enabled: rule.enabled,
+            severity: rule.severity,
+            threshold: rule.threshold,
+          };
+        }
+      }
+    }
+
+    async function saveHealthRules() {
+      if (!currentBatch.value) return;
+      const rulesUpdate = {};
+      for (const [key, val] of Object.entries(healthRuleForm)) {
+        rulesUpdate[key] = val;
+      }
+      const data = await api(`/api/batches/${currentBatch.value.id}/health-rules`, {
+        method: "PUT",
+        body: JSON.stringify({ rules: rulesUpdate, operator: "web_user" }),
+      });
+      if (data) {
+        healthRules.value = data;
+        showToast("巡检规则已更新");
+      }
+    }
+
+    async function runHealthCheck() {
+      if (!currentBatch.value) return;
+      healthLoading.value = true;
+      try {
+        const data = await api(`/api/batches/${currentBatch.value.id}/health-check`, {
+          method: "POST",
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        if (data) {
+          healthDetail.value = data;
+          showToast(`巡检完成：${data.summary.blocker_count} 阻断 / ${data.summary.warning_count} 警告 / ${data.summary.info_count} 提示`);
+          await loadHealthHistory();
+        }
+      } finally {
+        healthLoading.value = false;
+      }
+    }
+
+    async function loadHealthHistory() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/health-history?limit=10`);
+      if (data) {
+        healthHistory.value = data.history || [];
+      }
+    }
+
+    async function loadHealthDetail(historyId) {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/health-history/${historyId}`);
+      if (data) {
+        healthDetail.value = data;
+      }
+    }
+
+    function exportHealthCheck(historyId) {
+      if (!currentBatch.value) return;
+      window.open(`/api/batches/${currentBatch.value.id}/health-history/${historyId}/export`, "_blank");
+    }
+
+    async function importHealthRemarks(event) {
+      if (!currentBatch.value) return;
+      const file = event.target.files[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("operator", "web_user");
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/health-remarks/import`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "导入失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast(`已导入 ${data.imported} 条巡检备注`);
+      } catch (e) {
+        showToast("导入错误: " + e.message, "error");
+      } finally {
+        event.target.value = "";
+      }
+    }
+
+    function severityClass(severity) {
+      if (severity === "BLOCKER") return "bg-red-100 text-red-800";
+      if (severity === "WARNING") return "bg-yellow-100 text-yellow-800";
+      return "bg-blue-100 text-blue-800";
+    }
+
+    function severityLabel(severity) {
+      if (severity === "BLOCKER") return "阻断";
+      if (severity === "WARNING") return "警告";
+      return "提示";
+    }
+
     async function updateTolerance() {
       const data = await api(`/api/batches/${currentBatch.value.id}/tolerance`, {
         method: "PUT",
@@ -682,6 +801,7 @@ createApp({
       recalcNotes, comparisonResult, comparisonHistory, comparisonFilter, compareError,
       selectedComparisonIds, batchReviewForm, batchConflictResult,
       poDraft, invoiceDraft, currentPlan,
+      healthRules, healthHistory, healthDetail, healthLoading, healthRuleForm,
       canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons, canConfirmPlan,
       openBatch, createBatch, precheckFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
@@ -689,6 +809,8 @@ createApp({
       toggleComparisonSelect, toggleSelectAllComparisons, doBatchReview,
       confirmDraft, discardDraft, cancelDraft, draftStatusLabel,
       precheckBatch, confirmPlan, cancelPlan, undoPlan,
+      loadHealthRules, saveHealthRules, runHealthCheck, loadHealthHistory, loadHealthDetail,
+      exportHealthCheck, importHealthRemarks, severityClass, severityLabel,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };

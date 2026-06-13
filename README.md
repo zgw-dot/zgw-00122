@@ -444,6 +444,56 @@ Content-Type: application/json
 
 ---
 
+## 数据健康巡检（v4.0 新增）
+
+> 财务可在**导入前/入账后**对批次数据发起巡检，覆盖采购单、发票、匹配结果中的重复号、缺关键列、负金额、供应商不一致、已确认批次被新文件覆盖风险。问题分三级：阻断(BLOCKER) / 警告(WARNING) / 提示(INFO)。
+
+### 巡检规则（6 项，可开关可调阈值，重启后持久化）
+
+| 规则代码 | 说明 | 默认等级 | 默认阈值 |
+|----------|------|----------|----------|
+| `duplicate_po_number` | 采购单号重复 | BLOCKER | 1 |
+| `duplicate_invoice_number` | 发票号重复 | BLOCKER | 1 |
+| `missing_required_columns` | 缺少必填列（po/vendor/code/name/amount/date） | BLOCKER | 1 |
+| `negative_amount` | 金额低于阈值 | WARNING | 0 |
+| `vendor_mismatch` | 供应商编码↔名称多对一、采购单↔发票编码不对称 | WARNING | 1 |
+| `confirmed_override_risk` | 当前批次发票已存在于其他已确认批次（覆盖风险） | INFO | 1 |
+
+### 规则版本机制
+
+每次修改规则后自动生成 `rule_version`（基于启用状态/等级/阈值的 MD5）。巡检历史和导出 CSV 会记录执行时的规则版本，回导备注时会校验版本一致性。
+
+### 新增 API 接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/batches/<bid>/health-rules` | GET | 查询当前批次规则配置 + 当前版本 |
+| `/api/batches/<bid>/health-rules` | PUT | 修改规则配置（可部分更新） |
+| `/api/batches/<bid>/health-check` | POST | 发起一次巡检，写入 SQLite 历史 |
+| `/api/batches/<bid>/health-history?limit=N` | GET | 列出最近 N 次巡检记录 |
+| `/api/batches/<bid>/health-history/<hid>` | GET | 查看某次巡检的完整明细（含问题列表） |
+| `/api/batches/<bid>/health-history/<hid>/export` | GET | 导出巡检报告 CSV（头段+明细+摘要） |
+| `/api/batches/<bid>/health-remarks/import` | POST | 将巡检 CSV 回导为复核备注（含版本校验） |
+
+### 阻断与审计
+
+| 拦截场景 | 行为 | 审计日志 action |
+|----------|------|----------------|
+| 导入备注时规则版本与 CSV 不一致 | 返回 400 + 可读错误 | — |
+| 访问/导出不属于当前批次的巡检记录 | 返回 400 + 可读错误 | — |
+| 不存在的批次 / 不存在的 history_id | 返回 404 | — |
+| 规则变更成功 | 正常写入 | `HEALTH_RULES_UPDATED` |
+| 巡检执行成功 | 写入 history+results | `HEALTH_CHECK_RUN` |
+| 巡检备注 CSV 导入成功 | 写入审计 | `HEALTH_REMARKS_IMPORTED` |
+
+### 前端入口
+
+顶部 Tab 新增 **「数据健康巡检」**，包含：
+- 左：三栏计数（阻断/警告/提示）+ 问题明细表 + 「立即巡检 / 导出 CSV / 导入备注」操作
+- 右：规则配置面板（每项独立开关 + 等级下拉 + 阈值输入 + 「保存规则」） + 巡检历史列表（点击切换查看）
+
+---
+
 ## 一键验收脚本
 
 ### 方案 A：测试客户端跑 18 步（推荐，零依赖）
@@ -476,34 +526,32 @@ python app.py
 python -c "
 import requests
 BASE = 'http://localhost:5000'
-# 1. 创建批次
-b = requests.post(BASE+'/api/batches', json={'name':'E2E-导入复核台'}).json()
+# 1. create batch
+b = requests.post(BASE+'/api/batches', json={'name':'E2E-batch-plan'}).json()
 bid = b['id']
-# 2. 预检 PO
-with open('sample/purchase_orders.csv','rb') as f:
-    d1 = requests.post(BASE+f'/api/batches/{bid}/precheck-po',
-        files={'file':('po.csv',f)}, data={'operator':'e2e_u'}).json()
-assert d1['status']=='PENDING' and d1['diff_analysis']['vs_official']['add_count']>0
-# 3. 取消
-r = requests.post(BASE+f'/api/batches/{bid}/drafts/{d1[\"id\"]}/cancel', json={'operator':'e2e_u'})
-assert r.status_code==200 and r.json()['note'].startswith('已取消')
-# 4. 重新预检并确认 PO
-with open('sample/purchase_orders.csv','rb') as f:
-    d2 = requests.post(BASE+f'/api/batches/{bid}/precheck-po',
-        files={'file':('po.csv',f)}, data={'operator':'e2e_u'}).json()
-c = requests.post(BASE+f'/api/batches/{bid}/drafts/{d2[\"id\"]}/confirm', json={'operator':'e2e_u'})
+# 2. batch upload PO + Invoice
+with open('sample/purchase_orders.csv','rb') as fpo, open('sample/invoices.csv','rb') as finv:
+    plan = requests.post(BASE+f'/api/batches/{bid}/precheck-batch',
+        files={'po_file':('po.csv',fpo), 'invoice_file':('inv.csv',finv)},
+        data={'operator':'e2e_u'}).json()
+assert plan['status']=='PENDING' and len(plan['drafts'])==2
+# 3. confirm plan
+c = requests.post(BASE+f'/api/batches/{bid}/plans/{plan[\"id\"]}/confirm', json={'operator':'e2e_u'})
 assert c.status_code==200 and c.json()['confirmed_by']=='e2e_u'
-# 5. 预检 + 确认发票
-with open('sample/invoices.csv','rb') as f:
-    di = requests.post(BASE+f'/api/batches/{bid}/precheck-invoice',
-        files={'file':('inv.csv',f)}, data={'operator':'e2e_u2'}).json()
-requests.post(BASE+f'/api/batches/{bid}/drafts/{di[\"id\"]}/confirm', json={'operator':'e2e_u2'})
-# 6. 匹配
+# 4. undo
+u = requests.post(BASE+f'/api/batches/{bid}/plans/{plan[\"id\"]}/undo', json={'operator':'e2e_u'})
+assert u.status_code==200
+# 5. re-upload and confirm
+with open('sample/purchase_orders.csv','rb') as fpo, open('sample/invoices.csv','rb') as finv:
+    plan2 = requests.post(BASE+f'/api/batches/{bid}/precheck-batch',
+        files={'po_file':('po.csv',fpo), 'invoice_file':('inv.csv',finv)},
+        data={'operator':'e2e_u'}).json()
+requests.post(BASE+f'/api/batches/{bid}/plans/{plan2[\"id\"]}/confirm', json={'operator':'e2e_u'})
+# 6. match
 requests.post(BASE+f'/api/batches/{bid}/match')
-# 7. 导出 CSV
+# 7. export CSV
 exp = requests.get(BASE+f'/api/batches/{bid}/export').text
-assert '最近预检复核摘要' in exp
-assert '采购单草稿' in exp and '@e2e_u' in exp
-print('✅ E2E 预检→取消→确认→匹配→导出 全链路通过')
+assert 'plan #' in exp.lower() or 'batch import' in exp.lower()
+print('E2E batch-upload->confirm->undo->reconfirm->match->export PASSED')
 "
 ```

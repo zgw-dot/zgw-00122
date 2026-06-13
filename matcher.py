@@ -7,8 +7,9 @@ from models import (
     db, Batch, PurchaseOrder, Invoice, MatchResult, ExceptionItem,
     ToleranceHistory, AuditLog, PayableRecalcNote, NoteComparison,
     ImportDraft, ImportDraftIssue, ImportPlan, PlanSnapshot,
+    HealthCheckRule, HealthCheckHistory, HealthCheckResult,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
-    BATCH_STATUS_FAILED, BATCH_STATUS_CREATED,
+    BATCH_STATUS_FAILED, BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
     MATCH_TYPE_UNMATCHED_PO, MATCH_TYPE_UNMATCHED_INVOICE,
     EXCEPTION_MISSING_FIELD, EXCEPTION_OVER_TOLERANCE,
@@ -22,7 +23,12 @@ from models import (
     DRAFT_EXPIRE_HOURS,
     PRECHECK_ERROR, PRECHECK_WARNING, PRECHECK_INFO,
     ROW_ACTION_ADD, ROW_ACTION_OVERWRITE, ROW_ACTION_SKIP, ROW_ACTION_CONFLICT,
-    compute_rule_version, compute_note_content_hash,
+    HEALTH_SEVERITY_BLOCKER, HEALTH_SEVERITY_WARNING, HEALTH_SEVERITY_INFO,
+    HEALTH_RULE_DUPLICATE_PO, HEALTH_RULE_DUPLICATE_INVOICE,
+    HEALTH_RULE_MISSING_COLUMNS, HEALTH_RULE_NEGATIVE_AMOUNT,
+    HEALTH_RULE_VENDOR_MISMATCH, HEALTH_RULE_CONFIRMED_OVERRIDE_RISK,
+    DEFAULT_HEALTH_RULES,
+    compute_rule_version, compute_note_content_hash, compute_health_rule_version,
 )
 
 PO_REQUIRED_COLUMNS = ["po_number", "vendor_code", "vendor_name", "amount", "po_date"]
@@ -2398,3 +2404,505 @@ def get_latest_plan_review_summary(batch_id):
         return f"plan #{plan.id}: {'; '.join(parts)} @{plan.confirmed_by or 'system'}"
     except Exception:
         return None
+
+
+def get_health_rules(batch_id):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+    rules = {r.rule_key: r for r in batch.health_check_rules}
+    result = {}
+    for key, default in DEFAULT_HEALTH_RULES.items():
+        if key in rules:
+            r = rules[key]
+            result[key] = {
+                "enabled": r.enabled,
+                "severity": r.severity,
+                "threshold": r.threshold,
+                "rule_version": r.rule_version,
+                "updated_by": r.updated_by,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+        else:
+            result[key] = {
+                "enabled": default["enabled"],
+                "severity": default["severity"],
+                "threshold": default["threshold"],
+                "rule_version": None,
+                "updated_by": "default",
+                "updated_at": None,
+            }
+    def _normalize_threshold(v):
+        try:
+            fv = float(v)
+            if fv.is_integer():
+                return int(fv)
+            return fv
+        except (TypeError, ValueError):
+            return v
+
+    current_version = compute_health_rule_version(
+        {k: {"e": v["enabled"], "s": v["severity"], "t": _normalize_threshold(v["threshold"])}
+         for k, v in result.items()}
+    )
+    return {"rules": result, "rule_version": current_version}
+
+
+def update_health_rules(batch_id, rules_update, operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+    existing = {r.rule_key: r for r in batch.health_check_rules}
+    for key, update in rules_update.items():
+        if key not in DEFAULT_HEALTH_RULES:
+            continue
+        default = DEFAULT_HEALTH_RULES[key]
+        enabled = bool(update.get("enabled", default["enabled"]))
+        severity = update.get("severity", default["severity"])
+        threshold = float(update.get("threshold", default["threshold"]))
+        if severity not in (HEALTH_SEVERITY_BLOCKER, HEALTH_SEVERITY_WARNING, HEALTH_SEVERITY_INFO):
+            severity = default["severity"]
+        if key in existing:
+            r = existing[key]
+            r.enabled = enabled
+            r.severity = severity
+            r.threshold = threshold
+            r.updated_by = operator
+        else:
+            r = HealthCheckRule(
+                batch_id=batch_id,
+                rule_key=key,
+                enabled=enabled,
+                severity=severity,
+                threshold=threshold,
+                rule_version="",
+                updated_by=operator,
+            )
+            db.session.add(r)
+    db.session.flush()
+    all_rules = get_health_rules(batch_id)
+    new_version = all_rules["rule_version"]
+    for r in batch.health_check_rules:
+        r.rule_version = new_version
+    log = AuditLog(
+        batch_id=batch_id,
+        action="HEALTH_RULES_UPDATED",
+        detail=f"health check rules updated by {operator}, version={new_version}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    return get_health_rules(batch_id)
+
+
+def run_health_check(batch_id, operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+    rules_info = get_health_rules(batch_id)
+    rules = rules_info["rules"]
+    rule_version = rules_info["rule_version"]
+    results = []
+    pos = batch.purchase_orders
+    invs = batch.invoices
+    source_files = []
+    if batch.po_filename:
+        source_files.append(batch.po_filename)
+    if batch.invoice_filename:
+        source_files.append(batch.invoice_filename)
+    if rules.get(HEALTH_RULE_DUPLICATE_PO, {}).get("enabled", True):
+        sev = rules[HEALTH_RULE_DUPLICATE_PO]["severity"]
+        po_num_map = {}
+        for po in pos:
+            if po.po_number not in po_num_map:
+                po_num_map[po.po_number] = []
+            po_num_map[po.po_number].append(po)
+        for num, items in po_num_map.items():
+            if len(items) > 1:
+                results.append({
+                    "rule_key": HEALTH_RULE_DUPLICATE_PO,
+                    "severity": sev,
+                    "category": "purchase_order",
+                    "message": f"采购单号重复：{num}，共 {len(items)} 条",
+                    "related_numbers": [num],
+                    "table_name": "purchase_orders",
+                    "row_id": items[0].id,
+                })
+    if rules.get(HEALTH_RULE_DUPLICATE_INVOICE, {}).get("enabled", True):
+        sev = rules[HEALTH_RULE_DUPLICATE_INVOICE]["severity"]
+        inv_num_map = {}
+        for inv in invs:
+            if inv.invoice_number not in inv_num_map:
+                inv_num_map[inv.invoice_number] = []
+            inv_num_map[inv.invoice_number].append(inv)
+        for num, items in inv_num_map.items():
+            if len(items) > 1:
+                results.append({
+                    "rule_key": HEALTH_RULE_DUPLICATE_INVOICE,
+                    "severity": sev,
+                    "category": "invoice",
+                    "message": f"发票号重复：{num}，共 {len(items)} 条",
+                    "related_numbers": [num],
+                    "table_name": "invoices",
+                    "row_id": items[0].id,
+                })
+    if rules.get(HEALTH_RULE_MISSING_COLUMNS, {}).get("enabled", True):
+        sev = rules[HEALTH_RULE_MISSING_COLUMNS]["severity"]
+        for po in pos:
+            missing = []
+            if not po.po_number:
+                missing.append("po_number")
+            if not po.vendor_code:
+                missing.append("vendor_code")
+            if not po.vendor_name:
+                missing.append("vendor_name")
+            if po.amount is None:
+                missing.append("amount")
+            if not po.po_date:
+                missing.append("po_date")
+            if missing:
+                results.append({
+                    "rule_key": HEALTH_RULE_MISSING_COLUMNS,
+                    "severity": sev,
+                    "category": "purchase_order",
+                    "message": f"采购单 {po.po_number or '#'+str(po.id)} 缺少必填列：{', '.join(missing)}",
+                    "related_numbers": [po.po_number] if po.po_number else [],
+                    "table_name": "purchase_orders",
+                    "row_id": po.id,
+                })
+        for inv in invs:
+            missing = []
+            if not inv.invoice_number:
+                missing.append("invoice_number")
+            if not inv.vendor_code:
+                missing.append("vendor_code")
+            if not inv.vendor_name:
+                missing.append("vendor_name")
+            if inv.amount is None:
+                missing.append("amount")
+            if not inv.invoice_date:
+                missing.append("invoice_date")
+            if missing:
+                results.append({
+                    "rule_key": HEALTH_RULE_MISSING_COLUMNS,
+                    "severity": sev,
+                    "category": "invoice",
+                    "message": f"发票 {inv.invoice_number or '#'+str(inv.id)} 缺少必填列：{', '.join(missing)}",
+                    "related_numbers": [inv.invoice_number] if inv.invoice_number else [],
+                    "table_name": "invoices",
+                    "row_id": inv.id,
+                })
+    if rules.get(HEALTH_RULE_NEGATIVE_AMOUNT, {}).get("enabled", True):
+        sev = rules[HEALTH_RULE_NEGATIVE_AMOUNT]["severity"]
+        threshold = rules[HEALTH_RULE_NEGATIVE_AMOUNT]["threshold"]
+        for po in pos:
+            if po.amount is not None and po.amount < threshold:
+                results.append({
+                    "rule_key": HEALTH_RULE_NEGATIVE_AMOUNT,
+                    "severity": sev,
+                    "category": "purchase_order",
+                    "message": f"采购单 {po.po_number} 金额 {po.amount} 低于阈值 {threshold}",
+                    "related_numbers": [po.po_number],
+                    "table_name": "purchase_orders",
+                    "row_id": po.id,
+                })
+        for inv in invs:
+            if inv.amount is not None and inv.amount < threshold:
+                results.append({
+                    "rule_key": HEALTH_RULE_NEGATIVE_AMOUNT,
+                    "severity": sev,
+                    "category": "invoice",
+                    "message": f"发票 {inv.invoice_number} 金额 {inv.amount} 低于阈值 {threshold}",
+                    "related_numbers": [inv.invoice_number],
+                    "table_name": "invoices",
+                    "row_id": inv.id,
+                })
+    if rules.get(HEALTH_RULE_VENDOR_MISMATCH, {}).get("enabled", True):
+        sev = rules[HEALTH_RULE_VENDOR_MISMATCH]["severity"]
+        po_vendors = {}
+        for po in pos:
+            if po.vendor_code:
+                if po.vendor_code not in po_vendors:
+                    po_vendors[po.vendor_code] = set()
+                po_vendors[po.vendor_code].add(po.vendor_name or "")
+        for code, names in po_vendors.items():
+            if len(names) > 1:
+                results.append({
+                    "rule_key": HEALTH_RULE_VENDOR_MISMATCH,
+                    "severity": sev,
+                    "category": "purchase_order",
+                    "message": f"采购单供应商编码 {code} 对应多个名称：{', '.join(sorted(names))}",
+                    "related_numbers": [code],
+                    "table_name": "purchase_orders",
+                    "row_id": None,
+                })
+        inv_vendors = {}
+        for inv in invs:
+            if inv.vendor_code:
+                if inv.vendor_code not in inv_vendors:
+                    inv_vendors[inv.vendor_code] = set()
+                inv_vendors[inv.vendor_code].add(inv.vendor_name or "")
+        for code, names in inv_vendors.items():
+            if len(names) > 1:
+                results.append({
+                    "rule_key": HEALTH_RULE_VENDOR_MISMATCH,
+                    "severity": sev,
+                    "category": "invoice",
+                    "message": f"发票供应商编码 {code} 对应多个名称：{', '.join(sorted(names))}",
+                    "related_numbers": [code],
+                    "table_name": "invoices",
+                    "row_id": None,
+                })
+        po_codes = set(po.vendor_code for po in pos if po.vendor_code)
+        inv_codes = set(inv.vendor_code for inv in invs if inv.vendor_code)
+        only_po = po_codes - inv_codes
+        only_inv = inv_codes - po_codes
+        if only_po and invs:
+            results.append({
+                "rule_key": HEALTH_RULE_VENDOR_MISMATCH,
+                "severity": sev,
+                "category": "cross_table",
+                "message": f"采购单有但发票无的供应商：{', '.join(sorted(only_po))}",
+                "related_numbers": sorted(only_po),
+                "table_name": None,
+                "row_id": None,
+            })
+        if only_inv and pos:
+            results.append({
+                "rule_key": HEALTH_RULE_VENDOR_MISMATCH,
+                "severity": sev,
+                "category": "cross_table",
+                "message": f"发票有但采购单无的供应商：{', '.join(sorted(only_inv))}",
+                "related_numbers": sorted(only_inv),
+                "table_name": None,
+                "row_id": None,
+            })
+    if rules.get(HEALTH_RULE_CONFIRMED_OVERRIDE_RISK, {}).get("enabled", True):
+        sev = rules[HEALTH_RULE_CONFIRMED_OVERRIDE_RISK]["severity"]
+        other_batches = Batch.query.filter(
+            Batch.id != batch_id,
+            Batch.status == BATCH_STATUS_CONFIRMED,
+        ).all()
+        other_inv_nums = set()
+        for ob in other_batches:
+            for inv in ob.invoices:
+                other_inv_nums.add(inv.invoice_number)
+        current_inv_nums = set(inv.invoice_number for inv in invs)
+        overlap = current_inv_nums & other_inv_nums
+        if overlap:
+            results.append({
+                "rule_key": HEALTH_RULE_CONFIRMED_OVERRIDE_RISK,
+                "severity": sev,
+                "category": "cross_batch",
+                "message": f"发现 {len(overlap)} 张发票已存在于其他已确认批次，存在覆盖风险：{', '.join(sorted(list(overlap))[:10])}{'...' if len(overlap) > 10 else ''}",
+                "related_numbers": sorted(list(overlap))[:20],
+                "table_name": "invoices",
+                "row_id": None,
+            })
+    blocker_count = sum(1 for r in results if r["severity"] == HEALTH_SEVERITY_BLOCKER)
+    warning_count = sum(1 for r in results if r["severity"] == HEALTH_SEVERITY_WARNING)
+    info_count = sum(1 for r in results if r["severity"] == HEALTH_SEVERITY_INFO)
+    summary = {
+        "total": len(results),
+        "blocker_count": blocker_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "categories": {},
+    }
+    for r in results:
+        cat = r["category"] or "other"
+        if cat not in summary["categories"]:
+            summary["categories"][cat] = {"total": 0, "blocker": 0, "warning": 0, "info": 0}
+        summary["categories"][cat]["total"] += 1
+        if r["severity"] == HEALTH_SEVERITY_BLOCKER:
+            summary["categories"][cat]["blocker"] += 1
+        elif r["severity"] == HEALTH_SEVERITY_WARNING:
+            summary["categories"][cat]["warning"] += 1
+        else:
+            summary["categories"][cat]["info"] += 1
+    history = HealthCheckHistory(
+        batch_id=batch_id,
+        rule_version=rule_version,
+        operator=operator,
+        source_files=json.dumps(source_files, ensure_ascii=False),
+        summary=json.dumps(summary, ensure_ascii=False),
+        blocker_count=blocker_count,
+        warning_count=warning_count,
+        info_count=info_count,
+    )
+    db.session.add(history)
+    db.session.flush()
+    for r in results:
+        hr = HealthCheckResult(
+            history_id=history.id,
+            batch_id=batch_id,
+            rule_key=r["rule_key"],
+            severity=r["severity"],
+            category=r["category"],
+            message=r["message"],
+            related_numbers=json.dumps(r["related_numbers"], ensure_ascii=False) if r["related_numbers"] else None,
+            table_name=r["table_name"],
+            row_id=r["row_id"],
+        )
+        db.session.add(hr)
+    log = AuditLog(
+        batch_id=batch_id,
+        action="HEALTH_CHECK_RUN",
+        detail=f"health check by {operator}, {blocker_count} blockers, {warning_count} warnings, {info_count} infos",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    return {
+        "history_id": history.id,
+        "rule_version": rule_version,
+        "summary": summary,
+        "results": [dict(r, id=None) for r in results],
+        "created_at": history.created_at.isoformat() if history.created_at else None,
+    }
+
+
+def list_health_history(batch_id, limit=20):
+    history = HealthCheckHistory.query.filter_by(batch_id=batch_id).order_by(
+        HealthCheckHistory.created_at.desc()
+    ).limit(limit).all()
+    return [h.to_dict() for h in history]
+
+
+def get_health_history_detail(history_id):
+    history = HealthCheckHistory.query.get(history_id)
+    if not history:
+        raise ValidationError(["health check history not found"])
+    results = HealthCheckResult.query.filter_by(history_id=history_id).order_by(
+        HealthCheckResult.severity, HealthCheckResult.id
+    ).all()
+    data = history.to_dict()
+    data["results"] = [r.to_dict() for r in results]
+    return data
+
+
+def export_health_check_csv(history_id):
+    detail = get_health_history_detail(history_id)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["=== 数据健康巡检报告 ==="])
+    writer.writerow(["巡检ID", detail["id"]])
+    writer.writerow(["批次ID", detail["batch_id"]])
+    writer.writerow(["规则版本", detail["rule_version"]])
+    writer.writerow(["操作人", detail["operator"]])
+    writer.writerow(["巡检时间", detail["created_at"]])
+    writer.writerow(["阻断数", detail["blocker_count"]])
+    writer.writerow(["警告数", detail["warning_count"]])
+    writer.writerow(["提示数", detail["info_count"]])
+    writer.writerow(["来源文件", ", ".join(detail.get("source_files", []))])
+    writer.writerow([])
+    writer.writerow(["=== 巡检问题明细 ==="])
+    writer.writerow(["严重等级", "规则代码", "分类", "问题描述", "关联单号", "表名", "行ID"])
+    for r in detail.get("results", []):
+        writer.writerow([
+            r["severity"],
+            r["rule_key"],
+            r.get("category", ""),
+            r["message"],
+            ", ".join(r.get("related_numbers", [])),
+            r.get("table_name", ""),
+            r.get("row_id", ""),
+        ])
+    writer.writerow([])
+    writer.writerow(["=== 巡检摘要 ==="])
+    summary = detail.get("summary", {})
+    writer.writerow(["总问题数", summary.get("total", 0)])
+    writer.writerow(["阻断", summary.get("blocker_count", 0)])
+    writer.writerow(["警告", summary.get("warning_count", 0)])
+    writer.writerow(["提示", summary.get("info_count", 0)])
+    return output.getvalue()
+
+
+def import_health_remarks(batch_id, csv_content, operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+    rules_info = get_health_rules(batch_id)
+    current_version = rules_info["rule_version"]
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+    if not rows:
+        raise ValidationError(["empty CSV file"])
+    history_id = None
+    csv_rule_version = None
+    summary_found = False
+    for i, row in enumerate(rows[:30]):
+        if len(row) >= 2 and row[0] == "巡检ID":
+            try:
+                history_id = int(row[1])
+            except (ValueError, IndexError):
+                pass
+        if len(row) >= 2 and row[0] == "规则版本":
+            csv_rule_version = row[1].strip()
+        if len(row) >= 1 and row[0] == "=== 巡检问题明细 ===":
+            break
+    if csv_rule_version and csv_rule_version != current_version:
+        raise ValidationError([
+            f"规则版本不一致：CSV 使用 {csv_rule_version}，当前批次为 {current_version}，请先同步规则后再导入"
+        ])
+    if history_id:
+        existing = HealthCheckHistory.query.get(history_id)
+        if existing and existing.batch_id != batch_id:
+            raise ValidationError(["该巡检记录不属于当前批次，跨批次导入被阻断"])
+        existing_remarks = NoteComparison.query.filter_by(
+            batch_id=batch_id, change_source="HEALTH_REMARK_IMPORT"
+        ).count()
+        if existing_remarks > 0 and history_id:
+            same_history = HealthCheckResult.query.filter_by(
+                history_id=history_id, batch_id=batch_id
+            ).first()
+            if same_history:
+                pass
+    detail_start = -1
+    for i, row in enumerate(rows):
+        if len(row) >= 1 and row[0] == "=== 巡检问题明细 ===":
+            detail_start = i
+            break
+    if detail_start < 0:
+        raise ValidationError(["CSV 格式不正确，缺少巡检问题明细段"])
+    issues = []
+    header_idx = detail_start + 1
+    for i in range(header_idx + 1, len(rows)):
+        row = rows[i]
+        if not row or (len(row) >= 1 and row[0].startswith("===")):
+            break
+        if len(row) < 4:
+            continue
+        severity = row[0].strip()
+        rule_key = row[1].strip() if len(row) > 1 else ""
+        category = row[2].strip() if len(row) > 2 else ""
+        message = row[3].strip() if len(row) > 3 else ""
+        if not message:
+            continue
+        issues.append({
+            "severity": severity,
+            "rule_key": rule_key,
+            "category": category,
+            "message": message,
+        })
+    if not issues:
+        raise ValidationError(["CSV 中未找到有效的巡检问题"])
+    remark_text = f"健康巡检导入备注（{len(issues)} 条问题）\n"
+    for idx, issue in enumerate(issues[:50], 1):
+        remark_text += f"{idx}. [{issue['severity']}] {issue['message']}\n"
+    if len(issues) > 50:
+        remark_text += f"... 共 {len(issues)} 条，仅显示前 50 条\n"
+    log = AuditLog(
+        batch_id=batch_id,
+        action="HEALTH_REMARKS_IMPORTED",
+        detail=f"imported {len(issues)} health check remarks from CSV by {operator}, rule_version={csv_rule_version or 'unknown'}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    return {
+        "imported": len(issues),
+        "summary": remark_text,
+        "rule_version_match": csv_rule_version == current_version if csv_rule_version else None,
+        "history_id": history_id,
+    }
