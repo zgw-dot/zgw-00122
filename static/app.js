@@ -25,6 +25,7 @@ createApp({
     const batchConflictResult = ref(null);
     const poDraft = ref(null);
     const invoiceDraft = ref(null);
+    const currentPlan = ref(null);
 
     const createForm = reactive({ name: "", tolerance_pct: 2.0, tolerance_abs: 100.0 });
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
@@ -46,6 +47,16 @@ createApp({
     const canReset = computed(() => currentBatch.value && ["ROLLED_BACK", "FAILED"].includes(currentBatch.value.status));
     const canCompare = computed(() => compareForm.noteAId && compareForm.noteBId && compareForm.noteAId !== compareForm.noteBId);
     const hasSelectedComparisons = computed(() => selectedComparisonIds.value.size > 0);
+    const canConfirmPlan = computed(() => {
+      if (!currentPlan.value || currentPlan.value.status !== "PENDING") return false;
+      const drafts = currentPlan.value.drafts || [];
+      return drafts.every(d => {
+        if (d.status === "CONFLICT") return false;
+        if (d.precheck_report && d.precheck_report.summary && d.precheck_report.summary.error_count > 0) return false;
+        if (d.diff_analysis && d.diff_analysis.cross_batch_conflicts && d.diff_analysis.cross_batch_conflicts.invoice_duplicates && d.diff_analysis.cross_batch_conflicts.invoice_duplicates.length > 0) return false;
+        return true;
+      });
+    });
 
     function showToast(msg, type = "success") {
       toast.message = msg;
@@ -100,7 +111,9 @@ createApp({
       reviewForm.remark = "";
       poDraft.value = null;
       invoiceDraft.value = null;
+      currentPlan.value = null;
       loadDrafts(id);
+      loadLatestPlan(id);
     }
 
     async function loadDrafts(batchId) {
@@ -271,6 +284,119 @@ createApp({
         CANCELLED: "已取消",
       };
       return m[s] || s;
+    }
+
+    async function loadLatestPlan(batchId) {
+      const data = await api(`/api/batches/${batchId}/plans`);
+      if (data && data.plans && data.plans.length > 0) {
+        const pending = data.plans.find(p => p.status === "PENDING");
+        const confirmed = data.plans.find(p => p.status === "CONFIRMED");
+        currentPlan.value = pending || confirmed || data.plans[0];
+      }
+    }
+
+    async function precheckBatch() {
+      const bid = currentBatch.value.id;
+      const formData = new FormData();
+      const poFile = document.querySelector('[ref="batchPoFile"]') || null;
+      const poInput = document.querySelectorAll('input[type="file"]')[0];
+      const invInput = document.querySelectorAll('input[type="file"]')[1];
+      formData.append("operator", "web_user");
+      if (poInput && poInput.files && poInput.files[0]) {
+        formData.append("po_file", poInput.files[0]);
+      }
+      if (invInput && invInput.files && invInput.files[0]) {
+        formData.append("invoice_file", invInput.files[0]);
+      }
+      if (!formData.has("po_file") && !formData.has("invoice_file")) {
+        showToast("请至少选择一个文件", "error");
+        return;
+      }
+      try {
+        const res = await fetch(`/api/batches/${bid}/precheck-batch`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "批量预检失败";
+          showToast(detail, "error");
+          return;
+        }
+        currentPlan.value = data;
+        showToast(`批量预检完成，方案 #${data.id} 已生成`);
+      } catch (e) {
+        showToast("批量预检错误: " + e.message, "error");
+      }
+    }
+
+    async function confirmPlan(planId) {
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/plans/${planId}/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "确认失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast("批量导入确认成功");
+        currentPlan.value = null;
+        poDraft.value = null;
+        invoiceDraft.value = null;
+        await openBatch(currentBatch.value.id);
+      } catch (e) {
+        showToast("确认错误: " + e.message, "error");
+      }
+    }
+
+    async function cancelPlan(planId) {
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/plans/${planId}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "取消失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast(data.note || "方案已取消，原正式数据保持不变");
+        currentPlan.value = null;
+        poDraft.value = null;
+        invoiceDraft.value = null;
+        await openBatch(currentBatch.value.id);
+      } catch (e) {
+        showToast("取消错误: " + e.message, "error");
+      }
+    }
+
+    async function undoPlan(planId) {
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/plans/${planId}/undo`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "撤销失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast(data.note || "已撤销最近导入，数据已恢复");
+        currentPlan.value = null;
+        poDraft.value = null;
+        invoiceDraft.value = null;
+        await openBatch(currentBatch.value.id);
+      } catch (e) {
+        showToast("撤销错误: " + e.message, "error");
+      }
     }
 
     async function updateTolerance() {
@@ -555,13 +681,14 @@ createApp({
       createForm, toleranceForm, compareForm, reviewForm,
       recalcNotes, comparisonResult, comparisonHistory, comparisonFilter, compareError,
       selectedComparisonIds, batchReviewForm, batchConflictResult,
-      poDraft, invoiceDraft,
-      canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons,
+      poDraft, invoiceDraft, currentPlan,
+      canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons, canConfirmPlan,
       openBatch, createBatch, precheckFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
       exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
       toggleComparisonSelect, toggleSelectAllComparisons, doBatchReview,
       confirmDraft, discardDraft, cancelDraft, draftStatusLabel,
+      precheckBatch, confirmPlan, cancelPlan, undoPlan,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };

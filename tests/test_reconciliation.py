@@ -3064,3 +3064,138 @@ def test_export_csv_includes_review_summary(client, sample_dir):
     assert "@u1" in po_line, f"采购单草稿行应包含 @u1: {po_line}"
     assert "@u2" in inv_line, f"发票草稿行应包含 @u2: {inv_line}"
 
+
+# ========== 批量导入方案（v3）专用 5 条 ==========
+
+
+def test_batch_plan_full_flow(client, sample_dir):
+    plan_bid = create_batch(client, "batch-plan-full")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    with open(path_po, "rb") as fpo, open(path_inv, "rb") as finv:
+        r = client.post(
+            f"/api/batches/{plan_bid}/precheck-batch",
+            data={"po_file": (fpo, "po.csv"), "invoice_file": (finv, "inv.csv"), "operator": "bp_u1"},
+            content_type="multipart/form-data",
+        )
+    assert r.status_code == 200, f"batch precheck failed: {r.get_json()}"
+    plan = r.get_json()
+    assert plan["status"] == "PENDING"
+    assert len(plan["drafts"]) == 2
+    assert plan["plan_summary"] is not None
+    po_d = next(d for d in plan["drafts"] if d["file_type"] == "PO")
+    inv_d = next(d for d in plan["drafts"] if d["file_type"] == "INVOICE")
+    assert po_d["plan_id"] == plan["id"]
+    assert inv_d["plan_id"] == plan["id"]
+
+    r = client.post(f"/api/batches/{plan_bid}/plans/{plan['id']}/confirm", json={"operator": "bp_u1"})
+    assert r.status_code == 200, f"plan confirm failed: {r.get_json()}"
+    result = r.get_json()
+    assert result["confirmed_by"] == "bp_u1"
+    assert len(result["import_results"]) == 2
+
+    with client.application.app_context():
+        from models import PurchaseOrder, Invoice
+        assert PurchaseOrder.query.filter_by(batch_id=plan_bid).count() > 0
+        assert Invoice.query.filter_by(batch_id=plan_bid).count() > 0
+
+
+def test_batch_plan_undo_restores_data(client, sample_dir):
+    plan_bid = create_batch(client, "batch-undo")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    with open(path_po, "rb") as fpo, open(path_inv, "rb") as finv:
+        r = client.post(
+            f"/api/batches/{plan_bid}/precheck-batch",
+            data={"po_file": (fpo, "po.csv"), "invoice_file": (finv, "inv.csv"), "operator": "undo_u"},
+            content_type="multipart/form-data",
+        )
+    plan_id = r.get_json()["id"]
+    client.post(f"/api/batches/{plan_bid}/plans/{plan_id}/confirm", json={"operator": "undo_u"})
+
+    with client.application.app_context():
+        from models import PurchaseOrder, Invoice
+        po_c1 = PurchaseOrder.query.filter_by(batch_id=plan_bid).count()
+        inv_c1 = Invoice.query.filter_by(batch_id=plan_bid).count()
+    assert po_c1 > 0 and inv_c1 > 0
+
+    r = client.post(f"/api/batches/{plan_bid}/plans/{plan_id}/undo", json={"operator": "undo_u"})
+    assert r.status_code == 200, f"undo failed: {r.get_json()}"
+
+    with client.application.app_context():
+        from models import PurchaseOrder, Invoice
+        po_c2 = PurchaseOrder.query.filter_by(batch_id=plan_bid).count()
+        inv_c2 = Invoice.query.filter_by(batch_id=plan_bid).count()
+    assert po_c2 == 0, f"undo should remove added POs, got {po_c2}"
+    assert inv_c2 == 0, f"undo should remove added invoices, got {inv_c2}"
+
+
+def test_batch_plan_cancel_keeps_data(client, sample_dir):
+    plan_bid = create_batch(client, "batch-cancel")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path_po, "rb") as f:
+        r = client.post(
+            f"/api/batches/{plan_bid}/precheck-batch",
+            data={"po_file": (f, "po.csv"), "operator": "cancel_u"},
+            content_type="multipart/form-data",
+        )
+    plan_id = r.get_json()["id"]
+
+    r = client.post(f"/api/batches/{plan_bid}/plans/{plan_id}/cancel", json={"operator": "cancel_u"})
+    assert r.status_code == 200
+    assert "unchanged" in r.get_json()["note"].lower() or "unchanged" in (r.get_json().get("note") or "").lower() or r.get_json()["note"] is not None
+
+    with client.application.app_context():
+        from models import PurchaseOrder
+        assert PurchaseOrder.query.filter_by(batch_id=plan_bid).count() == 0
+
+    r2 = client.post(f"/api/batches/{plan_bid}/plans/{plan_id}/confirm", json={"operator": "cancel_u"})
+    assert r2.status_code == 400
+
+
+def test_expired_draft_blocked(client, sample_dir):
+    plan_bid = create_batch(client, "expired-block")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path_po, "rb") as f:
+        r = client.post(
+            f"/api/batches/{plan_bid}/precheck-po",
+            data={"file": (f, "po.csv"), "operator": "exp_u"},
+            content_type="multipart/form-data",
+        )
+    draft_id = r.get_json()["id"]
+
+    with client.application.app_context():
+        from models import ImportDraft
+        from datetime import datetime, timezone, timedelta
+        d = ImportDraft.query.get(draft_id)
+        d.created_at = datetime.now(timezone.utc) - timedelta(hours=25)
+        from models import db
+        db.session.commit()
+
+    r = client.post(f"/api/batches/{plan_bid}/drafts/{draft_id}/confirm", json={"operator": "exp_u"})
+    assert r.status_code == 400, "expired draft confirm should return 400"
+    err = r.get_json().get("error", "") or ""
+    assert "expired" in err.lower() or "24" in err
+
+
+def test_export_csv_includes_plan_summary(client, sample_dir):
+    plan_bid = create_batch(client, "export-plan")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    with open(path_po, "rb") as fpo, open(path_inv, "rb") as finv:
+        r = client.post(
+            f"/api/batches/{plan_bid}/precheck-batch",
+            data={"po_file": (fpo, "po.csv"), "invoice_file": (finv, "inv.csv"), "operator": "exp_u"},
+            content_type="multipart/form-data",
+        )
+    plan_id = r.get_json()["id"]
+    client.post(f"/api/batches/{plan_bid}/plans/{plan_id}/confirm", json={"operator": "exp_u"})
+    client.post(f"/api/batches/{plan_bid}/match")
+
+    exp = client.get(f"/api/batches/{plan_bid}/export")
+    assert exp.status_code == 200
+    body = exp.data.decode("utf-8-sig")
+    lines = body.splitlines()
+    assert any("batch import plan summary" in l.lower() or "plan #" in l.lower() for l in lines), \
+        f"CSV must include plan summary line, got: {[l for l in lines if 'plan' in l.lower() or 'summary' in l.lower()]}"
+

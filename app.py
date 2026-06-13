@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 from datetime import datetime, timezone
 from flask import Flask, Blueprint, request, jsonify, send_file, send_from_directory
@@ -21,7 +22,9 @@ from matcher import (
     update_comparison_review, batch_update_comparison_review,
     create_import_draft, get_latest_draft, list_drafts, get_draft,
     confirm_draft, discard_draft, cancel_draft,
-    get_latest_review_summary,
+    get_latest_review_summary, get_latest_plan_review_summary,
+    create_import_plan, get_plan, list_plans, get_latest_plan,
+    confirm_plan, cancel_plan, undo_plan,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
@@ -399,6 +402,104 @@ def cancel_batch_draft(batch_id, draft_id):
         return jsonify({"error": str(e), "details": e.details}), 400
 
 
+@bp.route("/api/batches/<int:batch_id>/precheck-batch", methods=["POST"])
+def precheck_batch(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    operator = request.form.get("operator", "web_user")
+    po_file = request.files.get("po_file")
+    inv_file = request.files.get("invoice_file")
+    if not po_file and not inv_file:
+        return jsonify({"error": "must provide at least one file (po_file or invoice_file)"}), 400
+    po_content = po_file.read().decode("utf-8-sig") if po_file and po_file.filename else None
+    po_filename = po_file.filename if po_file and po_file.filename else None
+    inv_content = inv_file.read().decode("utf-8-sig") if inv_file and inv_file.filename else None
+    inv_filename = inv_file.filename if inv_file and inv_file.filename else None
+    try:
+        plan = create_import_plan(
+            batch.id,
+            po_content=po_content, po_filename=po_filename,
+            invoice_content=inv_content, invoice_filename=inv_filename,
+            operator=operator,
+        )
+        return jsonify(plan.to_dict())
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/plans", methods=["GET"])
+def list_batch_plans(batch_id):
+    batch = Batch.query.get_or_404(batch_id)
+    status = request.args.get("status")
+    plans = list_plans(batch_id, status=status)
+    return jsonify({"plans": [p.to_dict() for p in plans]})
+
+
+@bp.route("/api/batches/<int:batch_id>/plans/<int:plan_id>", methods=["GET"])
+def get_batch_plan(batch_id, plan_id):
+    batch = Batch.query.get_or_404(batch_id)
+    plan = get_plan(plan_id)
+    if not plan:
+        return jsonify({"error": "plan not found"}), 404
+    if plan.batch_id != batch_id:
+        return jsonify({"error": "plan does not belong to this batch"}), 400
+    return jsonify({"plan": plan.to_dict()})
+
+
+@bp.route("/api/batches/<int:batch_id>/plans/<int:plan_id>/confirm", methods=["POST"])
+def confirm_batch_plan(batch_id, plan_id):
+    batch = Batch.query.get_or_404(batch_id)
+    plan = get_plan(plan_id)
+    if not plan:
+        return jsonify({"error": "plan not found"}), 404
+    if plan.batch_id != batch_id:
+        return jsonify({"error": "plan does not belong to this batch, cross-batch confirmation blocked"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        operator = payload.get("operator", "web_user")
+        result = confirm_plan(plan_id, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/plans/<int:plan_id>/cancel", methods=["POST"])
+def cancel_batch_plan(batch_id, plan_id):
+    batch = Batch.query.get_or_404(batch_id)
+    plan = get_plan(plan_id)
+    if not plan:
+        return jsonify({"error": "plan not found"}), 404
+    if plan.batch_id != batch_id:
+        return jsonify({"error": "plan does not belong to this batch, cross-batch operation blocked"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        operator = payload.get("operator", "web_user")
+        result = cancel_plan(plan_id, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/plans/<int:plan_id>/undo", methods=["POST"])
+def undo_batch_plan(batch_id, plan_id):
+    batch = Batch.query.get_or_404(batch_id)
+    plan = get_plan(plan_id)
+    if not plan:
+        return jsonify({"error": "plan not found"}), 404
+    if plan.batch_id != batch_id:
+        return jsonify({"error": "plan does not belong to this batch, cross-batch operation blocked"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        operator = payload.get("operator", "web_user")
+        result = undo_plan(plan_id, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
 @bp.route("/api/batches/<int:batch_id>/match", methods=["POST"])
 def match_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
@@ -694,6 +795,7 @@ def export_report(batch_id):
     latest_note = get_latest_recalc_note(batch_id)
     latest_confirmed_comparison = get_latest_confirmed_comparison(batch_id)
     latest_review = get_latest_review_summary(batch_id)
+    latest_plan_review = get_latest_plan_review_summary(batch_id)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -771,6 +873,21 @@ def export_report(batch_id):
             ])
             if inv_d.review_summary:
                 writer.writerow(["发票复核明细", inv_d.review_summary])
+
+    if latest_plan_review:
+        writer.writerow(["批量导入方案摘要", latest_plan_review])
+        from models import ImportPlan, PLAN_STATUS_CONFIRMED
+        confirmed_plans = ImportPlan.query.filter_by(
+            batch_id=batch_id, status=PLAN_STATUS_CONFIRMED,
+        ).order_by(ImportPlan.confirmed_at.desc()).all()
+        for p in confirmed_plans[:5]:
+            ps = json.loads(p.plan_summary) if p.plan_summary else {}
+            parts_str = "; ".join(ps.get("parts", []))
+            writer.writerow([
+                f"方案 #{p.id}",
+                f"{parts_str} @{p.confirmed_by or 'system'}"
+                + (f" ({p.confirmed_at.strftime('%Y-%m-%d %H:%M')})" if p.confirmed_at else ""),
+            ])
 
     output.seek(0)
     filename = f"reconciliation_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"

@@ -1,12 +1,12 @@
 import csv
 import io
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 from models import (
     db, Batch, PurchaseOrder, Invoice, MatchResult, ExceptionItem,
     ToleranceHistory, AuditLog, PayableRecalcNote, NoteComparison,
-    ImportDraft, ImportDraftIssue,
+    ImportDraft, ImportDraftIssue, ImportPlan, PlanSnapshot,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
@@ -18,6 +18,8 @@ from models import (
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFIRMED, DRAFT_STATUS_DISCARDED,
     DRAFT_STATUS_CONFLICT, DRAFT_STATUS_CANCELLED,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
+    PLAN_STATUS_PENDING, PLAN_STATUS_CONFIRMED, PLAN_STATUS_CANCELLED, PLAN_STATUS_UNDONE,
+    DRAFT_EXPIRE_HOURS,
     PRECHECK_ERROR, PRECHECK_WARNING, PRECHECK_INFO,
     ROW_ACTION_ADD, ROW_ACTION_OVERWRITE, ROW_ACTION_SKIP, ROW_ACTION_CONFLICT,
     compute_rule_version, compute_note_content_hash,
@@ -1965,6 +1967,9 @@ def confirm_draft(draft_id, operator="system"):
     if draft.status not in (DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT):
         raise ValidationError([f"草稿状态为 '{draft.status}'，不允许确认"])
 
+    if draft.created_at and datetime.now(timezone.utc) - draft.created_at.replace(tzinfo=timezone.utc) > timedelta(hours=DRAFT_EXPIRE_HOURS):
+        raise ValidationError([f"草稿已超过 {DRAFT_EXPIRE_HOURS} 小时有效期，请重新上传文件生成新草稿"])
+
     batch = Batch.query.get(draft.batch_id)
     if not batch:
         raise ValidationError(["关联批次不存在"])
@@ -2064,3 +2069,332 @@ def get_latest_review_summary(batch_id):
         parts.append(f"[发票] {summary} @{inv_draft.confirmed_by or 'system'}")
 
     return "；".join(parts) if parts else None
+
+
+def create_import_plan(batch_id, po_content=None, po_filename=None,
+                       invoice_content=None, invoice_filename=None, operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+    if not po_content and not invoice_content:
+        raise ValidationError(["must provide at least one file"])
+
+    plan = ImportPlan(
+        batch_id=batch_id,
+        status=PLAN_STATUS_PENDING,
+        operator=operator,
+    )
+    db.session.add(plan)
+    db.session.flush()
+
+    draft_results = {}
+    if po_content:
+        draft, is_new, conflict = create_import_draft(
+            batch_id, po_content, po_filename or "po.csv",
+            DRAFT_FILE_TYPE_PO, operator=operator,
+        )
+        draft.plan_id = plan.id
+        db.session.flush()
+        draft_results["po"] = draft.to_dict()
+
+    if invoice_content:
+        draft, is_new, conflict = create_import_draft(
+            batch_id, invoice_content, invoice_filename or "invoices.csv",
+            DRAFT_FILE_TYPE_INVOICE, operator=operator,
+        )
+        draft.plan_id = plan.id
+        db.session.flush()
+        draft_results["invoice"] = draft.to_dict()
+
+    summary_parts = []
+    for key, d in draft_results.items():
+        label = "采购单" if key == "po" else "发票"
+        da = d.get("diff_analysis") or {}
+        vs = da.get("vs_official") or {}
+        summary_parts.append(
+            f"[{label}] 新增{vs.get('add_count',0)}条;"
+            f"覆盖{vs.get('overwrite_count',0)}条;"
+            f"跳过{vs.get('skip_count',0)}条;"
+            f"冲突{vs.get('conflict_count',0)}条"
+        )
+    plan.plan_summary = json.dumps({
+        "parts": summary_parts,
+        "po_draft_id": draft_results.get("po", {}).get("id"),
+        "invoice_draft_id": draft_results.get("invoice", {}).get("id"),
+    }, ensure_ascii=False)
+
+    db.session.add(AuditLog(
+        batch_id=batch_id,
+        action="PLAN_CREATED",
+        detail=f"create plan #{plan.id}: {'; '.join(summary_parts)}",
+        operator=operator,
+    ))
+    db.session.commit()
+    db.session.refresh(plan)
+    return plan
+
+
+def get_plan(plan_id):
+    return ImportPlan.query.get(plan_id)
+
+
+def list_plans(batch_id, status=None):
+    q = ImportPlan.query.filter_by(batch_id=batch_id)
+    if status:
+        q = q.filter_by(status=status)
+    return q.order_by(ImportPlan.created_at.desc()).all()
+
+
+def get_latest_plan(batch_id):
+    return ImportPlan.query.filter_by(batch_id=batch_id).order_by(ImportPlan.created_at.desc()).first()
+
+
+def confirm_plan(plan_id, operator="system"):
+    plan = ImportPlan.query.get(plan_id)
+    if not plan:
+        raise ValidationError(["plan not found"])
+    if plan.status != PLAN_STATUS_PENDING:
+        raise ValidationError([f"plan status '{plan.status}' not confirmable"])
+
+    if plan.created_at and datetime.now(timezone.utc) - plan.created_at.replace(tzinfo=timezone.utc) > timedelta(hours=DRAFT_EXPIRE_HOURS):
+        raise ValidationError([f"plan expired over {DRAFT_EXPIRE_HOURS}h, please re-upload"])
+
+    drafts = ImportDraft.query.filter_by(plan_id=plan_id).all()
+    for d in drafts:
+        if d.created_at and datetime.now(timezone.utc) - d.created_at.replace(tzinfo=timezone.utc) > timedelta(hours=DRAFT_EXPIRE_HOURS):
+            raise ValidationError([f"draft #{d.id} expired over {DRAFT_EXPIRE_HOURS}h, please re-upload"])
+
+    for d in drafts:
+        if d.status not in (DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT):
+            raise ValidationError([f"draft #{d.id} status '{d.status}' not confirmable"])
+
+    for d in drafts:
+        if d.diff_analysis:
+            try:
+                diff = json.loads(d.diff_analysis)
+                cross = diff.get("cross_batch_conflicts", {})
+                dups = cross.get("invoice_duplicates", [])
+                if dups:
+                    dup_nums = ", ".join(x["invoice_number"] for x in dups[:5])
+                    raise ValidationError([f"draft #{d.id} has cross-batch duplicate invoices: {dup_nums}"])
+            except ValidationError:
+                raise
+            except Exception:
+                pass
+        if d.precheck_report:
+            try:
+                rpt = json.loads(d.precheck_report)
+                miss = rpt.get("missing_columns", [])
+                if miss:
+                    raise ValidationError([f"draft #{d.id} missing columns: {', '.join(miss)}"])
+                if rpt.get("summary", {}).get("error_count", 0) > 0:
+                    raise ValidationError([f"draft #{d.id} has {rpt['summary']['error_count']} format errors"])
+            except ValidationError:
+                raise
+            except Exception:
+                pass
+
+    po_before = {r.id: r for r in PurchaseOrder.query.filter_by(batch_id=plan.batch_id).all()}
+    inv_before = {r.id: r for r in Invoice.query.filter_by(batch_id=plan.batch_id).all()}
+
+    for d in drafts:
+        _snapshot_before_confirm(d, plan.id, po_before, inv_before)
+
+    import_results = []
+    for d in drafts:
+        if d.file_type == DRAFT_FILE_TYPE_PO:
+            count = validate_and_import_po(plan.batch_id, d.file_content, d.filename)
+        else:
+            count = validate_and_import_invoice(plan.batch_id, d.file_content, d.filename)
+        d.status = DRAFT_STATUS_CONFIRMED
+        d.confirmed_by = operator
+        d.confirmed_at = datetime.now(timezone.utc)
+        import_results.append({"file_type": d.file_type, "imported_count": count})
+
+    plan.status = PLAN_STATUS_CONFIRMED
+    plan.confirmed_by = operator
+    plan.confirmed_at = datetime.now(timezone.utc)
+
+    db.session.add(AuditLog(
+        batch_id=plan.batch_id,
+        action="PLAN_CONFIRMED",
+        detail=f"confirm plan #{plan_id}, results: {json.dumps(import_results, ensure_ascii=False)}, by {operator}",
+        operator=operator,
+    ))
+    db.session.commit()
+    return {
+        "success": True,
+        "plan_id": plan_id,
+        "confirmed_by": operator,
+        "import_results": import_results,
+    }
+
+
+def _snapshot_before_confirm(draft, plan_id, po_before, inv_before):
+    if draft.file_type == DRAFT_FILE_TYPE_PO:
+        existing = po_before
+        model_cls = PurchaseOrder
+    else:
+        existing = inv_before
+        model_cls = Invoice
+
+    if draft.diff_analysis:
+        try:
+            diff = json.loads(draft.diff_analysis)
+            vs = diff.get("vs_official", {})
+            for row in vs.get("overwrite_rows", []):
+                sig = row.get("signature", "")
+                for rid, rec in existing.items():
+                    if draft.file_type == DRAFT_FILE_TYPE_PO:
+                        rec_sig = f"{rec.po_number}|{rec.vendor_code}"
+                    else:
+                        rec_sig = f"{rec.invoice_number}|{rec.vendor_code}"
+                    if rec_sig == sig:
+                        db.session.add(PlanSnapshot(
+                            plan_id=plan_id,
+                            table_name=model_cls.__tablename__,
+                            row_id=rid,
+                            action=ROW_ACTION_OVERWRITE,
+                            original_data=json.dumps(rec.to_dict(), ensure_ascii=False),
+                        ))
+                        break
+        except Exception:
+            pass
+
+
+def cancel_plan(plan_id, operator="system"):
+    plan = ImportPlan.query.get(plan_id)
+    if not plan:
+        raise ValidationError(["plan not found"])
+    if plan.status != PLAN_STATUS_PENDING:
+        raise ValidationError([f"plan status '{plan.status}' not cancellable"])
+
+    drafts = ImportDraft.query.filter_by(plan_id=plan_id).all()
+    for d in drafts:
+        if d.status in (DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT):
+            d.status = DRAFT_STATUS_CANCELLED
+
+    plan.status = PLAN_STATUS_CANCELLED
+    plan.cancelled_by = operator
+    plan.cancelled_at = datetime.now(timezone.utc)
+
+    db.session.add(AuditLog(
+        batch_id=plan.batch_id,
+        action="PLAN_CANCELLED",
+        detail=f"cancel plan #{plan_id} by {operator}, original data unchanged",
+        operator=operator,
+    ))
+    db.session.commit()
+    return {"success": True, "plan_id": plan_id, "note": "plan cancelled, original data unchanged"}
+
+
+def undo_plan(plan_id, operator="system"):
+    plan = ImportPlan.query.get(plan_id)
+    if not plan:
+        raise ValidationError(["plan not found"])
+    if plan.status != PLAN_STATUS_CONFIRMED:
+        raise ValidationError([f"plan status '{plan.status}' cannot be undone"])
+
+    latest_confirmed = ImportPlan.query.filter_by(
+        batch_id=plan.batch_id, status=PLAN_STATUS_CONFIRMED,
+    ).order_by(ImportPlan.confirmed_at.desc()).first()
+    if latest_confirmed and latest_confirmed.id != plan.id:
+        raise ValidationError(["only the most recent confirmed plan can be undone"])
+
+    drafts = ImportDraft.query.filter_by(plan_id=plan_id).all()
+    po_imported = [d for d in drafts if d.file_type == DRAFT_FILE_TYPE_PO and d.status == DRAFT_STATUS_CONFIRMED]
+    inv_imported = [d for d in drafts if d.file_type == DRAFT_FILE_TYPE_INVOICE and d.status == DRAFT_STATUS_CONFIRMED]
+
+    po_before_ids = set()
+    inv_before_ids = set()
+    for snap in plan.snapshots:
+        if not snap.restored:
+            if snap.table_name == "purchase_orders":
+                po_before_ids.add(snap.row_id)
+            elif snap.table_name == "invoices":
+                inv_before_ids.add(snap.row_id)
+
+    if po_imported:
+        all_po = PurchaseOrder.query.filter_by(batch_id=plan.batch_id).all()
+        for rec in all_po:
+            if rec.id not in po_before_ids:
+                db.session.delete(rec)
+        for snap in plan.snapshots:
+            if snap.table_name == "purchase_orders" and not snap.restored and snap.original_data:
+                orig = json.loads(snap.original_data)
+                existing = PurchaseOrder.query.get(snap.row_id)
+                if existing:
+                    for k, v in orig.items():
+                        if k not in ("id", "batch_id"):
+                            setattr(existing, k, v)
+                else:
+                    db.session.add(PurchaseOrder(
+                        id=snap.row_id,
+                        batch_id=plan.batch_id,
+                        po_number=orig.get("po_number", ""),
+                        vendor_code=orig.get("vendor_code", ""),
+                        vendor_name=orig.get("vendor_name", ""),
+                        amount=orig.get("amount", 0),
+                        currency=orig.get("currency", "CNY"),
+                        po_date=orig.get("po_date", ""),
+                        raw_data=orig.get("raw_data"),
+                    ))
+                snap.restored = True
+
+    if inv_imported:
+        all_inv = Invoice.query.filter_by(batch_id=plan.batch_id).all()
+        for rec in all_inv:
+            if rec.id not in inv_before_ids:
+                db.session.delete(rec)
+        for snap in plan.snapshots:
+            if snap.table_name == "invoices" and not snap.restored and snap.original_data:
+                orig = json.loads(snap.original_data)
+                existing = Invoice.query.get(snap.row_id)
+                if existing:
+                    for k, v in orig.items():
+                        if k not in ("id", "batch_id"):
+                            setattr(existing, k, v)
+                else:
+                    db.session.add(Invoice(
+                        id=snap.row_id,
+                        batch_id=plan.batch_id,
+                        invoice_number=orig.get("invoice_number", ""),
+                        vendor_code=orig.get("vendor_code", ""),
+                        vendor_name=orig.get("vendor_name", ""),
+                        amount=orig.get("amount", 0),
+                        currency=orig.get("currency", "CNY"),
+                        invoice_date=orig.get("invoice_date", ""),
+                        raw_data=orig.get("raw_data"),
+                    ))
+                snap.restored = True
+
+    for d in drafts:
+        if d.status == DRAFT_STATUS_CONFIRMED:
+            d.status = DRAFT_STATUS_CANCELLED
+
+    plan.status = PLAN_STATUS_UNDONE
+    plan.undone_by = operator
+    plan.undone_at = datetime.now(timezone.utc)
+
+    db.session.add(AuditLog(
+        batch_id=plan.batch_id,
+        action="PLAN_UNDONE",
+        detail=f"undo plan #{plan_id} by {operator}, data restored to pre-import state",
+        operator=operator,
+    ))
+    db.session.commit()
+    return {"success": True, "plan_id": plan_id, "note": "plan undone, data restored to pre-import state"}
+
+
+def get_latest_plan_review_summary(batch_id):
+    plan = ImportPlan.query.filter_by(
+        batch_id=batch_id, status=PLAN_STATUS_CONFIRMED,
+    ).order_by(ImportPlan.confirmed_at.desc()).first()
+    if not plan or not plan.plan_summary:
+        return None
+    try:
+        ps = json.loads(plan.plan_summary)
+        parts = ps.get("parts", [])
+        return f"plan #{plan.id}: {'; '.join(parts)} @{plan.confirmed_by or 'system'}"
+    except Exception:
+        return None

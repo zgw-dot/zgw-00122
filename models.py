@@ -56,10 +56,17 @@ DRAFT_STATUS_CANCELLED = "CANCELLED"
 DRAFT_FILE_TYPE_PO = "PO"
 DRAFT_FILE_TYPE_INVOICE = "INVOICE"
 
+PLAN_STATUS_PENDING = "PENDING"
+PLAN_STATUS_CONFIRMED = "CONFIRMED"
+PLAN_STATUS_CANCELLED = "CANCELLED"
+PLAN_STATUS_UNDONE = "UNDONE"
+
 ROW_ACTION_ADD = "ADD"
 ROW_ACTION_OVERWRITE = "OVERWRITE"
 ROW_ACTION_SKIP = "SKIP"
 ROW_ACTION_CONFLICT = "CONFLICT"
+
+DRAFT_EXPIRE_HOURS = 24
 
 PRECHECK_ERROR = "ERROR"
 PRECHECK_WARNING = "WARNING"
@@ -401,6 +408,7 @@ class ImportDraft(db.Model):
     __tablename__ = "import_drafts"
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    plan_id = db.Column(db.Integer, db.ForeignKey("import_plans.id"), nullable=True)
     file_type = db.Column(db.String(10), nullable=False)
     filename = db.Column(db.String(500), nullable=False)
     status = db.Column(db.String(20), nullable=False, default=DRAFT_STATUS_PENDING)
@@ -433,6 +441,7 @@ class ImportDraft(db.Model):
         return {
             "id": self.id,
             "batch_id": self.batch_id,
+            "plan_id": self.plan_id,
             "file_type": self.file_type,
             "filename": self.filename,
             "status": self.status,
@@ -482,6 +491,69 @@ class ImportDraftIssue(db.Model):
             "message": self.message,
             "detail": json.loads(self.detail) if self.detail else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ImportPlan(db.Model):
+    __tablename__ = "import_plans"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default=PLAN_STATUS_PENDING)
+    plan_summary = db.Column(db.Text)
+    confirmed_by = db.Column(db.String(100))
+    confirmed_at = db.Column(db.DateTime)
+    cancelled_by = db.Column(db.String(100))
+    cancelled_at = db.Column(db.DateTime)
+    undone_by = db.Column(db.String(100))
+    undone_at = db.Column(db.DateTime)
+    undo_of_plan_id = db.Column(db.Integer)
+    operator = db.Column(db.String(100), default="system")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="import_plans")
+    drafts = db.relationship("ImportDraft", backref="plan", foreign_keys="ImportDraft.plan_id")
+    snapshots = db.relationship("PlanSnapshot", backref="plan", cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "status": self.status,
+            "plan_summary": json.loads(self.plan_summary) if self.plan_summary else None,
+            "confirmed_by": self.confirmed_by,
+            "confirmed_at": self.confirmed_at.isoformat() if self.confirmed_at else None,
+            "cancelled_by": self.cancelled_by,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
+            "undone_by": self.undone_by,
+            "undone_at": self.undone_at.isoformat() if self.undone_at else None,
+            "undo_of_plan_id": self.undo_of_plan_id,
+            "operator": self.operator,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "drafts": [d.to_dict() for d in self.drafts],
+        }
+
+
+class PlanSnapshot(db.Model):
+    __tablename__ = "plan_snapshots"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    plan_id = db.Column(db.Integer, db.ForeignKey("import_plans.id"), nullable=False)
+    table_name = db.Column(db.String(50), nullable=False)
+    row_id = db.Column(db.Integer, nullable=False)
+    action = db.Column(db.String(20), nullable=False)
+    original_data = db.Column(db.Text)
+    restored = db.Column(db.Boolean, default=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "plan_id": self.plan_id,
+            "table_name": self.table_name,
+            "row_id": self.row_id,
+            "action": self.action,
+            "original_data": json.loads(self.original_data) if self.original_data else None,
+            "restored": self.restored,
         }
 
 
