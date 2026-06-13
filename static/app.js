@@ -35,12 +35,25 @@ createApp({
     const toleranceForm = reactive({ pct: 2.0, abs: 100.0 });
     const healthRuleForm = reactive({});
 
+    const releasePackages = ref([]);
+    const currentReleasePackage = ref(null);
+    const releasePackageItems = ref([]);
+    const showCreateReleaseModal = ref(false);
+    const showReleaseDetailModal = ref(false);
+    const showRejectModal = ref(false);
+    const showRevokeModal = ref(false);
+    const releaseFilter = ref("");
+    const roleForm = reactive({ role: "finance" });
+    const releaseForm = reactive({ remarks: "", operator: "web_user" });
+    const releaseActionForm = reactive({ reason: "", operator: "web_user", role: "finance_lead" });
+
     const tabs = [
       { key: "upload", label: "文件上传（预检模式）" },
       { key: "health-check", label: "数据健康巡检" },
       { key: "results", label: "匹配结果" },
       { key: "exceptions", label: "异常待确认" },
       { key: "recalc-notes", label: "重算说明" },
+      { key: "release", label: "入账放行包" },
       { key: "actions", label: "操作" },
       { key: "history", label: "历史记录" },
     ];
@@ -121,6 +134,9 @@ createApp({
       healthRules.value = null;
       healthHistory.value = [];
       healthDetail.value = null;
+      releasePackages.value = [];
+      currentReleasePackage.value = null;
+      releasePackageItems.value = [];
       loadDrafts(id);
       loadLatestPlan(id);
       loadHealthRules();
@@ -785,11 +801,184 @@ createApp({
       return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
     }
 
+    async function loadReleasePackages() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/release-packages`);
+      if (data) releasePackages.value = data.release_packages || [];
+    }
+
+    async function loadReleasePackageDetail(id) {
+      const data = await api(`/api/release-packages/${id}`);
+      if (data) {
+        currentReleasePackage.value = data;
+        releasePackageItems.value = data.items || [];
+        showReleaseDetailModal.value = true;
+      }
+    }
+
+    async function createReleasePackage() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/release-packages`, {
+        method: "POST",
+        body: JSON.stringify({
+          remarks: releaseForm.remarks,
+          operator: releaseForm.operator,
+          role: roleForm.role,
+        }),
+      });
+      if (data) {
+        showCreateReleaseModal.value = false;
+        releaseForm.remarks = "";
+        if (data.is_new) showToast("放行包创建成功");
+        else showToast("已存在相同快照的放行包");
+        loadReleasePackages();
+      }
+    }
+
+    async function submitReleasePackage(id) {
+      const data = await api(`/api/release-packages/${id}/submit`, {
+        method: "POST",
+        body: JSON.stringify({ operator: releaseActionForm.operator }),
+      });
+      if (data) {
+        showToast("已提交审批");
+        loadReleasePackages();
+        loadReleasePackageDetail(id);
+      }
+    }
+
+    async function approveReleasePackage(id) {
+      const data = await api(`/api/release-packages/${id}/approve`, {
+        method: "POST",
+        body: JSON.stringify({
+          role: releaseActionForm.role,
+          operator: releaseActionForm.operator,
+        }),
+      });
+      if (data) {
+        showToast("已通过");
+        loadReleasePackages();
+        loadReleasePackageDetail(id);
+      }
+    }
+
+    async function rejectReleasePackage(id) {
+      const data = await api(`/api/release-packages/${id}/reject`, {
+        method: "POST",
+        body: JSON.stringify({
+          reason: releaseActionForm.reason,
+          role: releaseActionForm.role,
+          operator: releaseActionForm.operator,
+        }),
+      });
+      if (data) {
+        showToast("已驳回");
+        releaseActionForm.reason = "";
+        loadReleasePackages();
+        loadReleasePackageDetail(id);
+      }
+    }
+
+    async function revokeReleasePackage(id) {
+      const data = await api(`/api/release-packages/${id}/revoke`, {
+        method: "POST",
+        body: JSON.stringify({
+          reason: releaseActionForm.reason,
+          role: releaseActionForm.role,
+          operator: releaseActionForm.operator,
+        }),
+      });
+      if (data) {
+        showToast("已撤销");
+        releaseActionForm.reason = "";
+        loadReleasePackages();
+        loadReleasePackageDetail(id);
+      }
+    }
+
+    async function exportReleasePackage(id) {
+      try {
+        const res = await fetch(`/api/release-packages/${id}/export`);
+        if (!res.ok) {
+          const data = await res.json();
+          showToast(data.error || "导出失败", "error");
+          return;
+        }
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = res.headers.get("Content-Disposition")?.split("filename=")[1] || `release_${id}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+        showToast("导出成功");
+      } catch (e) {
+        showToast("导出失败: " + e.message, "error");
+      }
+    }
+
+    async function importReleasePackage(event) {
+      if (!currentBatch.value) return;
+      const file = event.target.files[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("operator", releaseForm.operator);
+      formData.append("role", roleForm.role);
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/release-packages/import`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "导入失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast("导入成功");
+        event.target.value = "";
+        loadReleasePackages();
+      } catch (e) {
+        showToast("导入失败: " + e.message, "error");
+      }
+    }
+
+    function releaseStatusLabel(s) {
+      const m = { DRAFT: "草稿", PENDING: "待审批", APPROVED: "已通过", REJECTED: "已驳回", REVOKED: "已撤销", EXPIRED: "已过期" };
+      return m[s] || s;
+    }
+
+    function releaseStatusClass(s) {
+      const m = {
+        DRAFT: "bg-gray-100 text-gray-700",
+        PENDING: "bg-yellow-100 text-yellow-700",
+        APPROVED: "bg-green-100 text-green-700",
+        REJECTED: "bg-red-100 text-red-700",
+        REVOKED: "bg-orange-100 text-orange-700",
+        EXPIRED: "bg-purple-100 text-purple-700",
+      };
+      return "status-badge " + (m[s] || "bg-gray-100 text-gray-700");
+    }
+
+    function canApproveRelease(pkg) {
+      return pkg && pkg.status === "PENDING" && ["admin", "finance_lead"].includes(releaseActionForm.role);
+    }
+
+    function canRevokeRelease(pkg) {
+      return pkg && pkg.status === "APPROVED" && ["admin", "finance_lead"].includes(releaseActionForm.role);
+    }
+
+    const canCreateRelease = computed(() => {
+      return currentBatch.value && ["MATCHED", "EXCEPTION_PENDING", "CONFIRMED"].includes(currentBatch.value.status);
+    });
+
     watch(activeTab, (tab) => {
       if (!currentBatch.value) return;
       if (tab === "results") loadResults();
       else if (tab === "exceptions") loadExceptions();
       else if (tab === "recalc-notes") loadRecalcNotes();
+      else if (tab === "release") loadReleasePackages();
     });
 
     onMounted(loadDashboard);
@@ -802,7 +991,12 @@ createApp({
       selectedComparisonIds, batchReviewForm, batchConflictResult,
       poDraft, invoiceDraft, currentPlan,
       healthRules, healthHistory, healthDetail, healthLoading, healthRuleForm,
+      releasePackages, currentReleasePackage, releasePackageItems,
+      showCreateReleaseModal, showReleaseDetailModal, showRejectModal, showRevokeModal,
+      releaseFilter,
+      roleForm, releaseForm, releaseActionForm,
       canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons, canConfirmPlan,
+      canCreateRelease, canApproveRelease, canRevokeRelease,
       openBatch, createBatch, precheckFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
       exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
@@ -811,6 +1005,10 @@ createApp({
       precheckBatch, confirmPlan, cancelPlan, undoPlan,
       loadHealthRules, saveHealthRules, runHealthCheck, loadHealthHistory, loadHealthDetail,
       exportHealthCheck, importHealthRemarks, severityClass, severityLabel,
+      loadReleasePackages, loadReleasePackageDetail, createReleasePackage,
+      submitReleasePackage, approveReleasePackage, rejectReleasePackage,
+      revokeReleasePackage, exportReleasePackage, importReleasePackage,
+      releaseStatusLabel, releaseStatusClass,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };

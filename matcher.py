@@ -9,6 +9,7 @@ from models import (
     ImportDraft, ImportDraftIssue, ImportPlan, PlanSnapshot,
     HealthCheckRule, HealthCheckHistory, HealthCheckResult,
     HandoverList, HandoverListItem,
+    ReleasePackage, ReleasePackageItem,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
@@ -33,7 +34,12 @@ from models import (
     HANDOVER_PERMISSION_COMPLETE, HANDOVER_PERMISSION_VOID,
     HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD,
     compute_rule_version, compute_note_content_hash, compute_health_rule_version,
-    compute_handover_content_hash,
+    compute_handover_content_hash, compute_release_content_hash,
+    RELEASE_STATUS_DRAFT, RELEASE_STATUS_PENDING, RELEASE_STATUS_APPROVED,
+    RELEASE_STATUS_REJECTED, RELEASE_STATUS_REVOKED, RELEASE_STATUS_EXPIRED,
+    RELEASE_PERMISSION_APPROVE, RELEASE_PERMISSION_REJECT, RELEASE_PERMISSION_REVOKE,
+    RELEASE_PERMISSION_CREATE, RELEASE_PERMISSION_VIEW,
+    HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE,
 )
 
 PO_REQUIRED_COLUMNS = ["po_number", "vendor_code", "vendor_name", "amount", "po_date"]
@@ -3427,4 +3433,652 @@ def list_handover_audit_logs(batch_id=None, handover_id=None, limit=50):
     query = query.filter(AuditLog.action.like(action_filter + "%"))
     if handover_id is not None:
         query = query.filter(AuditLog.detail.like(f"%#{handover_id}%"))
+    return query.order_by(AuditLog.created_at.desc()).limit(limit).all()
+
+
+def _generate_release_package_number(batch_id):
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    count = ReleasePackage.query.filter(
+        ReleasePackage.batch_id == batch_id,
+        ReleasePackage.package_number.like(f"REL-{batch_id}-{today}%"),
+    ).count()
+    return f"REL-{batch_id}-{today}-{count + 1:03d}"
+
+
+def check_release_expiry(batch_id, operator="system"):
+    """检查批次所有待审批放行包是否过期，过期则标记并写审计日志"""
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        return []
+
+    pending_packages = ReleasePackage.query.filter_by(
+        batch_id=batch_id,
+        status=RELEASE_STATUS_PENDING,
+        is_expired=False,
+    ).all()
+
+    expired = []
+    latest_note = get_latest_recalc_note(batch_id)
+    latest_health = (
+        HealthCheckHistory.query.filter_by(batch_id=batch_id)
+        .order_by(HealthCheckHistory.created_at.desc())
+        .first()
+    )
+
+    for pkg in pending_packages:
+        reasons = []
+        if pkg.rule_version != batch.rule_version:
+            reasons.append(f"容差规则变更: {pkg.rule_version[:8]} → {batch.rule_version[:8]}")
+        if pkg.batch_status != batch.status:
+            reasons.append(f"批次状态变更: {pkg.batch_status} → {batch.status}")
+        if latest_note and pkg.recalc_note_id != latest_note.id:
+            reasons.append(f"重算说明变更: v{pkg.recalc_note_version} → v{latest_note.version}")
+        if latest_health and pkg.health_history_id != latest_health.id:
+            reasons.append(f"巡检结果变更: 巡检#{pkg.health_history_id} → #{latest_health.id}")
+
+        current_hash = compute_release_content_hash(batch, latest_note, latest_health)
+        if pkg.content_hash != current_hash:
+            if not reasons:
+                reasons.append("批次数据内容发生变化")
+
+        if reasons:
+            pkg.is_expired = True
+            pkg.status = RELEASE_STATUS_EXPIRED
+            pkg.expire_reason = "; ".join(reasons)
+            pkg.expired_at = datetime.now(timezone.utc)
+            expired.append(pkg)
+
+            log = AuditLog(
+                batch_id=batch_id,
+                action="RELEASE_EXPIRED",
+                detail=f"放行包 {pkg.package_number} (#{pkg.id}) 已过期: {'; '.join(reasons)}",
+                operator=operator,
+            )
+            db.session.add(log)
+
+    if expired:
+        db.session.commit()
+
+    return expired
+
+
+def mark_expired_packages_on_change(batch_id, change_source, operator="system"):
+    """在批次数据、容差、巡检、重算说明变化时调用，标记旧包过期"""
+    return check_release_expiry(batch_id, operator=operator)
+
+
+def create_release_package(batch_id, remarks="", operator="system"):
+    """创建放行包，自动快照当前批次状态"""
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    if batch.status not in (BATCH_STATUS_CONFIRMED,):
+        raise ValidationError([f"批次状态 '{batch.status}' 不允许创建放行包，需先确认批次"])
+
+    check_release_expiry(batch_id, operator=operator)
+
+    summary = batch.summary
+    latest_note = get_latest_recalc_note(batch_id)
+    latest_health = (
+        HealthCheckHistory.query.filter_by(batch_id=batch_id)
+        .order_by(HealthCheckHistory.created_at.desc())
+        .first()
+    )
+    latest_plan = (
+        ImportPlan.query.filter_by(batch_id=batch_id, status=PLAN_STATUS_CONFIRMED)
+        .order_by(ImportPlan.confirmed_at.desc())
+        .first()
+    )
+
+    content_hash = compute_release_content_hash(batch, latest_note, latest_health)
+
+    existing = ReleasePackage.query.filter_by(
+        batch_id=batch_id,
+        content_hash=content_hash,
+        is_expired=False,
+    ).first()
+    if existing:
+        return existing, False
+
+    package_number = _generate_release_package_number(batch_id)
+
+    pkg = ReleasePackage(
+        batch_id=batch_id,
+        package_number=package_number,
+        status=RELEASE_STATUS_DRAFT,
+        batch_status=batch.status,
+        payable_total=summary["payable_total"],
+        matched_count=summary["matched_count"],
+        exception_count=summary["exception_count"],
+        unmatched_po_count=summary["unmatched_po_count"],
+        unmatched_invoice_count=summary["unmatched_invoice_count"],
+        tolerance_pct=batch.tolerance_pct,
+        tolerance_abs=batch.tolerance_abs,
+        rule_version=batch.rule_version,
+        recalc_note_id=latest_note.id if latest_note else None,
+        recalc_note_version=latest_note.version if latest_note else None,
+        recalc_note_summary=latest_note.change_summary if latest_note else None,
+        health_history_id=latest_health.id if latest_health else None,
+        health_rule_version=latest_health.rule_version if latest_health else None,
+        health_summary=json.dumps(latest_health.summary, ensure_ascii=False) if latest_health and latest_health.summary else None,
+        health_blocker_count=latest_health.blocker_count if latest_health else 0,
+        health_warning_count=latest_health.warning_count if latest_health else 0,
+        health_info_count=latest_health.info_count if latest_health else 0,
+        import_plan_id=latest_plan.id if latest_plan else None,
+        import_plan_summary=latest_plan.plan_summary if latest_plan else None,
+        content_hash=content_hash,
+        remarks=remarks,
+        created_by=operator,
+    )
+    db.session.add(pkg)
+    db.session.flush()
+
+    matched_types = (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)
+    matched_results = [r for r in batch.match_results if r.match_type in matched_types]
+
+    exc_map = {}
+    for exc in batch.exception_items:
+        if exc.match_result_id:
+            exc_map[exc.match_result_id] = exc
+
+    for idx, mr in enumerate(matched_results):
+        exc = exc_map.get(mr.id)
+        item = ReleasePackageItem(
+            release_package_id=pkg.id,
+            match_result_id=mr.id,
+            po_number=mr.po.po_number if mr.po else None,
+            invoice_number=mr.invoice.invoice_number if mr.invoice else None,
+            vendor_code=mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
+            vendor_name=mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
+            po_amount=mr.po_amount,
+            invoice_amount=mr.invoice_amount,
+            amount_diff=mr.amount_diff,
+            match_type=mr.match_type,
+            is_exception=mr.is_exception,
+            exception_type=mr.exception_type,
+            status=mr.status,
+            remarks=mr.remarks,
+            exception_remarks=exc.remarks if exc else None,
+            rule_version=mr.rule_version,
+            item_order=idx,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="RELEASE_CREATE",
+        detail=f"创建放行包 {package_number} (#{pkg.id})，应付合计 {summary['payable_total']:.2f}，共 {len(matched_results)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    db.session.refresh(pkg)
+
+    return pkg, True
+
+
+def get_release_package(package_id):
+    return ReleasePackage.query.get(package_id)
+
+
+def get_release_package_by_number(package_number):
+    return ReleasePackage.query.filter_by(package_number=package_number).first()
+
+
+def list_release_packages(batch_id=None, status=None):
+    query = ReleasePackage.query
+    if batch_id is not None:
+        query = query.filter_by(batch_id=batch_id)
+    if status:
+        query = query.filter_by(status=status)
+    return query.order_by(ReleasePackage.created_at.desc()).all()
+
+
+def get_latest_release_package(batch_id):
+    return (
+        ReleasePackage.query.filter_by(batch_id=batch_id)
+        .order_by(ReleasePackage.created_at.desc())
+        .first()
+    )
+
+
+def get_release_package_items(package_id):
+    return ReleasePackageItem.query.filter_by(
+        release_package_id=package_id
+    ).order_by(ReleasePackageItem.item_order).all()
+
+
+def submit_release_package(package_id, operator="system"):
+    """提交放行包审批：DRAFT → PENDING"""
+    pkg = get_release_package(package_id)
+    if not pkg:
+        raise ValidationError(["放行包不存在"])
+
+    if pkg.is_expired:
+        raise ValidationError([f"放行包已过期: {pkg.expire_reason}"])
+
+    if pkg.status != RELEASE_STATUS_DRAFT:
+        raise ValidationError([f"放行包状态 '{pkg.status}' 不允许提交，需为 DRAFT"])
+
+    check_release_expiry(pkg.batch_id, operator=operator)
+    pkg = get_release_package(package_id)
+    if pkg.is_expired:
+        raise ValidationError([f"放行包已过期: {pkg.expire_reason}"])
+
+    pkg.status = RELEASE_STATUS_PENDING
+    pkg.submitted_by = operator
+    pkg.submitted_at = datetime.now(timezone.utc)
+
+    log = AuditLog(
+        batch_id=pkg.batch_id,
+        action="RELEASE_SUBMIT",
+        detail=f"提交放行包 {pkg.package_number} (#{pkg.id}) 审批",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return pkg
+
+
+def approve_release_package(package_id, role="viewer", operator="system"):
+    """审批通过放行包"""
+    pkg = get_release_package(package_id)
+    if not pkg:
+        raise ValidationError(["放行包不存在"])
+
+    if role not in RELEASE_PERMISSION_APPROVE:
+        raise ValidationError([f"角色 '{role}' 无审批权限"])
+
+    if pkg.is_expired:
+        raise ValidationError([f"放行包已过期: {pkg.expire_reason}"])
+
+    check_release_expiry(pkg.batch_id, operator=operator)
+    pkg = get_release_package(package_id)
+    if pkg.is_expired:
+        raise ValidationError([f"放行包已过期，无法审批: {pkg.expire_reason}"])
+
+    if not pkg.can_transition(RELEASE_STATUS_APPROVED):
+        raise ValidationError([f"放行包状态 '{pkg.status}' 不允许审批通过"])
+
+    pkg.status = RELEASE_STATUS_APPROVED
+    pkg.approved_by = operator
+    pkg.approved_at = datetime.now(timezone.utc)
+
+    log = AuditLog(
+        batch_id=pkg.batch_id,
+        action="RELEASE_APPROVE",
+        detail=f"审批通过放行包 {pkg.package_number} (#{pkg.id})",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return pkg
+
+
+def reject_release_package(package_id, reason="", role="viewer", operator="system"):
+    """审批驳回放行包"""
+    pkg = get_release_package(package_id)
+    if not pkg:
+        raise ValidationError(["放行包不存在"])
+
+    if role not in RELEASE_PERMISSION_REJECT:
+        raise ValidationError([f"角色 '{role}' 无驳回权限"])
+
+    if pkg.is_expired:
+        raise ValidationError([f"放行包已过期: {pkg.expire_reason}"])
+
+    if not pkg.can_transition(RELEASE_STATUS_REJECTED):
+        raise ValidationError([f"放行包状态 '{pkg.status}' 不允许驳回"])
+
+    pkg.status = RELEASE_STATUS_REJECTED
+    pkg.rejected_by = operator
+    pkg.rejected_at = datetime.now(timezone.utc)
+    pkg.reject_reason = reason
+
+    log = AuditLog(
+        batch_id=pkg.batch_id,
+        action="RELEASE_REJECT",
+        detail=f"驳回放行包 {pkg.package_number} (#{pkg.id}): {reason}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return pkg
+
+
+def revoke_release_package(package_id, reason="", role="viewer", operator="system"):
+    """撤销放行包"""
+    pkg = get_release_package(package_id)
+    if not pkg:
+        raise ValidationError(["放行包不存在"])
+
+    if role not in RELEASE_PERMISSION_REVOKE:
+        raise ValidationError([f"角色 '{role}' 无撤销权限"])
+
+    if not pkg.can_transition(RELEASE_STATUS_REVOKED):
+        raise ValidationError([f"放行包状态 '{pkg.status}' 不允许撤销"])
+
+    pkg.status = RELEASE_STATUS_REVOKED
+    pkg.revoked_by = operator
+    pkg.revoked_at = datetime.now(timezone.utc)
+    pkg.revoke_reason = reason
+
+    log = AuditLog(
+        batch_id=pkg.batch_id,
+        action="RELEASE_REVOKE",
+        detail=f"撤销放行包 {pkg.package_number} (#{pkg.id}): {reason}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return pkg
+
+
+def export_release_csv(package_id):
+    """导出行包CSV，带头段和明细"""
+    pkg = get_release_package(package_id)
+    if not pkg:
+        raise ValidationError(["放行包不存在"])
+
+    items = get_release_package_items(package_id)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(["===== 放行包头段 ====="])
+    writer.writerow(["放行包编号", pkg.package_number])
+    writer.writerow(["放行包ID", pkg.id])
+    writer.writerow(["批次ID", pkg.batch_id])
+    writer.writerow(["状态", pkg.status])
+    writer.writerow(["是否过期", "是" if pkg.is_expired else "否"])
+    if pkg.is_expired:
+        writer.writerow(["过期原因", pkg.expire_reason or ""])
+    writer.writerow(["批次状态快照", pkg.batch_status or ""])
+    writer.writerow(["应付合计", f"{pkg.payable_total:.2f}" if pkg.payable_total is not None else ""])
+    writer.writerow(["匹配成功数", pkg.matched_count or 0])
+    writer.writerow(["异常数", pkg.exception_count or 0])
+    writer.writerow(["未匹配采购单数", pkg.unmatched_po_count or 0])
+    writer.writerow(["未匹配发票数", pkg.unmatched_invoice_count or 0])
+    writer.writerow(["容差百分比", pkg.tolerance_pct or ""])
+    writer.writerow(["容差绝对值", pkg.tolerance_abs or ""])
+    writer.writerow(["规则版本", pkg.rule_version or ""])
+    writer.writerow(["重算说明ID", pkg.recalc_note_id or ""])
+    writer.writerow(["重算说明版本", pkg.recalc_note_version or ""])
+    writer.writerow(["重算说明摘要", pkg.recalc_note_summary or ""])
+    writer.writerow(["巡检记录ID", pkg.health_history_id or ""])
+    writer.writerow(["巡检规则版本", pkg.health_rule_version or ""])
+    writer.writerow(["巡检阻断数", pkg.health_blocker_count or 0])
+    writer.writerow(["巡检警告数", pkg.health_warning_count or 0])
+    writer.writerow(["巡检提示数", pkg.health_info_count or 0])
+    writer.writerow(["导入方案ID", pkg.import_plan_id or ""])
+    writer.writerow(["经办人", pkg.created_by or ""])
+    writer.writerow(["提交人", pkg.submitted_by or ""])
+    writer.writerow(["提交时间", pkg.submitted_at.strftime("%Y-%m-%d %H:%M:%S") if pkg.submitted_at else ""])
+    writer.writerow(["审批人", pkg.approved_by or ""])
+    writer.writerow(["审批时间", pkg.approved_at.strftime("%Y-%m-%d %H:%M:%S") if pkg.approved_at else ""])
+    writer.writerow(["驳回人", pkg.rejected_by or ""])
+    writer.writerow(["驳回时间", pkg.rejected_at.strftime("%Y-%m-%d %H:%M:%S") if pkg.rejected_at else ""])
+    writer.writerow(["驳回原因", pkg.reject_reason or ""])
+    writer.writerow(["撤销人", pkg.revoked_by or ""])
+    writer.writerow(["撤销时间", pkg.revoked_at.strftime("%Y-%m-%d %H:%M:%S") if pkg.revoked_at else ""])
+    writer.writerow(["撤销原因", pkg.revoke_reason or ""])
+    writer.writerow(["内容哈希", pkg.content_hash or ""])
+    writer.writerow(["备注", pkg.remarks or ""])
+    writer.writerow(["创建时间", pkg.created_at.strftime("%Y-%m-%d %H:%M:%S") if pkg.created_at else ""])
+
+    writer.writerow([])
+    writer.writerow(["===== 放行包明细 ====="])
+    writer.writerow([
+        "序号", "匹配结果ID", "采购单号", "发票号", "供应商编码", "供应商名称",
+        "采购金额", "发票金额", "金额差异", "匹配类型", "是否异常", "异常类型",
+        "匹配状态", "规则版本", "匹配备注", "异常备注",
+    ])
+
+    for item in items:
+        writer.writerow([
+            item.item_order + 1,
+            item.match_result_id or "",
+            item.po_number or "",
+            item.invoice_number or "",
+            item.vendor_code or "",
+            item.vendor_name or "",
+            f"{item.po_amount:.2f}" if item.po_amount is not None else "",
+            f"{item.invoice_amount:.2f}" if item.invoice_amount is not None else "",
+            f"{item.amount_diff:.2f}" if item.amount_diff is not None else "",
+            item.match_type or "",
+            "是" if item.is_exception else "否",
+            item.exception_type or "",
+            item.status or "",
+            item.rule_version or "",
+            item.remarks or "",
+            item.exception_remarks or "",
+        ])
+
+    return output.getvalue()
+
+
+RELEASE_HEADER_FIELDS = {
+    "放行包编号": "package_number",
+    "放行包ID": "id",
+    "批次ID": "batch_id",
+    "状态": "status",
+    "是否过期": "is_expired",
+    "过期原因": "expire_reason",
+    "批次状态快照": "batch_status",
+    "应付合计": "payable_total",
+    "匹配成功数": "matched_count",
+    "异常数": "exception_count",
+    "未匹配采购单数": "unmatched_po_count",
+    "未匹配发票数": "unmatched_invoice_count",
+    "容差百分比": "tolerance_pct",
+    "容差绝对值": "tolerance_abs",
+    "规则版本": "rule_version",
+    "重算说明ID": "recalc_note_id",
+    "重算说明版本": "recalc_note_version",
+    "重算说明摘要": "recalc_note_summary",
+    "巡检记录ID": "health_history_id",
+    "巡检规则版本": "health_rule_version",
+    "巡检阻断数": "health_blocker_count",
+    "巡检警告数": "health_warning_count",
+    "巡检提示数": "health_info_count",
+    "导入方案ID": "import_plan_id",
+    "经办人": "created_by",
+    "提交人": "submitted_by",
+    "审批人": "approved_by",
+    "驳回人": "rejected_by",
+    "驳回原因": "reject_reason",
+    "撤销人": "revoked_by",
+    "撤销原因": "revoke_reason",
+    "内容哈希": "content_hash",
+    "备注": "remarks",
+}
+
+RELEASE_DETAIL_FIELDS = [
+    "序号", "匹配结果ID", "采购单号", "发票号", "供应商编码", "供应商名称",
+    "采购金额", "发票金额", "金额差异", "匹配类型", "是否异常", "异常类型",
+    "匹配状态", "规则版本", "匹配备注", "异常备注",
+]
+
+
+def import_release_csv(batch_id, csv_content, operator="system"):
+    """回导放行包CSV，恢复快照。检查重复回导、跨批次回导、字段缺失"""
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    if isinstance(csv_content, bytes):
+        csv_content = csv_content.decode("utf-8-sig")
+
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+
+    in_header = False
+    in_detail = False
+    header_data = {}
+    detail_items = []
+    detail_headers = None
+
+    for row in rows:
+        if not row or not any(cell.strip() for cell in row):
+            continue
+
+        if row[0].strip() == "===== 放行包头段 =====":
+            in_header = True
+            in_detail = False
+            continue
+        if row[0].strip() == "===== 放行包明细 =====":
+            in_header = False
+            in_detail = True
+            continue
+
+        if in_header and len(row) >= 2:
+            key = row[0].strip()
+            value = row[1].strip() if len(row) > 1 else ""
+            if key in RELEASE_HEADER_FIELDS:
+                header_data[RELEASE_HEADER_FIELDS[key]] = value
+
+        if in_detail:
+            if detail_headers is None:
+                detail_headers = [h.strip() for h in row]
+                missing = [f for f in RELEASE_DETAIL_FIELDS if f not in detail_headers]
+                if missing:
+                    raise ValidationError([f"CSV 明细缺少必填列: {', '.join(missing)}"])
+                continue
+
+            item = {}
+            for i, h in enumerate(detail_headers):
+                item[h] = row[i].strip() if i < len(row) else ""
+            detail_items.append(item)
+
+    required_headers = ["package_number", "batch_id", "content_hash", "payable_total"]
+    missing_headers = [k for k in required_headers if not header_data.get(k)]
+    if missing_headers:
+        field_map = {v: k for k, v in RELEASE_HEADER_FIELDS.items()}
+        missing_names = [field_map[k] for k in missing_headers]
+        raise ValidationError([f"CSV 头段缺少必填字段: {', '.join(missing_names)}"])
+
+    csv_batch_id = None
+    try:
+        csv_batch_id = int(header_data["batch_id"])
+    except (ValueError, TypeError):
+        raise ValidationError([f"批次ID格式错误: {header_data['batch_id']}"])
+
+    if csv_batch_id != batch_id:
+        raise ValidationError([
+            f"跨批次回导被拒绝：CSV 属于批次 #{csv_batch_id}，当前批次为 #{batch_id}"
+        ])
+
+    package_number = header_data["package_number"]
+    existing = get_release_package_by_number(package_number)
+    if existing:
+        raise ValidationError([
+            f"重复回导被拒绝：放行包 {package_number} 已存在 (#{existing.id})"
+        ])
+
+    if not detail_items:
+        raise ValidationError(["CSV 没有明细数据"])
+
+    check_release_expiry(batch_id, operator=operator)
+
+    def safe_float(val):
+        if val is None or val == "":
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    def safe_int(val):
+        if val is None or val == "":
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    pkg = ReleasePackage(
+        batch_id=batch_id,
+        package_number=package_number,
+        status=RELEASE_STATUS_DRAFT,
+        batch_status=header_data.get("batch_status"),
+        payable_total=safe_float(header_data.get("payable_total")),
+        matched_count=safe_int(header_data.get("matched_count")),
+        exception_count=safe_int(header_data.get("exception_count")),
+        unmatched_po_count=safe_int(header_data.get("unmatched_po_count")),
+        unmatched_invoice_count=safe_int(header_data.get("unmatched_invoice_count")),
+        tolerance_pct=safe_float(header_data.get("tolerance_pct")),
+        tolerance_abs=safe_float(header_data.get("tolerance_abs")),
+        rule_version=header_data.get("rule_version") or None,
+        recalc_note_id=safe_int(header_data.get("recalc_note_id")),
+        recalc_note_version=safe_int(header_data.get("recalc_note_version")),
+        recalc_note_summary=header_data.get("recalc_note_summary") or None,
+        health_history_id=safe_int(header_data.get("health_history_id")),
+        health_rule_version=header_data.get("health_rule_version") or None,
+        health_blocker_count=safe_int(header_data.get("health_blocker_count")) or 0,
+        health_warning_count=safe_int(header_data.get("health_warning_count")) or 0,
+        health_info_count=safe_int(header_data.get("health_info_count")) or 0,
+        import_plan_id=safe_int(header_data.get("import_plan_id")),
+        content_hash=header_data.get("content_hash") or None,
+        is_expired=header_data.get("is_expired") == "是",
+        expire_reason=header_data.get("expire_reason") or None,
+        remarks=header_data.get("remarks") or None,
+        created_by=header_data.get("created_by") or operator,
+        submitted_by=header_data.get("submitted_by") or None,
+        approved_by=header_data.get("approved_by") or None,
+        rejected_by=header_data.get("rejected_by") or None,
+        reject_reason=header_data.get("reject_reason") or None,
+        revoked_by=header_data.get("revoked_by") or None,
+        revoke_reason=header_data.get("revoke_reason") or None,
+    )
+    db.session.add(pkg)
+    db.session.flush()
+
+    for idx, row_data in enumerate(detail_items):
+        item = ReleasePackageItem(
+            release_package_id=pkg.id,
+            match_result_id=safe_int(row_data.get("匹配结果ID")),
+            po_number=row_data.get("采购单号") or None,
+            invoice_number=row_data.get("发票号") or None,
+            vendor_code=row_data.get("供应商编码") or None,
+            vendor_name=row_data.get("供应商名称") or None,
+            po_amount=safe_float(row_data.get("采购金额")),
+            invoice_amount=safe_float(row_data.get("发票金额")),
+            amount_diff=safe_float(row_data.get("金额差异")),
+            match_type=row_data.get("匹配类型") or None,
+            is_exception=row_data.get("是否异常") == "是",
+            exception_type=row_data.get("异常类型") or None,
+            status=row_data.get("匹配状态") or None,
+            remarks=row_data.get("匹配备注") or None,
+            exception_remarks=row_data.get("异常备注") or None,
+            rule_version=row_data.get("规则版本") or None,
+            item_order=idx,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="RELEASE_IMPORT",
+        detail=f"回导放行包 {package_number} (#{pkg.id})，共 {len(detail_items)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    db.session.refresh(pkg)
+
+    return pkg
+
+
+def list_release_audit_logs(batch_id=None, package_id=None, limit=50):
+    query = AuditLog.query
+    if batch_id is not None:
+        query = query.filter_by(batch_id=batch_id)
+    action_filter = "RELEASE_"
+    query = query.filter(AuditLog.action.like(action_filter + "%"))
+    if package_id is not None:
+        query = query.filter(AuditLog.detail.like(f"%#{package_id}%"))
     return query.order_by(AuditLog.created_at.desc()).limit(limit).all()

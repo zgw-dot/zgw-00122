@@ -32,6 +32,12 @@ from matcher import (
     get_handover_items, refresh_handover_list, complete_handover_list,
     void_handover_list, export_handover_csv, import_handover_csv,
     list_handover_audit_logs, get_handover_list_by_number,
+    create_release_package, get_release_package, list_release_packages,
+    get_latest_release_package, get_release_package_items,
+    submit_release_package, approve_release_package, reject_release_package,
+    revoke_release_package, export_release_csv, import_release_csv,
+    list_release_audit_logs, get_release_package_by_number,
+    mark_expired_packages_on_change,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
@@ -158,13 +164,14 @@ def update_tolerance(batch_id):
     )
     db.session.add(th)
     log = AuditLog(
-        batch_id=batch.id,
+        batch_id=batch_id,
         action="UPDATE_TOLERANCE",
         detail=f"容差更新为 {pct}% / {ab}",
     )
     db.session.add(log)
     db.session.commit()
     generate_payable_recalc_note(batch_id, change_source="UPDATE_TOLERANCE", operator="user")
+    mark_expired_packages_on_change(batch_id, "UPDATE_TOLERANCE", operator="user")
     resp = batch.to_dict()
     resp["summary"] = batch.summary
     return jsonify(resp)
@@ -326,6 +333,7 @@ def confirm_batch_draft(batch_id, draft_id):
         payload = request.get_json(silent=True) or {}
         operator = payload.get("operator", "web_user")
         result = confirm_draft(draft_id, operator=operator)
+        mark_expired_packages_on_change(batch_id, "DRAFT_CONFIRMED", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -465,6 +473,7 @@ def confirm_batch_plan(batch_id, plan_id):
         payload = request.get_json(silent=True) or {}
         operator = payload.get("operator", "web_user")
         result = confirm_plan(plan_id, operator=operator)
+        mark_expired_packages_on_change(batch_id, "PLAN_CONFIRMED", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -512,6 +521,7 @@ def match_batch(batch_id):
     batch = Batch.query.get_or_404(batch_id)
     try:
         success = process_batch(batch.id)
+        mark_expired_packages_on_change(batch_id, "MATCH", operator="system")
         return jsonify({"success": True, "has_exceptions": not success})
     except ValidationError as e:
         return jsonify({"success": False, "error": str(e), "details": e.details}), 400
@@ -553,6 +563,7 @@ def remark_exception(batch_id, exc_id):
     db.session.add(log)
     db.session.commit()
     generate_payable_recalc_note(batch_id, change_source="EXCEPTION_REMARK", operator="user")
+    mark_expired_packages_on_change(batch_id, "EXCEPTION_REMARK", operator="user")
     return jsonify(exc.to_dict())
 
 
@@ -590,6 +601,7 @@ def resolve_exception(batch_id, exc_id):
         db.session.commit()
 
     generate_payable_recalc_note(batch_id, change_source=f"EXCEPTION_{action.upper()}", operator="user")
+    mark_expired_packages_on_change(batch_id, f"EXCEPTION_{action.upper()}", operator="user")
 
     return jsonify(exc.to_dict())
 
@@ -610,6 +622,7 @@ def confirm_batch(batch_id):
     db.session.add(log)
     db.session.commit()
     generate_payable_recalc_note(batch_id, change_source="CONFIRM", operator="user")
+    mark_expired_packages_on_change(batch_id, "CONFIRM", operator="user")
     return jsonify(batch.to_dict())
 
 
@@ -932,6 +945,7 @@ def run_health_check_api(batch_id):
     operator = payload.get("operator", "system")
     try:
         result = run_health_check(batch_id, operator=operator)
+        mark_expired_packages_on_change(batch_id, "HEALTH_CHECK", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         return jsonify({"error": str(e), "details": e.details}), 400
@@ -1142,6 +1156,206 @@ def list_handover_audit_logs_api():
             handover_id = None
     logs = list_handover_audit_logs(batch_id=batch_id, handover_id=handover_id, limit=limit)
     return jsonify({"audit_logs": [l.to_dict() for l in logs]})
+
+
+@bp.route("/api/release-packages", methods=["GET"])
+def list_all_release_packages():
+    status = request.args.get("status")
+    batch_id = request.args.get("batch_id")
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            return jsonify({"error": "batch_id 必须是整数"}), 400
+    packages = list_release_packages(batch_id=batch_id, status=status)
+    return jsonify({"release_packages": [p.to_dict() for p in packages]})
+
+
+@bp.route("/api/batches/<int:batch_id>/release-packages", methods=["GET"])
+def list_batch_release_packages(batch_id):
+    Batch.query.get_or_404(batch_id)
+    status = request.args.get("status")
+    packages = list_release_packages(batch_id=batch_id, status=status)
+    return jsonify({"release_packages": [p.to_dict() for p in packages]})
+
+
+@bp.route("/api/batches/<int:batch_id>/release-packages", methods=["POST"])
+def create_batch_release_package(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    remarks = payload.get("remarks", "")
+    operator = payload.get("operator", "web_user")
+    role = payload.get("role", "viewer")
+
+    from models import RELEASE_PERMISSION_CREATE
+    if role not in RELEASE_PERMISSION_CREATE:
+        return jsonify({"error": f"角色 '{role}' 无创建权限"}), 403
+
+    try:
+        pkg, is_new = create_release_package(batch_id, remarks=remarks, operator=operator)
+        resp = pkg.to_dict()
+        resp["is_new"] = is_new
+        return jsonify(resp), 201
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/release-packages/<int:package_id>", methods=["GET"])
+def get_release_package_api(package_id):
+    pkg = get_release_package(package_id)
+    if pkg is None:
+        return jsonify({"error": "放行包不存在"}), 404
+    resp = pkg.to_dict()
+    resp["items"] = [i.to_dict() for i in get_release_package_items(package_id)]
+    return jsonify(resp)
+
+
+@bp.route("/api/release-packages/<int:package_id>/submit", methods=["POST"])
+def submit_release_package_api(package_id):
+    pkg = get_release_package(package_id)
+    if pkg is None:
+        return jsonify({"error": "放行包不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = submit_release_package(package_id, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/release-packages/<int:package_id>/approve", methods=["POST"])
+def approve_release_package_api(package_id):
+    pkg = get_release_package(package_id)
+    if pkg is None:
+        return jsonify({"error": "放行包不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = approve_release_package(package_id, role=role, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        db.session.rollback()
+        if "权限" in str(e):
+            return jsonify({"error": str(e), "details": e.details}), 403
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/release-packages/<int:package_id>/reject", methods=["POST"])
+def reject_release_package_api(package_id):
+    pkg = get_release_package(package_id)
+    if pkg is None:
+        return jsonify({"error": "放行包不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason", "")
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = reject_release_package(package_id, reason=reason, role=role, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        db.session.rollback()
+        if "权限" in str(e):
+            return jsonify({"error": str(e), "details": e.details}), 403
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/release-packages/<int:package_id>/revoke", methods=["POST"])
+def revoke_release_package_api(package_id):
+    pkg = get_release_package(package_id)
+    if pkg is None:
+        return jsonify({"error": "放行包不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason", "")
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = revoke_release_package(package_id, reason=reason, role=role, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        db.session.rollback()
+        if "权限" in str(e):
+            return jsonify({"error": str(e), "details": e.details}), 403
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/release-packages/<int:package_id>/export", methods=["GET"])
+def export_release_package_csv(package_id):
+    pkg = get_release_package(package_id)
+    if pkg is None:
+        return jsonify({"error": "放行包不存在"}), 404
+    try:
+        csv_content = export_release_csv(package_id)
+        filename = f"release_{pkg.package_number}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        pkg.export_filename = filename
+        db.session.commit()
+        return send_file(
+            io.BytesIO(csv_content.encode("utf-8-sig")),
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/release-packages/import", methods=["POST"])
+def import_release_package_csv(batch_id):
+    Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    operator = request.form.get("operator", "web_user")
+    role = request.form.get("role", "viewer")
+
+    from models import RELEASE_PERMISSION_CREATE
+    if role not in RELEASE_PERMISSION_CREATE:
+        return jsonify({"error": f"角色 '{role}' 无创建权限"}), 403
+
+    try:
+        content = f.read().decode("utf-8-sig")
+        pkg = import_release_csv(batch_id, content, operator=operator)
+        return jsonify(pkg.to_dict()), 201
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+    except UnicodeDecodeError:
+        return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
+
+
+@bp.route("/api/release-packages/audit-logs", methods=["GET"])
+def list_release_audit_logs_api():
+    batch_id = request.args.get("batch_id")
+    package_id = request.args.get("package_id")
+    limit = int(request.args.get("limit", 50))
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            batch_id = None
+    if package_id:
+        try:
+            package_id = int(package_id)
+        except ValueError:
+            package_id = None
+    logs = list_release_audit_logs(batch_id=batch_id, package_id=package_id, limit=limit)
+    return jsonify({"audit_logs": [l.to_dict() for l in logs]})
+
+
+@bp.route("/api/batches/<int:batch_id>/release-packages/latest", methods=["GET"])
+def get_batch_latest_release_package(batch_id):
+    Batch.query.get_or_404(batch_id)
+    pkg = get_latest_release_package(batch_id)
+    if pkg is None:
+        return jsonify({"release_package": None})
+    resp = pkg.to_dict()
+    resp["items"] = [i.to_dict() for i in get_release_package_items(pkg.id)]
+    return jsonify({"release_package": resp})
 
 
 app = create_app()

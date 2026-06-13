@@ -779,6 +779,61 @@
           </div>
         </div>
 
+        <div v-if="activeTab==='release'">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-semibold text-gray-700">入账放行包</h3>
+            <div class="flex items-center gap-3">
+              <div class="flex items-center gap-2">
+                <label class="text-xs text-gray-500">角色:</label>
+                <select v-model="roleForm.role" class="border rounded px-2 py-1 text-sm">
+                  <option value="finance">finance</option>
+                  <option value="finance_lead">finance_lead</option>
+                  <option value="admin">admin</option>
+                  <option value="viewer">viewer</option>
+                </select>
+              </div>
+              <button @click="loadReleasePackages" class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded text-sm transition">刷新</button>
+              <label class="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded text-sm font-medium transition cursor-pointer">
+                导入CSV
+                <input type="file" accept=".csv" class="hidden" @change="importReleasePackage">
+              </label>
+              <button @click="showCreateReleaseModal=true" :disabled="!canCreateRelease" class="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-3 py-1.5 rounded text-sm font-medium transition">+ 创建放行包</button>
+            </div>
+          </div>
+
+          <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 text-sm text-blue-800">
+            <div class="flex items-center gap-2">
+              <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+              <div>
+                <span class="font-medium">入账放行包</span>：确认后、入账前的放行审批环节。finance 可创建和查看，admin/finance_lead 可审批、驳回或撤销。批次数据、容差、巡检结果或重算说明变更后，待审批包会被标为过期。
+              </div>
+            </div>
+          </div>
+
+          <div v-if="releasePackages.length>0" class="space-y-3 mb-6">
+            <div v-for="pkg in releasePackages" :key="pkg.id" @click="loadReleasePackageDetail(pkg.id)" class="bg-white border border-gray-200 rounded-lg p-4 cursor-pointer hover:border-indigo-300 hover:shadow-sm transition">
+              <div class="flex items-center justify-between mb-2">
+                <span class="font-medium text-gray-800">{{ pkg.package_number }}</span>
+                <span :class="releaseStatusClass(pkg.status)">{{ releaseStatusLabel(pkg.status) }}</span>
+              </div>
+              <div class="grid grid-cols-3 md:grid-cols-6 gap-2 text-xs text-gray-600 mb-2">
+                <div>批次状态: {{ pkg.batch_status }}</div>
+                <div>应付: ¥{{ pkg.payable_total }}</div>
+                <div>匹配: {{ pkg.matched_count }}</div>
+                <div>异常: {{ pkg.exception_count }}</div>
+                <div>巡检版本: {{ pkg.health_version || '-' }}</div>
+                <div>容差: {{ pkg.tolerance_pct }}%</div>
+              </div>
+              <div class="text-xs text-gray-400">
+                创建人: {{ pkg.created_by || '-' }} · 审批人: {{ pkg.approved_by || '-' }} · {{ formatTime(pkg.created_at) }}
+              </div>
+            </div>
+          </div>
+          <div v-if="releasePackages.length===0" class="text-center text-gray-400 py-8 border-2 border-dashed border-gray-200 rounded-lg">
+            暂无放行包，点击「创建放行包」生成
+          </div>
+        </div>
+
         <div v-if="activeTab==='actions'">
           <div class="space-y-4">
             <div class="flex items-center gap-4">
@@ -1011,6 +1066,192 @@
       <div class="flex justify-end gap-3 mt-6">
         <button @click="showVoidHandoverModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
         <button @click="voidHandover" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-medium">确认作废</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showCreateReleaseModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showCreateReleaseModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+      <h3 class="text-lg font-bold mb-4">创建放行包</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作人</label>
+          <input type="text" v-model="releaseForm.operator" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="例: zhangsan">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">角色</label>
+          <select v-model="roleForm.role" class="w-full border rounded-lg px-3 py-2 text-sm">
+            <option value="finance">finance (可创建查看)</option>
+            <option value="finance_lead">finance_lead (可审批)</option>
+            <option value="admin">admin (可审批)</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">备注（可选）</label>
+          <textarea v-model="releaseForm.remarks" rows="3" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="输入备注信息"></textarea>
+        </div>
+        <p class="text-xs text-gray-500">放行包将自动快照当前批次状态、应付合计、异常数、重算说明、巡检结果和导入方案。</p>
+      </div>
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showCreateReleaseModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
+        <button @click="createReleasePackage" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showReleaseDetailModal && currentReleasePackage" class="fixed inset-0 bg-black/40 flex items-start justify-center z-50 overflow-y-auto py-8" @click.self="showReleaseDetailModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-5xl">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-bold">放行包详情 - {{ currentReleasePackage.package_number }}</h3>
+        <div class="flex items-center gap-2">
+          <span :class="releaseStatusClass(currentReleasePackage.status)">{{ releaseStatusLabel(currentReleasePackage.status) }}</span>
+          <button @click="showReleaseDetailModal=false" class="text-gray-400 hover:text-gray-600">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div v-if="currentReleasePackage.status==='EXPIRED'" class="bg-purple-50 border border-purple-200 rounded-lg p-3 mb-4 text-sm text-purple-800">
+        ⚠️ 此放行包已过期，因为批次数据、容差规则、巡检版本或重算说明已变更。请创建新的放行包。
+      </div>
+
+      <div class="bg-gray-50 rounded-lg p-4 mb-4">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm mb-3">
+          <div><span class="text-gray-500">批次状态:</span> {{ currentReleasePackage.batch_status }}</div>
+          <div><span class="text-gray-500">应付合计:</span> ¥{{ currentReleasePackage.payable_total }}</div>
+          <div><span class="text-gray-500">匹配成功:</span> {{ currentReleasePackage.matched_count }}</div>
+          <div><span class="text-gray-500">异常数量:</span> {{ currentReleasePackage.exception_count }}</div>
+          <div><span class="text-gray-500">未匹配PO:</span> {{ currentReleasePackage.unmatched_po_count }}</div>
+          <div><span class="text-gray-500">未匹配发票:</span> {{ currentReleasePackage.unmatched_invoice_count }}</div>
+          <div><span class="text-gray-500">容差规则:</span> {{ currentReleasePackage.tolerance_pct }}% / ¥{{ currentReleasePackage.tolerance_abs }}</div>
+          <div><span class="text-gray-500">规则版本:</span> {{ currentReleasePackage.rule_version }}</div>
+        </div>
+        <div class="grid grid-cols-2 gap-3 text-sm">
+          <div><span class="text-gray-500">创建人:</span> {{ currentReleasePackage.created_by || '-' }}</div>
+          <div><span class="text-gray-500">审批人:</span> {{ currentReleasePackage.approved_by || '-' }}</div>
+          <div><span class="text-gray-500">创建时间:</span> {{ formatTime(currentReleasePackage.created_at) }}</div>
+          <div><span class="text-gray-500">审批时间:</span> {{ currentReleasePackage.approved_at ? formatTime(currentReleasePackage.approved_at) : '-' }}</div>
+        </div>
+        <div v-if="currentReleasePackage.health_version" class="mt-3 text-sm">
+          <span class="text-gray-500">巡检版本:</span> {{ currentReleasePackage.health_version }}
+          <span v-if="currentReleasePackage.health_result" class="ml-4">
+            <span class="text-gray-500">巡检结果:</span>
+            <span :class="currentReleasePackage.health_result.includes('PASS') ? 'text-green-600' : 'text-red-600'">{{ currentReleasePackage.health_result }}</span>
+          </span>
+        </div>
+        <div v-if="currentReleasePackage.recalc_notes_summary" class="mt-3 text-sm">
+          <span class="text-gray-500">重算说明:</span> {{ currentReleasePackage.recalc_notes_summary }}
+        </div>
+        <div v-if="currentReleasePackage.import_plan_summary" class="mt-3 text-sm">
+          <span class="text-gray-500">导入方案:</span> {{ currentReleasePackage.import_plan_summary }}
+        </div>
+        <div v-if="currentReleasePackage.remarks" class="mt-3 text-sm">
+          <span class="text-gray-500">备注:</span> {{ currentReleasePackage.remarks }}
+        </div>
+        <div v-if="currentReleasePackage.reject_reason" class="mt-3 text-sm text-red-600">
+          <span class="text-gray-500">驳回原因:</span> {{ currentReleasePackage.reject_reason }}
+        </div>
+        <div v-if="currentReleasePackage.revoke_reason" class="mt-3 text-sm text-orange-600">
+          <span class="text-gray-500">撤销原因:</span> {{ currentReleasePackage.revoke_reason }}
+        </div>
+      </div>
+
+      <div class="flex flex-wrap gap-2 mb-4">
+        <button @click="exportReleasePackage(currentReleasePackage.id)" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">导出 CSV</button>
+        <button v-if="currentReleasePackage.status==='DRAFT'" @click="submitReleasePackage(currentReleasePackage.id)" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">提交审批</button>
+        <button v-if="canApproveRelease(currentReleasePackage)" @click="approveReleasePackage(currentReleasePackage.id)" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">通过</button>
+        <button v-if="canApproveRelease(currentReleasePackage)" @click="showReleaseDetailModal=false; showRejectModal=true" class="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">驳回</button>
+        <button v-if="canRevokeRelease(currentReleasePackage)" @click="showReleaseDetailModal=false; showRevokeModal=true" class="bg-orange-600 hover:bg-orange-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">撤销</button>
+        <button @click="showReleaseDetailModal=false" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1.5 rounded text-sm font-medium transition">关闭</button>
+      </div>
+
+      <div class="mb-2 flex justify-between items-center">
+        <h4 class="font-medium text-gray-700">明细列表 ({{ releasePackageItems.length }})</h4>
+        <div class="text-xs text-gray-500">内容哈希: {{ currentReleasePackage.content_hash }}</div>
+      </div>
+      <div class="overflow-x-auto max-h-96 overflow-y-auto border rounded-lg">
+        <table class="min-w-full text-xs">
+          <thead class="bg-gray-50 sticky top-0">
+            <tr>
+              <th class="px-2 py-2 text-left text-gray-600">采购单号</th>
+              <th class="px-2 py-2 text-left text-gray-600">发票号</th>
+              <th class="px-2 py-2 text-left text-gray-600">供应商</th>
+              <th class="px-2 py-2 text-right text-gray-600">采购金额</th>
+              <th class="px-2 py-2 text-right text-gray-600">发票金额</th>
+              <th class="px-2 py-2 text-right text-gray-600">差异</th>
+              <th class="px-2 py-2 text-center text-gray-600">匹配类型</th>
+              <th class="px-2 py-2 text-center text-gray-600">状态</th>
+              <th class="px-2 py-2 text-left text-gray-600">备注</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="item in releasePackageItems" :key="item.id" class="border-t border-gray-100">
+              <td class="px-2 py-2">{{ item.po_number || '-' }}</td>
+              <td class="px-2 py-2">{{ item.invoice_number || '-' }}</td>
+              <td class="px-2 py-2">{{ item.vendor_name || '-' }}</td>
+              <td class="px-2 py-2 text-right">{{ item.po_amount ? '¥' + item.po_amount : '-' }}</td>
+              <td class="px-2 py-2 text-right">{{ item.invoice_amount ? '¥' + item.invoice_amount : '-' }}</td>
+              <td class="px-2 py-2 text-right" :class="item.amount_diff > 0 ? 'text-red-600' : ''">{{ item.amount_diff !== null ? '¥' + item.amount_diff : '-' }}</td>
+              <td class="px-2 py-2 text-center"><span :class="matchTypeClass(item.match_type)">{{ matchTypeLabel(item.match_type) }}</span></td>
+              <td class="px-2 py-2 text-center">{{ item.status }}</td>
+              <td class="px-2 py-2">{{ item.remarks || '-' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showRejectModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showRejectModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+      <h3 class="text-lg font-bold mb-4">驳回放行包</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作人</label>
+          <input type="text" v-model="releaseActionForm.operator" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="例: zhangsan">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">角色</label>
+          <select v-model="releaseActionForm.role" class="w-full border rounded-lg px-3 py-2 text-sm">
+            <option value="finance_lead">finance_lead</option>
+            <option value="admin">admin</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">驳回原因</label>
+          <textarea v-model="releaseActionForm.reason" rows="3" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="请输入驳回原因"></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showRejectModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
+        <button @click="rejectReleasePackage(currentReleasePackage.id); showRejectModal=false" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-medium">确认驳回</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showRevokeModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showRevokeModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+      <h3 class="text-lg font-bold mb-4">撤销放行包</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作人</label>
+          <input type="text" v-model="releaseActionForm.operator" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="例: zhangsan">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">角色</label>
+          <select v-model="releaseActionForm.role" class="w-full border rounded-lg px-3 py-2 text-sm">
+            <option value="finance_lead">finance_lead</option>
+            <option value="admin">admin</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">撤销原因</label>
+          <textarea v-model="releaseActionForm.reason" rows="3" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="请输入撤销原因"></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showRevokeModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
+        <button @click="revokeReleasePackage(currentReleasePackage.id); showRevokeModal=false" class="bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded-lg text-sm font-medium">确认撤销</button>
       </div>
     </div>
   </div>

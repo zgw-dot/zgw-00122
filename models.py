@@ -94,6 +94,28 @@ HANDOVER_ROLE_VIEWER = "viewer"
 HANDOVER_PERMISSION_COMPLETE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
 HANDOVER_PERMISSION_VOID = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
 
+RELEASE_STATUS_DRAFT = "DRAFT"
+RELEASE_STATUS_PENDING = "PENDING"
+RELEASE_STATUS_APPROVED = "APPROVED"
+RELEASE_STATUS_REJECTED = "REJECTED"
+RELEASE_STATUS_REVOKED = "REVOKED"
+RELEASE_STATUS_EXPIRED = "EXPIRED"
+
+RELEASE_ALLOWED_TRANSITIONS = {
+    RELEASE_STATUS_DRAFT: [RELEASE_STATUS_PENDING, RELEASE_STATUS_REVOKED],
+    RELEASE_STATUS_PENDING: [RELEASE_STATUS_APPROVED, RELEASE_STATUS_REJECTED, RELEASE_STATUS_REVOKED, RELEASE_STATUS_EXPIRED],
+    RELEASE_STATUS_APPROVED: [RELEASE_STATUS_REVOKED],
+    RELEASE_STATUS_REJECTED: [],
+    RELEASE_STATUS_REVOKED: [],
+    RELEASE_STATUS_EXPIRED: [],
+}
+
+RELEASE_PERMISSION_APPROVE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
+RELEASE_PERMISSION_REJECT = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
+RELEASE_PERMISSION_REVOKE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
+RELEASE_PERMISSION_CREATE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE}
+RELEASE_PERMISSION_VIEW = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE, HANDOVER_ROLE_VIEWER}
+
 HEALTH_RULE_DUPLICATE_PO = "duplicate_po_number"
 HEALTH_RULE_DUPLICATE_INVOICE = "duplicate_invoice_number"
 HEALTH_RULE_MISSING_COLUMNS = "missing_required_columns"
@@ -817,6 +839,188 @@ def compute_handover_content_hash(batch):
         )
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def compute_release_content_hash(batch, note=None, health_history=None):
+    parts = []
+    parts.append(f"batch_status:{batch.status}")
+    parts.append(f"batch_updated:{batch.updated_at.isoformat() if batch.updated_at else ''}")
+    parts.append(f"rule_version:{batch.rule_version}")
+    parts.append(f"tolerance_pct:{batch.tolerance_pct}")
+    parts.append(f"tolerance_abs:{batch.tolerance_abs}")
+    summary = batch.summary
+    parts.append(f"matched:{summary['matched_count']}")
+    parts.append(f"exception:{summary['exception_count']}")
+    parts.append(f"payable:{summary['payable_total']}")
+    if note:
+        parts.append(f"note_id:{note.id}")
+        parts.append(f"note_version:{note.version}")
+        parts.append(f"note_hash:{note.content_hash}")
+    if health_history:
+        parts.append(f"health_id:{health_history.id}")
+        parts.append(f"health_version:{health_history.rule_version}")
+    for mr in sorted(batch.match_results, key=lambda x: x.id or 0):
+        parts.append(
+            f"mr:{mr.id}:{mr.po_id}:{mr.invoice_id}:{mr.match_type}:"
+            f"{mr.status}:{mr.po_amount}:{mr.invoice_amount}:{mr.amount_diff}:"
+            f"{mr.is_exception}:{mr.exception_type or ''}:{mr.remarks or ''}:{mr.rule_version or ''}"
+        )
+    for exc in sorted(batch.exception_items, key=lambda x: x.id or 0):
+        parts.append(
+            f"exc:{exc.id}:{exc.match_result_id}:{exc.exception_type}:{exc.status}:{exc.remarks or ''}"
+        )
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ReleasePackage(db.Model):
+    __tablename__ = "release_packages"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    package_number = db.Column(db.String(100), nullable=False, unique=True)
+    status = db.Column(db.String(20), nullable=False, default=RELEASE_STATUS_DRAFT)
+    batch_status = db.Column(db.String(30))
+    payable_total = db.Column(db.Float, default=0.0)
+    matched_count = db.Column(db.Integer, default=0)
+    exception_count = db.Column(db.Integer, default=0)
+    unmatched_po_count = db.Column(db.Integer, default=0)
+    unmatched_invoice_count = db.Column(db.Integer, default=0)
+    tolerance_pct = db.Column(db.Float)
+    tolerance_abs = db.Column(db.Float)
+    rule_version = db.Column(db.String(50))
+    recalc_note_id = db.Column(db.Integer, db.ForeignKey("payable_recalc_notes.id"))
+    recalc_note_version = db.Column(db.Integer)
+    recalc_note_summary = db.Column(db.Text)
+    health_history_id = db.Column(db.Integer, db.ForeignKey("health_check_history.id"))
+    health_rule_version = db.Column(db.String(50))
+    health_summary = db.Column(db.Text)
+    health_blocker_count = db.Column(db.Integer, default=0)
+    health_warning_count = db.Column(db.Integer, default=0)
+    health_info_count = db.Column(db.Integer, default=0)
+    import_plan_id = db.Column(db.Integer, db.ForeignKey("import_plans.id"))
+    import_plan_summary = db.Column(db.Text)
+    export_filename = db.Column(db.String(500))
+    content_hash = db.Column(db.String(64))
+    is_expired = db.Column(db.Boolean, default=False)
+    expire_reason = db.Column(db.Text)
+    remarks = db.Column(db.Text)
+    created_by = db.Column(db.String(100), default="system")
+    submitted_by = db.Column(db.String(100))
+    submitted_at = db.Column(db.DateTime)
+    approved_by = db.Column(db.String(100))
+    approved_at = db.Column(db.DateTime)
+    rejected_by = db.Column(db.String(100))
+    rejected_at = db.Column(db.DateTime)
+    reject_reason = db.Column(db.Text)
+    revoked_by = db.Column(db.String(100))
+    revoked_at = db.Column(db.DateTime)
+    revoke_reason = db.Column(db.Text)
+    expired_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="release_packages")
+    recalc_note = db.relationship("PayableRecalcNote", foreign_keys=[recalc_note_id])
+    health_history = db.relationship("HealthCheckHistory", foreign_keys=[health_history_id])
+    import_plan = db.relationship("ImportPlan", foreign_keys=[import_plan_id])
+    items = db.relationship("ReleasePackageItem", backref="release_package", cascade="all, delete-orphan")
+
+    def can_transition(self, new_status):
+        allowed = RELEASE_ALLOWED_TRANSITIONS.get(self.status, [])
+        return new_status in allowed
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "package_number": self.package_number,
+            "status": self.status,
+            "batch_status": self.batch_status,
+            "payable_total": round(self.payable_total, 2) if self.payable_total is not None else None,
+            "matched_count": self.matched_count,
+            "exception_count": self.exception_count,
+            "unmatched_po_count": self.unmatched_po_count,
+            "unmatched_invoice_count": self.unmatched_invoice_count,
+            "tolerance_pct": self.tolerance_pct,
+            "tolerance_abs": self.tolerance_abs,
+            "rule_version": self.rule_version,
+            "recalc_note_id": self.recalc_note_id,
+            "recalc_note_version": self.recalc_note_version,
+            "recalc_note_summary": self.recalc_note_summary,
+            "health_history_id": self.health_history_id,
+            "health_rule_version": self.health_rule_version,
+            "health_summary": json.loads(self.health_summary) if self.health_summary else None,
+            "health_blocker_count": self.health_blocker_count,
+            "health_warning_count": self.health_warning_count,
+            "health_info_count": self.health_info_count,
+            "import_plan_id": self.import_plan_id,
+            "import_plan_summary": json.loads(self.import_plan_summary) if self.import_plan_summary else None,
+            "export_filename": self.export_filename,
+            "content_hash": self.content_hash,
+            "is_expired": self.is_expired,
+            "expire_reason": self.expire_reason,
+            "remarks": self.remarks,
+            "created_by": self.created_by,
+            "submitted_by": self.submitted_by,
+            "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+            "approved_by": self.approved_by,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+            "rejected_by": self.rejected_by,
+            "rejected_at": self.rejected_at.isoformat() if self.rejected_at else None,
+            "reject_reason": self.reject_reason,
+            "revoked_by": self.revoked_by,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+            "revoke_reason": self.revoke_reason,
+            "expired_at": self.expired_at.isoformat() if self.expired_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class ReleasePackageItem(db.Model):
+    __tablename__ = "release_package_items"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    release_package_id = db.Column(db.Integer, db.ForeignKey("release_packages.id"), nullable=False)
+    match_result_id = db.Column(db.Integer, db.ForeignKey("match_results.id"))
+    po_number = db.Column(db.String(100))
+    invoice_number = db.Column(db.String(100))
+    vendor_code = db.Column(db.String(100))
+    vendor_name = db.Column(db.String(200))
+    po_amount = db.Column(db.Float)
+    invoice_amount = db.Column(db.Float)
+    amount_diff = db.Column(db.Float)
+    match_type = db.Column(db.String(30))
+    is_exception = db.Column(db.Boolean, default=False)
+    exception_type = db.Column(db.String(50))
+    status = db.Column(db.String(20))
+    remarks = db.Column(db.Text)
+    exception_remarks = db.Column(db.Text)
+    rule_version = db.Column(db.String(50))
+    item_order = db.Column(db.Integer, default=0)
+
+    match_result = db.relationship("MatchResult")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "release_package_id": self.release_package_id,
+            "match_result_id": self.match_result_id,
+            "po_number": self.po_number,
+            "invoice_number": self.invoice_number,
+            "vendor_code": self.vendor_code,
+            "vendor_name": self.vendor_name,
+            "po_amount": self.po_amount,
+            "invoice_amount": self.invoice_amount,
+            "amount_diff": self.amount_diff,
+            "match_type": self.match_type,
+            "is_exception": self.is_exception,
+            "exception_type": self.exception_type,
+            "status": self.status,
+            "remarks": self.remarks,
+            "exception_remarks": self.exception_remarks,
+            "rule_version": self.rule_version,
+            "item_order": self.item_order,
+        }
 
 
 def init_db(app):
