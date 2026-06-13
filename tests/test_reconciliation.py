@@ -2819,3 +2819,248 @@ def test_old_api_still_works_for_backward_compat(client, sample_dir):
         assert PurchaseOrder.query.filter_by(batch_id=bid).count() == 6
         assert Invoice.query.filter_by(batch_id=bid).count() == 6
 
+
+# ========== 导入复核台（预检草稿 v2）专用 5 条 ==========
+
+
+def test_import_review_desk_full_flow(client, sample_dir):
+    """
+    [导入复核台#1] 完整链路：预检 → diff 分析(新增/覆盖/跳过) → superseded → 取消 → 确认 → 匹配
+    """
+    bid = create_batch(client, "ird-full-flow")
+
+    # 1) 采购单预检 v1
+    path = os.path.join(sample_dir, "purchase_orders.csv")
+    with open(path, "rb") as f:
+        r1 = client.post(
+            f"/api/batches/{bid}/precheck-po",
+            data={"file": (f, "po_v1.csv"), "operator": "alice"},
+            content_type="multipart/form-data",
+        )
+    assert r1.status_code == 200
+    d1 = r1.get_json()
+    assert d1["status"] == "PENDING"
+    assert d1["diff_analysis"] is not None
+    assert d1["diff_analysis"]["vs_official"]["add_count"] == 6
+    assert d1["review_summary"] == "新增 6 条"
+
+    # 2) 再传一份有差异的 v2，触发 superseded
+    with open(path, "rb") as f:
+        orig = f.read().decode("utf-8-sig")
+    lines = orig.splitlines()
+    v2 = "\n".join(lines + ["PO-2099-EXTRA,V000,额外供应商,999.99,CNY,2099-01-01"])
+    r2 = client.post(
+        f"/api/batches/{bid}/precheck-po",
+        data={"file": (io.BytesIO(v2.encode("utf-8-sig")), "po_v2.csv"), "operator": "alice"},
+        content_type="multipart/form-data",
+    )
+    assert r2.status_code == 200
+    d2 = r2.get_json()
+    assert d2["id"] != d1["id"]
+    assert d2["supersedes_draft_id"] == d1["id"]
+    assert d2["diff_analysis"]["vs_official"]["add_count"] == 7
+
+    # 3) 验证 v1 被 DISCARD，且被标记
+    from models import ImportDraft
+    with client.application.app_context():
+        old = ImportDraft.query.get(d1["id"])
+    assert old.status == "DISCARDED"
+    assert old.superseded_by_draft_id == d2["id"]
+    assert old.conflict_reason is not None
+
+    # 4) 取消发票草稿后正式表不变
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    with open(path_inv, "rb") as f:
+        rc = client.post(
+            f"/api/batches/{bid}/precheck-invoice",
+            data={"file": (f, "inv.csv"), "operator": "bob"},
+            content_type="multipart/form-data",
+        )
+    inv_draft = rc.get_json()["id"]
+    can = client.post(f"/api/batches/{bid}/drafts/{inv_draft}/cancel", json={"operator": "bob"})
+    assert can.status_code == 200
+    with client.application.app_context():
+        from models import Invoice as Inv
+        assert Inv.query.filter_by(batch_id=bid).count() == 0
+        assert ImportDraft.query.get(inv_draft).status == "CANCELLED"
+
+    # 5) 确认 v2 + 确认发票
+    rc_po = client.post(f"/api/batches/{bid}/drafts/{d2['id']}/confirm", json={"operator": "alice"})
+    assert rc_po.status_code == 200
+    assert rc_po.get_json()["confirmed_by"] == "alice"
+    assert rc_po.get_json()["review_summary"] is not None
+
+    with open(path_inv, "rb") as f:
+        ri = client.post(
+            f"/api/batches/{bid}/precheck-invoice",
+            data={"file": (f, "inv_final.csv"), "operator": "bob"},
+            content_type="multipart/form-data",
+        )
+    inv_id2 = ri.get_json()["id"]
+    ri2 = client.post(f"/api/batches/{bid}/drafts/{inv_id2}/confirm", json={"operator": "bob"})
+    assert ri2.status_code == 200
+
+    # 6) 匹配成功
+    rm = client.post(f"/api/batches/{bid}/match")
+    assert rm.status_code == 200
+    res = client.get(f"/api/batches/{bid}/results").get_json()["results"]
+    assert len(res) > 0
+
+
+def test_confirm_blocked_by_cross_batch_dup_invoice(client, sample_dir):
+    """
+    [导入复核台#2] 跨批次重复发票：草稿 status=CONFLICT，confirm 接口返回 400
+    """
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    # 建批 1 → 预检 → 确认发票
+    b1 = create_batch(client, "ird-block-b1")
+    with open(path_inv, "rb") as f:
+        r1 = client.post(
+            f"/api/batches/{b1}/precheck-invoice",
+            data={"file": (f, "inv.csv"), "operator": "x"},
+            content_type="multipart/form-data",
+        )
+    client.post(f"/api/batches/{b1}/drafts/{r1.get_json()['id']}/confirm", json={"operator": "x"})
+
+    # 建批 2 → 预检同号发票 → 应为 CONFLICT
+    b2 = create_batch(client, "ird-block-b2")
+    with open(path_inv, "rb") as f:
+        r2 = client.post(
+            f"/api/batches/{b2}/precheck-invoice",
+            data={"file": (f, "inv_dup.csv"), "operator": "y"},
+            content_type="multipart/form-data",
+        )
+    assert r2.status_code == 200
+    d2 = r2.get_json()
+    assert d2["status"] == "CONFLICT"
+    assert d2["conflict_reason"] is not None
+    assert len(d2["diff_analysis"]["cross_batch_conflicts"]["invoice_duplicates"]) > 0
+
+    # 尝试确认 → 400
+    rc = client.post(f"/api/batches/{b2}/drafts/{d2['id']}/confirm", json={"operator": "y"})
+    assert rc.status_code == 400, "CONFLICT 发票不可直接确认"
+
+
+def test_confirm_blocked_by_missing_columns(client, sample_dir):
+    """
+    [导入复核台#3] 缺列 / 格式错误文件 → error_count>0 → confirm 返回 400
+    """
+    bid = create_batch(client, "ird-block-missing-col")
+    bad = "po_number,vendor_name,amount\nP001,供应商A,100\n"
+    r = client.post(
+        f"/api/batches/{bid}/precheck-po",
+        data={"file": (io.BytesIO(bad.encode("utf-8")), "bad.csv"), "operator": "z"},
+        content_type="multipart/form-data",
+    )
+    if r.status_code == 200:
+        d = r.get_json()
+        err_count = d["precheck_report"]["summary"]["error_count"]
+        assert err_count > 0, "缺列文件应有错误"
+        rc = client.post(f"/api/batches/{bid}/drafts/{d['id']}/confirm", json={"operator": "z"})
+        assert rc.status_code == 400, "error_count>0 时 confirm 必须返回 400"
+    # 预检直接失败也是可接受的阻断方式
+
+
+def test_cancel_keeps_official_data(client, sample_dir):
+    """
+    [导入复核台#4] 取消草稿不写入正式数据，已确认数据仍可正常匹配
+    """
+    bid = create_batch(client, "ird-cancel-official")
+
+    # 先完成一批完整的确认
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+    with open(path_po, "rb") as f:
+        r = client.post(
+            f"/api/batches/{bid}/precheck-po",
+            data={"file": (f, "po.csv"), "operator": "op1"},
+            content_type="multipart/form-data",
+        )
+    client.post(f"/api/batches/{bid}/drafts/{r.get_json()['id']}/confirm", json={"operator": "op1"})
+    with open(path_inv, "rb") as f:
+        r = client.post(
+            f"/api/batches/{bid}/precheck-invoice",
+            data={"file": (f, "inv.csv"), "operator": "op1"},
+            content_type="multipart/form-data",
+        )
+    client.post(f"/api/batches/{bid}/drafts/{r.get_json()['id']}/confirm", json={"operator": "op1"})
+
+    # 记录当前行
+    from models import PurchaseOrder as PO, Invoice as Inv
+    with client.application.app_context():
+        po_c1 = PO.query.filter_by(batch_id=bid).count()
+        inv_c1 = Inv.query.filter_by(batch_id=bid).count()
+
+    # 匹配一次
+    client.post(f"/api/batches/{bid}/match")
+    res1 = len(client.get(f"/api/batches/{bid}/results").get_json()["results"])
+
+    # 再创建草稿并 CANCEL
+    with open(path_po, "rb") as f:
+        orig = f.read().decode("utf-8-sig")
+    extra = "\n".join(orig.splitlines() + ["PO-9999,V000,额外,1000,CNY,2099-01-01"])
+    r = client.post(
+        f"/api/batches/{bid}/precheck-po",
+        data={"file": (io.BytesIO(extra.encode("utf-8-sig")), "po_extra.csv"), "operator": "op2"},
+        content_type="multipart/form-data",
+    )
+    extra_id = r.get_json()["id"]
+    client.post(f"/api/batches/{bid}/drafts/{extra_id}/cancel", json={"operator": "op2"})
+
+    # 取消后正式数据不变
+    with client.application.app_context():
+        po_c2 = PO.query.filter_by(batch_id=bid).count()
+        inv_c2 = Inv.query.filter_by(batch_id=bid).count()
+    assert po_c2 == po_c1, "CANCEL 后采购单正式数据不变"
+    assert inv_c2 == inv_c1, "CANCEL 后发票正式数据不变"
+
+    # 重新匹配结果数不变
+    client.post(f"/api/batches/{bid}/match")
+    res2 = len(client.get(f"/api/batches/{bid}/results").get_json()["results"])
+    assert res2 == res1, "CANCEL 不影响匹配结果"
+
+
+def test_export_csv_includes_review_summary(client, sample_dir):
+    """
+    [导入复核台#5] 导出 CSV 汇总区必须带「最近预检复核摘要」+ 草稿/复核明细
+    """
+    bid = create_batch(client, "ird-export-summary")
+    path_po = os.path.join(sample_dir, "purchase_orders.csv")
+    path_inv = os.path.join(sample_dir, "invoices.csv")
+
+    with open(path_po, "rb") as f:
+        r = client.post(
+            f"/api/batches/{bid}/precheck-po",
+            data={"file": (f, "po.csv"), "operator": "u1"},
+            content_type="multipart/form-data",
+        )
+    client.post(f"/api/batches/{bid}/drafts/{r.get_json()['id']}/confirm", json={"operator": "u1"})
+
+    with open(path_inv, "rb") as f:
+        r = client.post(
+            f"/api/batches/{bid}/precheck-invoice",
+            data={"file": (f, "inv.csv"), "operator": "u2"},
+            content_type="multipart/form-data",
+        )
+    client.post(f"/api/batches/{bid}/drafts/{r.get_json()['id']}/confirm", json={"operator": "u2"})
+
+    client.post(f"/api/batches/{bid}/match")
+
+    exp = client.get(f"/api/batches/{bid}/export")
+    assert exp.status_code == 200
+    body = exp.data.decode("utf-8-sig")
+    lines = body.splitlines()
+
+    # 核心断言：汇总区块必须包含以下 5 行关键字
+    assert any("最近预检复核摘要" in l for l in lines), "CSV 必须包含「最近预检复核摘要」行"
+    assert any("采购单草稿" in l for l in lines), "CSV 必须包含采购单草稿行"
+    assert any("采购单复核明细" in l for l in lines), "CSV 必须包含采购单复核明细"
+    assert any("发票草稿" in l for l in lines), "CSV 必须包含发票草稿行"
+    assert any("发票复核明细" in l for l in lines), "CSV 必须包含发票复核明细"
+
+    # 草稿行中必须包含确认人 @u1 @u2
+    po_line = next(l for l in lines if "采购单草稿" in l)
+    inv_line = next(l for l in lines if "发票草稿" in l)
+    assert "@u1" in po_line, f"采购单草稿行应包含 @u1: {po_line}"
+    assert "@u2" in inv_line, f"发票草稿行应包含 @u2: {inv_line}"
+

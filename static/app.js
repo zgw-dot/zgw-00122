@@ -105,11 +105,11 @@ createApp({
 
     async function loadDrafts(batchId) {
       const poData = await api(`/api/batches/${batchId}/drafts/latest?file_type=PO`);
-      if (poData && poData.draft && poData.draft.status === "PENDING") {
+      if (poData && poData.draft && ["PENDING", "CONFLICT"].includes(poData.draft.status)) {
         poDraft.value = poData.draft;
       }
       const invData = await api(`/api/batches/${batchId}/drafts/latest?file_type=INVOICE`);
-      if (invData && invData.draft && invData.draft.status === "PENDING") {
+      if (invData && invData.draft && ["PENDING", "CONFLICT"].includes(invData.draft.status)) {
         invoiceDraft.value = invData.draft;
       }
     }
@@ -235,6 +235,42 @@ createApp({
       } catch (e) {
         showToast("丢弃错误: " + e.message, "error");
       }
+    }
+
+    async function cancelDraft(draftId) {
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/drafts/${draftId}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ operator: "web_user" }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "取消失败";
+          showToast(detail, "error");
+          return;
+        }
+        if (poDraft.value && poDraft.value.id === draftId) {
+          poDraft.value = null;
+        }
+        if (invoiceDraft.value && invoiceDraft.value.id === draftId) {
+          invoiceDraft.value = null;
+        }
+        showToast(data.note || "草稿已取消，原正式数据保持不变");
+      } catch (e) {
+        showToast("取消错误: " + e.message, "error");
+      }
+    }
+
+    function draftStatusLabel(s) {
+      const m = {
+        PENDING: "待确认",
+        CONFIRMED: "已确认",
+        DISCARDED: "已丢弃",
+        CONFLICT: "冲突待处理",
+        CANCELLED: "已取消",
+      };
+      return m[s] || s;
     }
 
     async function updateTolerance() {
@@ -525,7 +561,7 @@ createApp({
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
       exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
       toggleComparisonSelect, toggleSelectAllComparisons, doBatchReview,
-      confirmDraft, discardDraft,
+      confirmDraft, discardDraft, cancelDraft, draftStatusLabel,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };

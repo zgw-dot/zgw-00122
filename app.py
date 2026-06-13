@@ -20,8 +20,10 @@ from matcher import (
     list_comparisons_with_filter, get_latest_confirmed_comparison,
     update_comparison_review, batch_update_comparison_review,
     create_import_draft, get_latest_draft, list_drafts, get_draft,
-    confirm_draft, discard_draft, DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
-    DRAFT_STATUS_PENDING,
+    confirm_draft, discard_draft, cancel_draft,
+    get_latest_review_summary,
+    DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
+    DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -322,7 +324,7 @@ def confirm_batch_draft(batch_id, draft_id):
 
 @bp.route("/api/batches/<int:batch_id>/drafts/<int:draft_id>/discard", methods=["POST"])
 def discard_batch_draft(batch_id, draft_id):
-    """丢弃草稿"""
+    """丢弃草稿（支持 PENDING 和 CONFLICT 状态）"""
     batch = Batch.query.get_or_404(batch_id)
     draft = get_draft(draft_id)
     if draft is None:
@@ -332,7 +334,65 @@ def discard_batch_draft(batch_id, draft_id):
     try:
         payload = request.get_json(silent=True) or {}
         operator = payload.get("operator", "web_user")
-        result = discard_draft(draft_id, operator=operator)
+
+        if draft.status == DRAFT_STATUS_CONFLICT:
+            from models import DRAFT_STATUS_DISCARDED
+            from matcher import discard_draft as _discard_fn
+            import inspect
+            sig = inspect.signature(_discard_fn)
+            if "allow_conflict" in sig.parameters:
+                result = _discard_fn(draft_id, operator=operator, allow_conflict=True)
+            else:
+                draft_obj = get_draft(draft_id)
+                draft_obj.status = DRAFT_STATUS_DISCARDED
+                from models import AuditLog
+                from datetime import datetime, timezone
+                log = AuditLog(
+                    batch_id=batch_id,
+                    action="DRAFT_DISCARDED_CONFLICT",
+                    detail=f"丢弃冲突状态草稿 #{draft_id} ({draft_obj.filename})",
+                    operator=operator,
+                )
+                db.session.add(log)
+                db.session.commit()
+                result = {"success": True, "draft_id": draft_id}
+        else:
+            result = discard_draft(draft_id, operator=operator)
+        return jsonify(result)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/drafts/<int:draft_id>/cancel", methods=["POST"])
+def cancel_batch_draft(batch_id, draft_id):
+    """取消草稿（用户主动取消，保留原正式数据不变；支持 PENDING 和 CONFLICT 状态）"""
+    batch = Batch.query.get_or_404(batch_id)
+    draft = get_draft(draft_id)
+    if draft is None:
+        return jsonify({"error": "草稿不存在"}), 404
+    if draft.batch_id != batch_id:
+        return jsonify({"error": "草稿不属于该批次，跨批次草稿误确认被阻断"}), 400
+    try:
+        payload = request.get_json(silent=True) or {}
+        operator = payload.get("operator", "web_user")
+
+        if draft.status == DRAFT_STATUS_CONFLICT:
+            from models import DRAFT_STATUS_CANCELLED, AuditLog
+            draft_obj = get_draft(draft_id)
+            draft_obj.status = DRAFT_STATUS_CANCELLED
+            log = AuditLog(
+                batch_id=batch_id,
+                action="DRAFT_CANCELLED_CONFLICT",
+                detail=f"取消冲突状态草稿 #{draft_id} ({draft_obj.filename})，原正式数据保持不变",
+                operator=operator,
+            )
+            db.session.add(log)
+            db.session.commit()
+            result = {"success": True, "draft_id": draft_id, "note": "已取消，原正式数据保持不变"}
+        else:
+            result = cancel_draft(draft_id, operator=operator)
+            result["note"] = "已取消，原正式数据保持不变"
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -633,6 +693,7 @@ def export_report(batch_id):
     exceptions = ExceptionItem.query.filter_by(batch_id=batch_id).all()
     latest_note = get_latest_recalc_note(batch_id)
     latest_confirmed_comparison = get_latest_confirmed_comparison(batch_id)
+    latest_review = get_latest_review_summary(batch_id)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -688,6 +749,28 @@ def export_report(batch_id):
         writer.writerow(["对比操作人", latest_confirmed_comparison.operator or ""])
         writer.writerow(["复核人", latest_confirmed_comparison.reviewed_by or ""])
         writer.writerow(["复核备注", latest_confirmed_comparison.review_remark or ""])
+
+    if latest_review:
+        writer.writerow(["最近预检复核摘要", latest_review])
+        from matcher import get_latest_confirmed_draft
+        po_d = get_latest_confirmed_draft(batch_id, file_type="PO")
+        inv_d = get_latest_confirmed_draft(batch_id, file_type="INVOICE")
+        if po_d:
+            writer.writerow([
+                "采购单草稿",
+                f"#{po_d.id} {po_d.filename} @{po_d.confirmed_by or 'system'}"
+                + (f" ({po_d.confirmed_at.strftime('%Y-%m-%d %H:%M')})" if po_d.confirmed_at else ""),
+            ])
+            if po_d.review_summary:
+                writer.writerow(["采购单复核明细", po_d.review_summary])
+        if inv_d:
+            writer.writerow([
+                "发票草稿",
+                f"#{inv_d.id} {inv_d.filename} @{inv_d.confirmed_by or 'system'}"
+                + (f" ({inv_d.confirmed_at.strftime('%Y-%m-%d %H:%M')})" if inv_d.confirmed_at else ""),
+            ])
+            if inv_d.review_summary:
+                writer.writerow(["发票复核明细", inv_d.review_summary])
 
     output.seek(0)
     filename = f"reconciliation_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"

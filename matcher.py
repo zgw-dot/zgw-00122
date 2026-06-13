@@ -16,8 +16,10 @@ from models import (
     EXCEPTION_STATUS_PENDING, RESULT_STATUS_PENDING, RESULT_STATUS_REJECTED,
     REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFIRMED, DRAFT_STATUS_DISCARDED,
+    DRAFT_STATUS_CONFLICT, DRAFT_STATUS_CANCELLED,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     PRECHECK_ERROR, PRECHECK_WARNING, PRECHECK_INFO,
+    ROW_ACTION_ADD, ROW_ACTION_OVERWRITE, ROW_ACTION_SKIP, ROW_ACTION_CONFLICT,
     compute_rule_version, compute_note_content_hash,
 )
 
@@ -1425,3 +1427,640 @@ def discard_draft(draft_id, operator="system"):
         "success": True,
         "draft_id": draft_id,
     }
+
+
+def cancel_draft(draft_id, operator="system"):
+    """
+    取消草稿（与丢弃类似，但语义不同：用户主动取消 vs 被新草稿替换）。
+    取消后原正式数据保持不变。
+    """
+    draft = ImportDraft.query.get(draft_id)
+    if not draft:
+        raise ValidationError(["草稿不存在"])
+
+    if draft.status != DRAFT_STATUS_PENDING:
+        raise ValidationError([f"草稿状态为 '{draft.status}'，不允许取消"])
+
+    draft.status = DRAFT_STATUS_CANCELLED
+    db.session.flush()
+
+    log_action = "DRAFT_CANCELLED_PO" if draft.file_type == DRAFT_FILE_TYPE_PO else "DRAFT_CANCELLED_INVOICE"
+    log = AuditLog(
+        batch_id=draft.batch_id,
+        action=log_action,
+        detail=f"取消{'采购单' if draft.file_type == DRAFT_FILE_TYPE_PO else '发票'}草稿 #{draft_id} ({draft.filename})，原正式数据保持不变",
+        operator=operator,
+    )
+    db.session.add(log)
+
+    db.session.commit()
+
+    return {
+        "success": True,
+        "draft_id": draft_id,
+    }
+
+
+def _row_signature(row, file_type):
+    """生成行的业务主键签名（用于对比覆盖/新增/跳过）。"""
+    if file_type == DRAFT_FILE_TYPE_PO:
+        return (
+            row.get("po_number", "").strip(),
+            row.get("vendor_code", "").strip(),
+        )
+    else:
+        return (
+            row.get("invoice_number", "").strip(),
+            row.get("vendor_code", "").strip(),
+        )
+
+
+def _row_value_signature(row, file_type):
+    """生成行内容签名（用于判断内容是否变化）。"""
+    if file_type == DRAFT_FILE_TYPE_PO:
+        return (
+            round(float(row.get("amount", 0)), 2),
+            (row.get("vendor_name", "") or "").strip(),
+            (row.get("po_date", "") or "").strip(),
+            (row.get("currency", "CNY") or "CNY").strip(),
+        )
+    else:
+        return (
+            round(float(row.get("amount", 0)), 2),
+            (row.get("vendor_name", "") or "").strip(),
+            (row.get("invoice_date", "") or "").strip(),
+            (row.get("currency", "CNY") or "CNY").strip(),
+        )
+
+
+def analyze_diff(batch_id, file_type, parsed_rows, existing_draft_id=None):
+    """
+    分析草稿与正式数据、以及与同批次上一版草稿的差异。
+
+    返回 dict:
+    {
+        "vs_official": {
+            "add_count": int,
+            "overwrite_count": int,
+            "skip_count": int,
+            "conflict_count": int,
+            "add_rows": [ {row_index, key, amount, vendor} ... ],
+            "overwrite_rows": [ ... ],
+            "skip_rows": [ ... ],
+            "conflict_rows": [ ... ],
+        },
+        "vs_previous_draft": {
+            "prev_draft_id": int or None,
+            "prev_filename": str or None,
+            "same_file": bool,
+            "changed_count": int,
+            "added_vs_prev": [ ... ],
+            "removed_vs_prev": [ ... ],
+            "modified_vs_prev": [ ... ],
+        },
+        "cross_batch_conflicts": {
+            "invoice_duplicates": [ {invoice_number, existing_batch_id, existing_batch_name, amount, vendor} ],
+        },
+        "summary_text": str,
+    }
+    """
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    required_columns = PO_REQUIRED_COLUMNS if file_type == DRAFT_FILE_TYPE_PO else INVOICE_REQUIRED_COLUMNS
+    validate_row_fn = validate_po_row if file_type == DRAFT_FILE_TYPE_PO else validate_invoice_row
+
+    valid_rows = []
+    for i, row in enumerate(parsed_rows):
+        row_num = i + 2
+        errs = validate_row_fn(row, row_num)
+        if not errs:
+            valid_rows.append((i, row))
+
+    vs_official = {
+        "add_count": 0,
+        "overwrite_count": 0,
+        "skip_count": 0,
+        "conflict_count": 0,
+        "add_rows": [],
+        "overwrite_rows": [],
+        "skip_rows": [],
+        "conflict_rows": [],
+    }
+
+    if file_type == DRAFT_FILE_TYPE_PO:
+        existing_records = PurchaseOrder.query.filter_by(batch_id=batch_id).all()
+    else:
+        existing_records = Invoice.query.filter_by(batch_id=batch_id).all()
+
+    existing_map = {}
+    for rec in existing_records:
+        if file_type == DRAFT_FILE_TYPE_PO:
+            key = (rec.po_number.strip(), rec.vendor_code.strip())
+            val_sig = (round(rec.amount, 2), (rec.vendor_name or "").strip(), (rec.po_date or "").strip(), (rec.currency or "CNY").strip())
+        else:
+            key = (rec.invoice_number.strip(), rec.vendor_code.strip())
+            val_sig = (round(rec.amount, 2), (rec.vendor_name or "").strip(), (rec.invoice_date or "").strip(), (rec.currency or "CNY").strip())
+        existing_map[key] = {
+            "id": rec.id,
+            "value_sig": val_sig,
+            "amount": rec.amount,
+            "vendor": rec.vendor_name or rec.vendor_code,
+        }
+
+    seen_keys_in_draft = set()
+    for i, row in valid_rows:
+        key = _row_signature(row, file_type)
+        if not key[0]:
+            continue
+        try:
+            val_sig = _row_value_signature(row, file_type)
+        except (ValueError, TypeError):
+            continue
+
+        row_num = i + 2
+        amount = float(row.get("amount", 0) or 0)
+        vendor = row.get("vendor_name") or row.get("vendor_code") or ""
+        doc_number = key[0]
+
+        if key in seen_keys_in_draft:
+            vs_official["conflict_count"] += 1
+            vs_official["conflict_rows"].append({
+                "row_index": row_num,
+                "key": doc_number,
+                "amount": amount,
+                "vendor": vendor,
+                "reason": "草稿内重复",
+            })
+            continue
+        seen_keys_in_draft.add(key)
+
+        if key in existing_map:
+            existing = existing_map[key]
+            if val_sig == existing["value_sig"]:
+                vs_official["skip_count"] += 1
+                vs_official["skip_rows"].append({
+                    "row_index": row_num,
+                    "key": doc_number,
+                    "amount": amount,
+                    "vendor": vendor,
+                    "existing_id": existing["id"],
+                    "existing_amount": existing["amount"],
+                })
+            else:
+                vs_official["overwrite_count"] += 1
+                vs_official["overwrite_rows"].append({
+                    "row_index": row_num,
+                    "key": doc_number,
+                    "amount": amount,
+                    "vendor": vendor,
+                    "existing_id": existing["id"],
+                    "existing_amount": existing["amount"],
+                    "diff_amount": round(amount - existing["amount"], 2),
+                })
+        else:
+            vs_official["add_count"] += 1
+            vs_official["add_rows"].append({
+                "row_index": row_num,
+                "key": doc_number,
+                "amount": amount,
+                "vendor": vendor,
+            })
+
+    vs_previous = {
+        "prev_draft_id": None,
+        "prev_filename": None,
+        "same_file": False,
+        "changed_count": 0,
+        "added_vs_prev": [],
+        "removed_vs_prev": [],
+        "modified_vs_prev": [],
+    }
+
+    query = ImportDraft.query.filter_by(
+        batch_id=batch_id,
+        file_type=file_type,
+    ).filter(ImportDraft.id != existing_draft_id if existing_draft_id else True)
+    prev_draft = query.order_by(ImportDraft.created_at.desc()).first()
+    if prev_draft and prev_draft.precheck_report:
+        try:
+            prev_report = json.loads(prev_draft.precheck_report)
+            prev_headers = prev_report.get("headers", [])
+            prev_issue_codes = set()
+            for iss in prev_report.get("issues", []):
+                if iss.get("type") == PRECHECK_ERROR:
+                    prev_issue_codes.add(iss.get("code"))
+
+            if "MISSING_COLUMN" not in prev_issue_codes:
+                prev_content = prev_draft.file_content
+                _, prev_rows = parse_file((prev_content, prev_draft.filename), filename=prev_draft.filename)
+
+                prev_valid_keys = {}
+                for i, row in enumerate(prev_rows):
+                    errs = validate_row_fn(row, i + 2)
+                    if errs:
+                        continue
+                    key = _row_signature(row, file_type)
+                    if not key[0]:
+                        continue
+                    try:
+                        vsig = _row_value_signature(row, file_type)
+                    except (ValueError, TypeError):
+                        continue
+                    prev_valid_keys[key] = {
+                        "amount": float(row.get("amount", 0) or 0),
+                        "vendor": row.get("vendor_name") or row.get("vendor_code") or "",
+                        "vsig": vsig,
+                    }
+
+                curr_valid_keys = {}
+                for i, row in valid_rows:
+                    key = _row_signature(row, file_type)
+                    if not key[0]:
+                        continue
+                    try:
+                        vsig = _row_value_signature(row, file_type)
+                    except (ValueError, TypeError):
+                        continue
+                    curr_valid_keys[key] = {
+                        "amount": float(row.get("amount", 0) or 0),
+                        "vendor": row.get("vendor_name") or row.get("vendor_code") or "",
+                        "vsig": vsig,
+                    }
+
+                added_keys = set(curr_valid_keys.keys()) - set(prev_valid_keys.keys())
+                removed_keys = set(prev_valid_keys.keys()) - set(curr_valid_keys.keys())
+                common_keys = set(curr_valid_keys.keys()) & set(prev_valid_keys.keys())
+
+                for k in added_keys:
+                    info = curr_valid_keys[k]
+                    vs_previous["added_vs_prev"].append({
+                        "key": k[0],
+                        "amount": info["amount"],
+                        "vendor": info["vendor"],
+                    })
+                for k in removed_keys:
+                    info = prev_valid_keys[k]
+                    vs_previous["removed_vs_prev"].append({
+                        "key": k[0],
+                        "amount": info["amount"],
+                        "vendor": info["vendor"],
+                    })
+                for k in common_keys:
+                    a = prev_valid_keys[k]
+                    b = curr_valid_keys[k]
+                    if a["vsig"] != b["vsig"]:
+                        vs_previous["modified_vs_prev"].append({
+                            "key": k[0],
+                            "old_amount": a["amount"],
+                            "new_amount": b["amount"],
+                            "vendor": b["vendor"],
+                            "diff_amount": round(b["amount"] - a["amount"], 2),
+                        })
+
+                vs_previous["prev_draft_id"] = prev_draft.id
+                vs_previous["prev_filename"] = prev_draft.filename
+                vs_previous["same_file"] = (prev_draft.file_hash == _compute_file_hash(parsed_rows_to_csv(parsed_rows, required_columns)))
+                vs_previous["changed_count"] = (
+                    len(vs_previous["added_vs_prev"])
+                    + len(vs_previous["removed_vs_prev"])
+                    + len(vs_previous["modified_vs_prev"])
+                )
+        except Exception:
+            pass
+
+    cross_batch = {
+        "invoice_duplicates": [],
+    }
+    if file_type == DRAFT_FILE_TYPE_INVOICE:
+        seen_inv_in_draft = set()
+        for i, row in valid_rows:
+            inv_num = row.get("invoice_number", "").strip()
+            if not inv_num or inv_num in seen_inv_in_draft:
+                continue
+            seen_inv_in_draft.add(inv_num)
+            dup = (
+                Invoice.query
+                .join(Batch, Invoice.batch_id == Batch.id)
+                .filter(
+                    Invoice.invoice_number == inv_num,
+                    Invoice.batch_id != batch_id,
+                )
+                .with_entities(
+                    Invoice.id, Invoice.invoice_number, Invoice.amount,
+                    Invoice.vendor_code, Invoice.vendor_name,
+                    Batch.id.label("bid"), Batch.name.label("bname"),
+                )
+                .first()
+            )
+            if dup:
+                try:
+                    amount = float(row.get("amount", 0) or 0)
+                except (ValueError, TypeError):
+                    amount = 0
+                cross_batch["invoice_duplicates"].append({
+                    "invoice_number": inv_num,
+                    "existing_batch_id": dup.bid,
+                    "existing_batch_name": dup.bname,
+                    "existing_amount": float(dup.amount or 0),
+                    "draft_amount": amount,
+                    "vendor": row.get("vendor_name") or row.get("vendor_code") or "",
+                })
+
+    summary_parts = []
+    if vs_official["add_count"]:
+        summary_parts.append(f"新增 {vs_official['add_count']} 条")
+    if vs_official["overwrite_count"]:
+        summary_parts.append(f"覆盖 {vs_official['overwrite_count']} 条")
+    if vs_official["skip_count"]:
+        summary_parts.append(f"跳过 {vs_official['skip_count']} 条")
+    if vs_official["conflict_count"]:
+        summary_parts.append(f"冲突 {vs_official['conflict_count']} 条")
+    if cross_batch["invoice_duplicates"]:
+        summary_parts.append(f"跨批次重复发票 {len(cross_batch['invoice_duplicates'])} 条")
+    if not summary_parts:
+        summary_parts.append("无变化")
+    summary_text = "；".join(summary_parts)
+
+    return {
+        "vs_official": vs_official,
+        "vs_previous_draft": vs_previous,
+        "cross_batch_conflicts": cross_batch,
+        "summary_text": summary_text,
+    }
+
+
+def parsed_rows_to_csv(rows, headers):
+    """将解析后的行重新序列化为 CSV 字符串用于哈希比较。"""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in headers})
+    return output.getvalue()
+
+
+def create_import_draft(batch_id, file_content, filename, file_type, operator="system"):
+    """
+    创建导入草稿，执行预检、diff 分析并保存结果。
+    处理旧草稿冲突：同批次同类型的旧 PENDING 草稿被标记为丢弃并记录原因。
+    """
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    if isinstance(file_content, bytes):
+        content_str = file_content.decode("utf-8-sig")
+    else:
+        content_str = file_content
+
+    file_hash = _compute_file_hash(content_str)
+
+    required_columns = PO_REQUIRED_COLUMNS if file_type == DRAFT_FILE_TYPE_PO else INVOICE_REQUIRED_COLUMNS
+    headers, parsed_rows = parse_file((content_str, filename), filename=filename)
+
+    existing_pending = ImportDraft.query.filter_by(
+        batch_id=batch_id,
+        file_type=file_type,
+        status=DRAFT_STATUS_PENDING,
+    ).first()
+
+    conflict_info = None
+    conflict_reason = None
+    supersedes_draft_id = None
+
+    if existing_pending:
+        if existing_pending.file_hash == file_hash:
+            return existing_pending, False, None
+
+        conflict_info = {
+            "old_draft_id": existing_pending.id,
+            "old_filename": existing_pending.filename,
+            "old_created_at": existing_pending.created_at.isoformat(),
+            "reason": "同批次同类型文件重新上传，旧草稿被自动丢弃",
+        }
+        existing_pending.status = DRAFT_STATUS_DISCARDED
+        existing_pending.conflict_reason = "同批次同类型重新上传，被新草稿取代"
+        existing_pending.superseded_by_draft_id = None
+        supersedes_draft_id = existing_pending.id
+        db.session.flush()
+
+        log = AuditLog(
+            batch_id=batch_id,
+            action="DRAFT_CONFLICT_DISCARDED",
+            detail=f"同批次同类型旧草稿 #{existing_pending.id}({existing_pending.filename}) 因重新上传被自动丢弃",
+            operator=operator,
+        )
+        db.session.add(log)
+
+    report = precheck_file(content_str, filename, file_type, batch)
+
+    missing_cols = validate_columns(headers, required_columns)
+    has_fatal_errors = bool(missing_cols) or report["summary"]["error_count"] > 0
+    cross_batch_conflicts_empty = True
+
+    if not has_fatal_errors:
+        try:
+            diff = analyze_diff(batch_id, file_type, parsed_rows)
+            cross_batch_conflicts_empty = len(diff["cross_batch_conflicts"]["invoice_duplicates"]) == 0
+        except Exception:
+            diff = None
+            cross_batch_conflicts_empty = True
+    else:
+        diff = None
+
+    if not has_fatal_errors and diff and not cross_batch_conflicts_empty:
+        conflict_reason = f"检测到 {len(diff['cross_batch_conflicts']['invoice_duplicates'])} 条跨批次重复发票，导入前请人工复核"
+
+    rule_version = compute_rule_version(batch.tolerance_pct, batch.tolerance_abs)
+
+    review_summary = None
+    if diff:
+        review_summary = diff["summary_text"]
+
+    draft = ImportDraft(
+        batch_id=batch_id,
+        file_type=file_type,
+        filename=filename,
+        status=DRAFT_STATUS_PENDING if cross_batch_conflicts_empty else DRAFT_STATUS_CONFLICT,
+        row_count=report["row_count"],
+        valid_row_count=report["summary"]["valid_rows"],
+        error_count=report["summary"]["error_count"],
+        warning_count=report["summary"]["warning_count"],
+        tolerance_pct=batch.tolerance_pct,
+        tolerance_abs=batch.tolerance_abs,
+        rule_version=rule_version,
+        file_content=content_str,
+        file_hash=file_hash,
+        parsed_data=json.dumps(report["issues"], ensure_ascii=False),
+        precheck_report=json.dumps(report, ensure_ascii=False),
+        diff_analysis=json.dumps(diff, ensure_ascii=False) if diff else None,
+        conflict_reason=conflict_reason,
+        review_summary=review_summary,
+        operator=operator,
+        supersedes_draft_id=supersedes_draft_id,
+    )
+    db.session.add(draft)
+    db.session.flush()
+
+    if supersedes_draft_id is not None:
+        prev = ImportDraft.query.get(supersedes_draft_id)
+        if prev:
+            prev.superseded_by_draft_id = draft.id
+
+    for issue in report["issues"]:
+        db_issue = ImportDraftIssue(
+            draft_id=draft.id,
+            issue_type=issue["type"],
+            issue_code=issue["code"],
+            row_number=issue["row_number"],
+            column_name=issue["column_name"],
+            message=issue["message"],
+            detail=json.dumps(issue["detail"], ensure_ascii=False) if issue["detail"] else None,
+        )
+        db.session.add(db_issue)
+
+    log_action = "DRAFT_CREATED_PO" if file_type == DRAFT_FILE_TYPE_PO else "DRAFT_CREATED_INVOICE"
+    log_detail = (
+        f"创建{'采购单' if file_type == DRAFT_FILE_TYPE_PO else '发票'}草稿: {filename}, "
+        f"共{report['row_count']}行, "
+        f"错误{report['summary']['error_count']}个, "
+        f"警告{report['summary']['warning_count']}个"
+    )
+    if review_summary:
+        log_detail += f" | 复核摘要: {review_summary}"
+    if conflict_info:
+        log_detail += f" (冲突: 旧草稿 #{conflict_info['old_draft_id']} 被丢弃)"
+    if not cross_batch_conflicts_empty:
+        log_detail += f" | 状态: CONFLICT ({conflict_reason})"
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action=log_action,
+        detail=log_detail,
+        operator=operator,
+    )
+    db.session.add(log)
+
+    db.session.commit()
+    db.session.refresh(draft)
+
+    return draft, True, conflict_info
+
+
+def confirm_draft(draft_id, operator="system"):
+    """
+    确认草稿，将数据写入正式表。
+    阻断逻辑：
+    1. 草稿状态只能是 PENDING 或 CONFLICT（CONFLICT 需显式确认，表示人工已复核）
+    2. 缺列/格式错误文件不能确认
+    3. 跨批次重复发票不能确认（必须人工先处理）
+    4. 草稿必须属于批次，不能跨批次误操作
+    """
+    draft = ImportDraft.query.get(draft_id)
+    if not draft:
+        raise ValidationError(["草稿不存在"])
+
+    if draft.status not in (DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT):
+        raise ValidationError([f"草稿状态为 '{draft.status}'，不允许确认"])
+
+    batch = Batch.query.get(draft.batch_id)
+    if not batch:
+        raise ValidationError(["关联批次不存在"])
+
+    if draft.diff_analysis:
+        try:
+            diff = json.loads(draft.diff_analysis)
+            cross = diff.get("cross_batch_conflicts", {})
+            dups = cross.get("invoice_duplicates", [])
+            if dups:
+                dup_nums = ", ".join(d["invoice_number"] for d in dups[:5])
+                more = "" if len(dups) <= 5 else f" 等{len(dups)}条"
+                raise ValidationError([
+                    f"存在跨批次重复发票: {dup_nums}{more}，"
+                    f"请先在对应批次处理后再确认。使用 /discard 或 /cancel 放弃当前草稿。"
+                ])
+        except ValidationError:
+            raise
+        except Exception:
+            pass
+
+    if draft.precheck_report:
+        try:
+            rpt = json.loads(draft.precheck_report)
+            miss = rpt.get("missing_columns", [])
+            if miss:
+                raise ValidationError([f"文件缺少必要列: {', '.join(miss)}，请修正文件后重新上传"])
+            err_count = rpt.get("summary", {}).get("error_count", 0)
+            if err_count > 0:
+                raise ValidationError([f"文件存在 {err_count} 条格式错误，请修正后重新上传；可查看草稿的 issues 详情"])
+        except ValidationError:
+            raise
+        except Exception:
+            pass
+
+    try:
+        if draft.file_type == DRAFT_FILE_TYPE_PO:
+            count = validate_and_import_po(batch.id, draft.file_content, draft.filename)
+        else:
+            count = validate_and_import_invoice(batch.id, draft.file_content, draft.filename)
+
+        draft.status = DRAFT_STATUS_CONFIRMED
+        draft.confirmed_by = operator
+        draft.confirmed_at = datetime.now(timezone.utc)
+        db.session.flush()
+
+        log_action = "DRAFT_CONFIRMED_PO" if draft.file_type == DRAFT_FILE_TYPE_PO else "DRAFT_CONFIRMED_INVOICE"
+        review_extra = f"；复核摘要: {draft.review_summary}" if draft.review_summary else ""
+        log = AuditLog(
+            batch_id=batch.id,
+            action=log_action,
+            detail=f"确认{'采购单' if draft.file_type == DRAFT_FILE_TYPE_PO else '发票'}草稿 #{draft_id}，写入 {count} 行数据（确认人: {operator}）{review_extra}",
+            operator=operator,
+        )
+        db.session.add(log)
+
+        db.session.commit()
+
+        return {
+            "success": True,
+            "imported_count": count,
+            "draft_id": draft_id,
+            "confirmed_by": operator,
+            "review_summary": draft.review_summary,
+        }
+
+    except ValidationError:
+        db.session.rollback()
+        raise
+    except Exception as e:
+        db.session.rollback()
+        raise ValidationError([str(e)])
+
+
+def get_latest_confirmed_draft(batch_id, file_type=None):
+    """获取指定批次最近一次已确认的草稿（用于导出 CSV 复核摘要）。"""
+    query = ImportDraft.query.filter_by(
+        batch_id=batch_id,
+        status=DRAFT_STATUS_CONFIRMED,
+    )
+    if file_type:
+        query = query.filter_by(file_type=file_type)
+    return query.order_by(ImportDraft.confirmed_at.desc()).first()
+
+
+def get_latest_review_summary(batch_id):
+    """获取批次最近一次预检/复核摘要（包含采购单和发票最近一次）。"""
+    po_draft = get_latest_confirmed_draft(batch_id, file_type=DRAFT_FILE_TYPE_PO)
+    inv_draft = get_latest_confirmed_draft(batch_id, file_type=DRAFT_FILE_TYPE_INVOICE)
+
+    parts = []
+    if po_draft:
+        summary = po_draft.review_summary or f"已确认采购单草稿 #{po_draft.id}"
+        parts.append(f"[采购单] {summary} @{po_draft.confirmed_by or 'system'}")
+    if inv_draft:
+        summary = inv_draft.review_summary or f"已确认发票草稿 #{inv_draft.id}"
+        parts.append(f"[发票] {summary} @{inv_draft.confirmed_by or 'system'}")
+
+    return "；".join(parts) if parts else None

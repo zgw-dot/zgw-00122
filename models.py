@@ -51,8 +51,15 @@ REVIEW_STATUS_IGNORED = "IGNORED"
 DRAFT_STATUS_PENDING = "PENDING"
 DRAFT_STATUS_CONFIRMED = "CONFIRMED"
 DRAFT_STATUS_DISCARDED = "DISCARDED"
+DRAFT_STATUS_CONFLICT = "CONFLICT"
+DRAFT_STATUS_CANCELLED = "CANCELLED"
 DRAFT_FILE_TYPE_PO = "PO"
 DRAFT_FILE_TYPE_INVOICE = "INVOICE"
+
+ROW_ACTION_ADD = "ADD"
+ROW_ACTION_OVERWRITE = "OVERWRITE"
+ROW_ACTION_SKIP = "SKIP"
+ROW_ACTION_CONFLICT = "CONFLICT"
 
 PRECHECK_ERROR = "ERROR"
 PRECHECK_WARNING = "WARNING"
@@ -408,7 +415,14 @@ class ImportDraft(db.Model):
     file_hash = db.Column(db.String(64), nullable=False)
     parsed_data = db.Column(db.Text)
     precheck_report = db.Column(db.Text)
+    diff_analysis = db.Column(db.Text)
+    conflict_reason = db.Column(db.Text)
+    review_summary = db.Column(db.Text)
+    confirmed_by = db.Column(db.String(100))
+    confirmed_at = db.Column(db.DateTime)
     operator = db.Column(db.String(100), default="system")
+    superseded_by_draft_id = db.Column(db.Integer)
+    supersedes_draft_id = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -431,9 +445,16 @@ class ImportDraft(db.Model):
             "rule_version": self.rule_version,
             "file_hash": self.file_hash,
             "operator": self.operator,
+            "confirmed_by": self.confirmed_by,
+            "confirmed_at": self.confirmed_at.isoformat() if self.confirmed_at else None,
+            "superseded_by_draft_id": self.superseded_by_draft_id,
+            "supersedes_draft_id": self.supersedes_draft_id,
+            "conflict_reason": self.conflict_reason,
+            "review_summary": self.review_summary,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "precheck_report": json.loads(self.precheck_report) if self.precheck_report else None,
+            "diff_analysis": json.loads(self.diff_analysis) if self.diff_analysis else None,
             "issues": [i.to_dict() for i in self.issues],
         }
 
