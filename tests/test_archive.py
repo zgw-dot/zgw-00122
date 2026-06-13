@@ -514,3 +514,199 @@ def test_unconfirmed_batch_cannot_create(client, sample_dir):
         "role": "finance",
     })
     assert r.status_code == 400
+
+
+def test_posted_batch_can_create_archive(client, sample_dir):
+    bid = full_pipeline(client, sample_dir, name="test-posted-arc")
+
+    r = client.post(f"/api/batches/{bid}/post")
+    assert r.status_code == 200
+
+    batch = client.get(f"/api/batches/{bid}").get_json()
+    assert batch["status"] == "POSTED"
+
+    r = client.post(f"/api/batches/{bid}/archives", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    assert r.status_code == 201, f"已入账批次生成归档失败: {r.data}"
+    body = r.get_json()
+    assert body["batch_status"] == "POSTED"
+    assert body["status"] == ARCHIVE_STATUS_ACTIVE
+
+
+def test_import_snapshots_restore_recalc_health_release_rehearsal(client, sample_dir, app):
+    from models import AuditLog
+
+    bid = full_pipeline(client, sample_dir, name="test-snapshot-restore")
+
+    r = client.post(f"/api/batches/{bid}/release-packages", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    assert r.status_code in (200, 201), f"生成放行包失败: {r.data}"
+
+    r = client.post(f"/api/batches/{bid}/rehearsal-slips", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    assert r.status_code in (200, 201), f"生成预演单失败: {r.data}"
+
+    r1 = client.post(f"/api/batches/{bid}/archives", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    assert r1.status_code == 201, f"生成归档失败: {r1.data}"
+    arc_id = r1.get_json()["id"]
+    orig_body = r1.get_json()
+
+    r = client.get(f"/api/archives/{arc_id}/export")
+    assert r.status_code == 200
+    csv_bytes = r.data
+    csv_text = csv_bytes.decode("utf-8-sig")
+    assert "重算说明快照" in csv_text
+    assert "巡检摘要快照" in csv_text
+    assert "放行包快照" in csv_text
+    assert "预演单快照" in csv_text
+
+    with app.app_context():
+        from models import ClosingArchiveItem, ClosingArchive, AuditLog as AL
+        db.session.query(ClosingArchiveItem).filter(ClosingArchiveItem.closing_archive_id == arc_id).delete()
+        db.session.query(ClosingArchive).filter(ClosingArchive.id == arc_id).delete()
+        db.session.commit()
+
+    data = {"file": (BytesIO(csv_bytes), "restore.csv")}
+    r = client.post(f"/api/batches/{bid}/archives/import", data=data, content_type="multipart/form-data")
+    assert r.status_code == 201, f"回导失败: {r.data}"
+    imported = r.get_json()
+    new_arc_id = imported["id"]
+
+    detail = client.get(f"/api/archives/{new_arc_id}").get_json()
+    assert detail["archive_number"] == orig_body["archive_number"]
+    assert detail["content_hash"] == orig_body["content_hash"]
+    assert detail["batch_summary_snapshot"] is not None
+
+    if orig_body.get("recalc_note_id"):
+        assert detail["recalc_note_summary"] is not None
+    if orig_body.get("health_history_id"):
+        assert detail["health_summary"] is not None
+    if orig_body.get("release_package_id"):
+        assert detail["release_package_snapshot"] is not None
+    if orig_body.get("rehearsal_slip_id"):
+        assert detail["rehearsal_slip_snapshot"] is not None
+
+    with app.app_context():
+        logs = AuditLog.query.filter_by(batch_id=bid).order_by(AuditLog.created_at.desc()).all()
+        actions = [log.action for log in logs]
+        assert "ARCHIVE_IMPORT" in actions
+        assert any("回导" in (log.detail or "") for log in logs)
+
+
+def test_import_number_duplicate_denied(client, sample_dir):
+    bid = full_pipeline(client, sample_dir, name="test-num-dup")
+
+    r1 = client.post(f"/api/batches/{bid}/archives", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    arc_id = r1.get_json()["id"]
+
+    r = client.get(f"/api/archives/{arc_id}/export")
+    csv_bytes = r.data
+
+    csv_text = csv_bytes.decode("utf-8-sig")
+    import hashlib
+    fake_hash = hashlib.sha256(b"fake").hexdigest()
+    original_hash = r1.get_json()["content_hash"]
+    csv_text = csv_text.replace(original_hash, fake_hash)
+    csv_bytes = csv_text.encode("utf-8-sig")
+
+    data = {"file": (BytesIO(csv_bytes), "numdup.csv")}
+    r = client.post(f"/api/batches/{bid}/archives/import", data=data, content_type="multipart/form-data")
+    assert r.status_code == 400
+    body = r.get_json()
+    assert "编号" in str(body.get("error", "")) or any("编号" in d for d in body.get("details", []))
+
+
+def test_finance_cannot_seal_or_void(client, sample_dir):
+    bid = full_pipeline(client, sample_dir, name="test-finance-no-seal-void")
+
+    r1 = client.post(f"/api/batches/{bid}/archives", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    arc_id = r1.get_json()["id"]
+
+    r = client.post(f"/api/archives/{arc_id}/seal", json={
+        "operator": "fin",
+        "role": "finance",
+    })
+    assert r.status_code == 403
+
+    r = client.post(f"/api/archives/{arc_id}/void", json={
+        "operator": "fin",
+        "role": "finance",
+        "reason": "no",
+    })
+    assert r.status_code == 403
+
+
+def test_restart_query_with_snapshots(client, sample_dir, app):
+    bid = full_pipeline(client, sample_dir, name="test-restart-snap")
+
+    client.post(f"/api/batches/{bid}/release-packages", json={
+        "operator": "tester", "role": "finance",
+    })
+    client.post(f"/api/batches/{bid}/rehearsal-slips", json={
+        "operator": "tester", "role": "finance",
+    })
+
+    r1 = client.post(f"/api/batches/{bid}/archives", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    arc_id = r1.get_json()["id"]
+    orig_num = r1.get_json()["archive_number"]
+    orig_hash = r1.get_json()["content_hash"]
+
+    with app.test_client() as client2:
+        r = client2.get(f"/api/archives/{arc_id}")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["archive_number"] == orig_num
+        assert body["content_hash"] == orig_hash
+        assert body["batch_summary_snapshot"] is not None
+        if r1.get_json().get("recalc_note_id"):
+            assert body["recalc_note_summary"] is not None
+        if r1.get_json().get("health_history_id"):
+            assert body["health_summary"] is not None
+
+        r = client2.get(f"/api/archives/audit-logs?batch_id={bid}")
+        assert r.status_code == 200
+        logs = r.get_json()["audit_logs"]
+        assert any(log["action"] == "ARCHIVE_CREATE" for log in logs)
+
+
+def test_posted_batch_not_blocked_on_import(client, sample_dir, app):
+    bid = full_pipeline(client, sample_dir, name="test-posted-import")
+
+    client.post(f"/api/batches/{bid}/post")
+
+    r1 = client.post(f"/api/batches/{bid}/archives", json={
+        "operator": "tester",
+        "role": "finance",
+    })
+    arc_id = r1.get_json()["id"]
+
+    r = client.get(f"/api/archives/{arc_id}/export")
+    csv_bytes = r.data
+
+    with app.app_context():
+        from models import ClosingArchiveItem, ClosingArchive
+        db.session.query(ClosingArchiveItem).filter(ClosingArchiveItem.closing_archive_id == arc_id).delete()
+        db.session.query(ClosingArchive).filter(ClosingArchive.id == arc_id).delete()
+        db.session.commit()
+
+    data = {"file": (BytesIO(csv_bytes), "posted.csv")}
+    r = client.post(f"/api/batches/{bid}/archives/import", data=data, content_type="multipart/form-data")
+    assert r.status_code == 201, f"已入账批次回导被挡: {r.data}"

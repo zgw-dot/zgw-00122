@@ -47,7 +47,10 @@ from models import (
     HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE, HANDOVER_ROLE_VIEWER,
     ARCHIVE_STATUS_ACTIVE, ARCHIVE_STATUS_STALE, ARCHIVE_STATUS_SEALED, ARCHIVE_STATUS_VOID,
     ARCHIVE_PERMISSION_SEAL, ARCHIVE_PERMISSION_VOID, ARCHIVE_PERMISSION_CREATE, ARCHIVE_PERMISSION_VIEW,
-    compute_closing_archive_content_hash,
+    can_generate_archive, collect_archive_related, build_archive_snapshots,
+    compute_archive_content_hash, build_archive_items,
+    parse_archive_csv, validate_archive_import, build_archive_from_parsed,
+    export_archive_to_csv,
 )
 
 PO_REQUIRED_COLUMNS = ["po_number", "vendor_code", "vendor_name", "amount", "po_date"]
@@ -4739,31 +4742,18 @@ def _collect_related_snapshots(batch, note, health_history, release_pkg, rehears
 
 
 def create_closing_archive(batch_id, operator="system", force_new=False):
+    from models import _generate_archive_number as _gen_arc_num
+
     batch = Batch.query.get(batch_id)
     if not batch:
         raise ValidationError(["批次不存在"])
 
-    if batch.status not in (BATCH_STATUS_CONFIRMED, BATCH_STATUS_MATCHED):
+    if not can_generate_archive(batch):
         raise ValidationError([f"批次状态 '{batch.status}' 不允许生成归档包，需先确认或入账批次"])
 
-    latest_note = get_latest_recalc_note(batch_id)
-    latest_health = (
-        HealthCheckHistory.query.filter_by(batch_id=batch_id)
-        .order_by(HealthCheckHistory.created_at.desc())
-        .first()
-    )
-    latest_release = (
-        ReleasePackage.query.filter_by(batch_id=batch_id)
-        .order_by(ReleasePackage.created_at.desc())
-        .first()
-    )
-    latest_rehearsal = (
-        RehearsalSlip.query.filter_by(batch_id=batch_id)
-        .order_by(RehearsalSlip.created_at.desc())
-        .first()
-    )
+    latest_note, latest_health, latest_release, latest_rehearsal = collect_archive_related(batch)
 
-    content_hash = compute_closing_archive_content_hash(
+    content_hash = compute_archive_content_hash(
         batch, latest_note, latest_health, latest_release, latest_rehearsal
     )
 
@@ -4778,12 +4768,18 @@ def create_closing_archive(batch_id, operator="system", force_new=False):
 
     mark_stale_archives(batch_id, "ARCHIVE_CREATE", operator=operator)
 
-    archive_number = _generate_archive_number(batch_id)
+    archive_number = _gen_arc_num(batch_id)
 
-    (
-        batch_summary, match_snapshot, exception_snapshot,
-        recalc_snapshot, health_snapshot, release_snapshot, rehearsal_snapshot
-    ) = _collect_related_snapshots(batch, latest_note, latest_health, latest_release, latest_rehearsal)
+    snapshots = build_archive_snapshots(
+        batch, latest_note, latest_health, latest_release, latest_rehearsal
+    )
+    batch_summary = snapshots["batch_summary"]
+    recalc_snapshot = snapshots["recalc_snapshot"]
+    health_snapshot = snapshots["health_snapshot"]
+    release_snapshot = snapshots["release_snapshot"]
+    rehearsal_snapshot = snapshots["rehearsal_snapshot"]
+    match_snapshot = snapshots["match_snapshot"]
+    exception_snapshot = snapshots["exception_snapshot"]
 
     archive = ClosingArchive(
         batch_id=batch_id,
@@ -4823,41 +4819,14 @@ def create_closing_archive(batch_id, operator="system", force_new=False):
     db.session.add(archive)
     db.session.flush()
 
-    exc_map = {}
-    for exc in batch.exception_items:
-        if exc.match_result_id:
-            exc_map[exc.match_result_id] = exc
-
-    matched_types = (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)
-    matched_results = [r for r in batch.match_results if r.match_type in matched_types]
-
-    for idx, mr in enumerate(sorted(matched_results, key=lambda x: x.id or 0)):
-        exc = exc_map.get(mr.id)
-        item = ClosingArchiveItem(
-            closing_archive_id=archive.id,
-            match_result_id=mr.id,
-            po_number=mr.po.po_number if mr.po else None,
-            invoice_number=mr.invoice.invoice_number if mr.invoice else None,
-            vendor_code=mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
-            vendor_name=mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
-            po_amount=mr.po_amount,
-            invoice_amount=mr.invoice_amount,
-            amount_diff=mr.amount_diff,
-            match_type=mr.match_type,
-            is_exception=mr.is_exception,
-            exception_type=mr.exception_type,
-            status=mr.status,
-            remarks=mr.remarks,
-            exception_remarks=exc.remarks if exc else None,
-            rule_version=mr.rule_version,
-            item_order=idx,
-        )
+    items = build_archive_items(batch, archive.id)
+    for item in items:
         db.session.add(item)
 
     log = AuditLog(
         batch_id=batch_id,
         action="ARCHIVE_CREATE",
-        detail=f"生成结账归档 {archive_number} (#{archive.id})，共 {len(matched_results)} 条明细",
+        detail=f"生成结账归档 {archive_number} (#{archive.id})，共 {len(items)} 条明细",
         operator=operator,
     )
     db.session.add(log)
@@ -4960,86 +4929,7 @@ def export_closing_archive_csv(archive_id):
     archive = get_closing_archive(archive_id)
     if not archive:
         raise ValidationError(["归档不存在"])
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-
-    writer.writerow(["===== 结账归档头段 ====="])
-    header_data = archive.to_dict()
-    header_data["created_at"] = header_data["created_at"] if header_data["created_at"] else ""
-    header_data["sealed_at"] = header_data["sealed_at"] if header_data["sealed_at"] else ""
-    header_data["voided_at"] = header_data["voided_at"] if header_data["voided_at"] else ""
-    header_data["is_stale"] = "是" if header_data["is_stale"] else "否"
-
-    for label, key in ARCHIVE_HEADER_FIELDS.items():
-        value = header_data.get(key, "")
-        writer.writerow([label, value])
-
-    writer.writerow([])
-    writer.writerow(["===== 结账归档明细 ====="])
-    writer.writerow(ARCHIVE_DETAIL_FIELDS)
-
-    for idx, item in enumerate(sorted(archive.items, key=lambda x: x.item_order)):
-        writer.writerow([
-            idx + 1,
-            item.match_result_id or "",
-            item.po_number or "",
-            item.invoice_number or "",
-            item.vendor_code or "",
-            item.vendor_name or "",
-            item.po_amount if item.po_amount is not None else "",
-            item.invoice_amount if item.invoice_amount is not None else "",
-            item.amount_diff if item.amount_diff is not None else "",
-            item.match_type or "",
-            "是" if item.is_exception else "否",
-            item.exception_type or "",
-            item.status or "",
-            item.rule_version or "",
-            item.remarks or "",
-            item.exception_remarks or "",
-        ])
-
-    writer.writerow([])
-    writer.writerow(["===== 批次摘要快照 ====="])
-    if archive.batch_summary_snapshot:
-        summary = json.loads(archive.batch_summary_snapshot)
-        for k, v in summary.items():
-            writer.writerow([k, v])
-
-    writer.writerow([])
-    writer.writerow(["===== 重算说明快照 ====="])
-    if archive.recalc_note_summary:
-        recalc = json.loads(archive.recalc_note_summary)
-        for k, v in recalc.items():
-            writer.writerow([k, v])
-
-    writer.writerow([])
-    writer.writerow(["===== 巡检摘要快照 ====="])
-    if archive.health_summary:
-        health = json.loads(archive.health_summary)
-        for k, v in health.items():
-            if isinstance(v, (dict, list)):
-                writer.writerow([k, json.dumps(v, ensure_ascii=False)])
-            else:
-                writer.writerow([k, v])
-
-    writer.writerow([])
-    writer.writerow(["===== 放行包快照 ====="])
-    if archive.release_package_snapshot:
-        release = json.loads(archive.release_package_snapshot)
-        for k, v in release.items():
-            writer.writerow([k, v])
-
-    writer.writerow([])
-    writer.writerow(["===== 预演单快照 ====="])
-    if archive.rehearsal_slip_snapshot:
-        rehearsal = json.loads(archive.rehearsal_slip_snapshot)
-        for k, v in rehearsal.items():
-            writer.writerow([k, v])
-
-    content = output.getvalue()
-    output.close()
-    return content, f"{archive.archive_number}.csv"
+    return export_archive_to_csv(archive)
 
 
 def import_closing_archive_csv(batch_id, csv_content, operator="system"):
@@ -5047,227 +4937,12 @@ def import_closing_archive_csv(batch_id, csv_content, operator="system"):
     if not batch:
         raise ValidationError(["批次不存在"])
 
-    if isinstance(csv_content, bytes):
-        csv_content = csv_content.decode("utf-8-sig")
+    parsed = parse_archive_csv(csv_content)
+    errors = validate_archive_import(batch_id, parsed)
+    if errors:
+        raise ValidationError(errors)
 
-    reader = csv.reader(io.StringIO(csv_content))
-    rows = list(reader)
-
-    in_header = False
-    in_detail = False
-    in_batch_summary = False
-    in_recalc = False
-    in_health = False
-    in_release = False
-    in_rehearsal = False
-
-    header_data = {}
-    detail_items = []
-    detail_headers = None
-
-    for row in rows:
-        if not row or not any(cell.strip() for cell in row):
-            continue
-
-        first = row[0].strip()
-        if first == "===== 结账归档头段 =====":
-            in_header = True
-            in_detail = in_batch_summary = in_recalc = in_health = in_release = in_rehearsal = False
-            continue
-        if first == "===== 结账归档明细 =====":
-            in_detail = True
-            in_header = in_batch_summary = in_recalc = in_health = in_release = in_rehearsal = False
-            continue
-        if first == "===== 批次摘要快照 =====":
-            in_batch_summary = True
-            in_header = in_detail = in_recalc = in_health = in_release = in_rehearsal = False
-            continue
-        if first == "===== 重算说明快照 =====":
-            in_recalc = True
-            in_header = in_detail = in_batch_summary = in_health = in_release = in_rehearsal = False
-            continue
-        if first == "===== 巡检摘要快照 =====":
-            in_health = True
-            in_header = in_detail = in_batch_summary = in_recalc = in_release = in_rehearsal = False
-            continue
-        if first == "===== 放行包快照 =====":
-            in_release = True
-            in_header = in_detail = in_batch_summary = in_recalc = in_health = in_rehearsal = False
-            continue
-        if first == "===== 预演单快照 =====":
-            in_rehearsal = True
-            in_header = in_detail = in_batch_summary = in_recalc = in_health = in_release = False
-            continue
-
-        if in_header and len(row) >= 2:
-            key = row[0].strip()
-            value = row[1].strip() if len(row) > 1 else ""
-            if key in ARCHIVE_HEADER_FIELDS:
-                header_data[ARCHIVE_HEADER_FIELDS[key]] = value
-
-        if in_detail:
-            if detail_headers is None:
-                detail_headers = [h.strip() for h in row]
-                missing = [f for f in ARCHIVE_DETAIL_FIELDS if f not in detail_headers]
-                if missing:
-                    raise ValidationError([f"CSV 明细缺少必填列: {', '.join(missing)}"])
-                continue
-
-            item = {}
-            for i, h in enumerate(detail_headers):
-                item[h] = row[i].strip() if i < len(row) else ""
-            detail_items.append(item)
-
-    required_headers = ["archive_number", "batch_id", "content_hash"]
-    missing_headers = [k for k in required_headers if not header_data.get(k)]
-    if missing_headers:
-        field_map = {v: k for k, v in ARCHIVE_HEADER_FIELDS.items()}
-        missing_names = [field_map[k] for k in missing_headers]
-        raise ValidationError([f"CSV 头段缺少必填字段: {', '.join(missing_names)}"])
-
-    csv_batch_id = None
-    try:
-        csv_batch_id = int(header_data["batch_id"])
-    except (ValueError, TypeError):
-        raise ValidationError([f"批次ID格式错误: {header_data['batch_id']}"])
-
-    if csv_batch_id != batch_id:
-        raise ValidationError([
-            f"跨批次回导被拒绝：CSV 属于批次 #{csv_batch_id}，当前批次为 #{batch_id}"
-        ])
-
-    archive_number = header_data["archive_number"]
-    existing_by_number = get_closing_archive_by_number(archive_number)
-    if existing_by_number:
-        raise ValidationError([
-            f"归档编号重复：{archive_number} 已存在 (#{existing_by_number.id})"
-        ])
-
-    content_hash = header_data["content_hash"]
-    existing_by_hash = ClosingArchive.query.filter_by(
-        batch_id=batch_id,
-        content_hash=content_hash,
-    ).first()
-    if existing_by_hash:
-        raise ValidationError([
-            f"内容哈希重复：哈希 {content_hash[:12]} 已存在于归档 {existing_by_hash.archive_number}"
-        ])
-
-    existing_sealed = ClosingArchive.query.filter_by(
-        batch_id=batch_id,
-        status=ARCHIVE_STATUS_SEALED,
-    ).first()
-    if existing_sealed:
-        raise ValidationError([
-            f"已封存冲突：批次 #{batch_id} 存在已封存归档 {existing_sealed.archive_number}，不允许回导"
-        ])
-
-    if not detail_items:
-        raise ValidationError(["CSV 没有明细数据"])
-
-    def safe_float(val):
-        if val is None or val == "":
-            return None
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return None
-
-    def safe_int(val):
-        if val is None or val == "":
-            return None
-        try:
-            return int(val)
-        except (ValueError, TypeError):
-            return None
-
-    batch_summary_snapshot = None
-    for row in rows:
-        if row and row[0].strip() == "===== 批次摘要快照 =====":
-            in_batch_summary = True
-            continue
-        if in_batch_summary and row and len(row) >= 2:
-            if row[0].strip().startswith("====="):
-                break
-            if batch_summary_snapshot is None:
-                batch_summary_snapshot = {}
-            k = row[0].strip()
-            v = row[1].strip() if len(row) > 1 else ""
-            if v.replace(".", "").isdigit() and "." in v:
-                batch_summary_snapshot[k] = float(v)
-            elif v.isdigit():
-                batch_summary_snapshot[k] = int(v)
-            else:
-                batch_summary_snapshot[k] = v
-
-    archive = ClosingArchive(
-        batch_id=batch_id,
-        archive_number=archive_number,
-        status=header_data.get("status", ARCHIVE_STATUS_ACTIVE),
-        batch_status=header_data.get("batch_status"),
-        payable_total=safe_float(header_data.get("payable_total")),
-        matched_count=safe_int(header_data.get("matched_count")) or 0,
-        exception_count=safe_int(header_data.get("exception_count")) or 0,
-        unmatched_po_count=safe_int(header_data.get("unmatched_po_count")) or 0,
-        unmatched_invoice_count=safe_int(header_data.get("unmatched_invoice_count")) or 0,
-        tolerance_pct=safe_float(header_data.get("tolerance_pct")),
-        tolerance_abs=safe_float(header_data.get("tolerance_abs")),
-        rule_version=header_data.get("rule_version"),
-        recalc_note_id=safe_int(header_data.get("recalc_note_id")),
-        recalc_note_version=safe_int(header_data.get("recalc_note_version")),
-        health_history_id=safe_int(header_data.get("health_history_id")),
-        health_rule_version=header_data.get("health_rule_version"),
-        health_blocker_count=safe_int(header_data.get("health_blocker_count")) or 0,
-        health_warning_count=safe_int(header_data.get("health_warning_count")) or 0,
-        health_info_count=safe_int(header_data.get("health_info_count")) or 0,
-        release_package_id=safe_int(header_data.get("release_package_id")),
-        release_package_status=header_data.get("release_package_status"),
-        rehearsal_slip_id=safe_int(header_data.get("rehearsal_slip_id")),
-        rehearsal_slip_status=header_data.get("rehearsal_slip_status"),
-        batch_summary_snapshot=json.dumps(batch_summary_snapshot, ensure_ascii=False) if batch_summary_snapshot else None,
-        content_hash=content_hash,
-        is_stale=(header_data.get("is_stale") == "是"),
-        stale_reason=header_data.get("stale_reason"),
-        created_by=header_data.get("created_by", operator),
-        sealed_by=header_data.get("sealed_by"),
-        voided_by=header_data.get("voided_by"),
-        void_reason=header_data.get("void_reason"),
-    )
-    db.session.add(archive)
-    db.session.flush()
-
-    for idx, item in enumerate(detail_items):
-        archive_item = ClosingArchiveItem(
-            closing_archive_id=archive.id,
-            match_result_id=safe_int(item.get("匹配结果ID")),
-            po_number=item.get("采购单号") or None,
-            invoice_number=item.get("发票号") or None,
-            vendor_code=item.get("供应商编码") or None,
-            vendor_name=item.get("供应商名称") or None,
-            po_amount=safe_float(item.get("采购金额")),
-            invoice_amount=safe_float(item.get("发票金额")),
-            amount_diff=safe_float(item.get("金额差异")),
-            match_type=item.get("匹配类型") or None,
-            is_exception=(item.get("是否异常") == "是"),
-            exception_type=item.get("异常类型") or None,
-            status=item.get("匹配状态") or None,
-            remarks=item.get("匹配备注") or None,
-            exception_remarks=item.get("异常备注") or None,
-            rule_version=item.get("规则版本") or None,
-            item_order=idx,
-        )
-        db.session.add(archive_item)
-
-    log = AuditLog(
-        batch_id=batch_id,
-        action="ARCHIVE_IMPORT",
-        detail=f"回导结账归档 {archive_number} (#{archive.id})，共 {len(detail_items)} 条明细",
-        operator=operator,
-    )
-    db.session.add(log)
-    db.session.commit()
-    db.session.refresh(archive)
-    return archive
+    return build_archive_from_parsed(batch_id, parsed, operator=operator)
 
 
 def list_archive_audit_logs(batch_id=None, archive_id=None, limit=50):

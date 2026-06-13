@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import hashlib
 from datetime import datetime, timezone
@@ -1423,3 +1425,597 @@ def init_db(app):
         db.init_app(app)
     with app.app_context():
         db.create_all()
+
+
+ARCHIVE_CSV_HEADER_FIELDS = {
+    "归档编号": "archive_number",
+    "批次ID": "batch_id",
+    "状态": "status",
+    "批次状态": "batch_status",
+    "应付总额": "payable_total",
+    "匹配数": "matched_count",
+    "异常数": "exception_count",
+    "未匹配PO数": "unmatched_po_count",
+    "未匹配发票数": "unmatched_invoice_count",
+    "容差比例%": "tolerance_pct",
+    "容差绝对值": "tolerance_abs",
+    "规则版本": "rule_version",
+    "重算说明ID": "recalc_note_id",
+    "重算说明版本": "recalc_note_version",
+    "巡检记录ID": "health_history_id",
+    "巡检规则版本": "health_rule_version",
+    "阻塞问题数": "health_blocker_count",
+    "警告问题数": "health_warning_count",
+    "提示问题数": "health_info_count",
+    "放行包ID": "release_package_id",
+    "放行包状态": "release_package_status",
+    "预演单ID": "rehearsal_slip_id",
+    "预演单状态": "rehearsal_slip_status",
+    "内容哈希": "content_hash",
+    "创建人": "created_by",
+    "创建时间": "created_at",
+    "封存人": "sealed_by",
+    "封存时间": "sealed_at",
+    "作废人": "voided_by",
+    "作废时间": "voided_at",
+    "作废原因": "void_reason",
+    "是否过期": "is_stale",
+    "过期原因": "stale_reason",
+}
+
+ARCHIVE_CSV_DETAIL_FIELDS = [
+    "序号", "匹配结果ID", "采购单号", "发票号", "供应商编码", "供应商名称",
+    "采购金额", "发票金额", "金额差异", "匹配类型", "是否异常", "异常类型",
+    "匹配状态", "规则版本", "匹配备注", "异常备注",
+]
+
+ARCHIVE_CSV_SECTIONS = {
+    "header": "===== 结账归档头段 =====",
+    "detail": "===== 结账归档明细 =====",
+    "batch_summary": "===== 批次摘要快照 =====",
+    "recalc": "===== 重算说明快照 =====",
+    "health": "===== 巡检摘要快照 =====",
+    "release": "===== 放行包快照 =====",
+    "rehearsal": "===== 预演单快照 =====",
+}
+
+
+def _archive_safe_float(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _archive_safe_int(val):
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def can_generate_archive(batch):
+    """判断批次能否生成归档：CONFIRMED 或 POSTED 状态都可以"""
+    return batch.status in (BATCH_STATUS_CONFIRMED, BATCH_STATUS_POSTED, BATCH_STATUS_MATCHED)
+
+
+def collect_archive_related(batch):
+    """收集归档关联对象：最新重算说明、巡检、放行包、预演单"""
+    latest_note = PayableRecalcNote.query.filter_by(batch_id=batch.id).order_by(
+        PayableRecalcNote.created_at.desc()
+    ).first()
+    latest_health = HealthCheckHistory.query.filter_by(batch_id=batch.id).order_by(
+        HealthCheckHistory.created_at.desc()
+    ).first()
+    latest_release = ReleasePackage.query.filter_by(batch_id=batch.id).order_by(
+        ReleasePackage.created_at.desc()
+    ).first()
+    latest_rehearsal = RehearsalSlip.query.filter_by(batch_id=batch.id).order_by(
+        RehearsalSlip.created_at.desc()
+    ).first()
+    return latest_note, latest_health, latest_release, latest_rehearsal
+
+
+def build_archive_snapshots(batch, note, health_history, release_pkg, rehearsal_slip):
+    """统一组装所有归档快照：批次摘要、匹配结果、异常、重算说明、巡检、放行包、预演单"""
+    matched_types = (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)
+    matched_results = [r for r in batch.match_results if r.match_type in matched_types]
+
+    batch_summary = batch.summary
+
+    match_snapshot = []
+    for mr in sorted(matched_results, key=lambda x: x.id or 0):
+        match_snapshot.append({
+            "id": mr.id,
+            "po_id": mr.po_id,
+            "invoice_id": mr.invoice_id,
+            "po_number": mr.po.po_number if mr.po else None,
+            "invoice_number": mr.invoice.invoice_number if mr.invoice else None,
+            "vendor_code": mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
+            "vendor_name": mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
+            "po_amount": mr.po_amount,
+            "invoice_amount": mr.invoice_amount,
+            "amount_diff": mr.amount_diff,
+            "match_type": mr.match_type,
+            "status": mr.status,
+            "is_exception": mr.is_exception,
+            "exception_type": mr.exception_type,
+            "remarks": mr.remarks,
+            "rule_version": mr.rule_version,
+        })
+
+    exception_snapshot = []
+    for exc in sorted(batch.exception_items, key=lambda x: x.id or 0):
+        exception_snapshot.append({
+            "id": exc.id,
+            "match_result_id": exc.match_result_id,
+            "exception_type": exc.exception_type,
+            "status": exc.status,
+            "detail": exc.detail,
+            "remarks": exc.remarks,
+        })
+
+    recalc_snapshot = None
+    if note:
+        recalc_snapshot = {
+            "id": note.id,
+            "version": note.version,
+            "current_total": note.current_total,
+            "previous_total": note.previous_total,
+            "amount_diff": note.amount_diff,
+            "change_source": note.change_source,
+            "change_summary": note.change_summary,
+            "po_numbers": json.loads(note.po_numbers) if note.po_numbers else [],
+            "invoice_numbers": json.loads(note.invoice_numbers) if note.invoice_numbers else [],
+            "rule_version": note.rule_version,
+            "content_hash": note.content_hash,
+        }
+
+    health_snapshot = None
+    if health_history:
+        health_snapshot = {
+            "id": health_history.id,
+            "rule_version": health_history.rule_version,
+            "blocker_count": health_history.blocker_count,
+            "warning_count": health_history.warning_count,
+            "info_count": health_history.info_count,
+            "summary": json.loads(health_history.summary) if health_history.summary else None,
+        }
+
+    release_snapshot = None
+    if release_pkg:
+        release_snapshot = {
+            "id": release_pkg.id,
+            "package_number": release_pkg.package_number,
+            "status": release_pkg.status,
+            "batch_status": release_pkg.batch_status,
+            "payable_total": release_pkg.payable_total,
+            "matched_count": release_pkg.matched_count,
+            "exception_count": release_pkg.exception_count,
+            "tolerance_pct": release_pkg.tolerance_pct,
+            "tolerance_abs": release_pkg.tolerance_abs,
+            "rule_version": release_pkg.rule_version,
+            "recalc_note_id": release_pkg.recalc_note_id,
+            "recalc_note_version": release_pkg.recalc_note_version,
+            "health_history_id": release_pkg.health_history_id,
+            "health_rule_version": release_pkg.health_rule_version,
+            "health_blocker_count": release_pkg.health_blocker_count,
+            "health_warning_count": release_pkg.health_warning_count,
+            "health_info_count": release_pkg.health_info_count,
+            "is_expired": release_pkg.is_expired,
+            "content_hash": release_pkg.content_hash,
+            "created_at": release_pkg.created_at.isoformat() if release_pkg.created_at else None,
+        }
+
+    rehearsal_snapshot = None
+    if rehearsal_slip:
+        rehearsal_snapshot = {
+            "id": rehearsal_slip.id,
+            "slip_number": rehearsal_slip.slip_number,
+            "status": rehearsal_slip.status,
+            "batch_status": rehearsal_slip.batch_status,
+            "payable_total": rehearsal_slip.payable_total,
+            "matched_count": rehearsal_slip.matched_count,
+            "exception_count": rehearsal_slip.exception_count,
+            "tolerance_pct": rehearsal_slip.tolerance_pct,
+            "tolerance_abs": rehearsal_slip.tolerance_abs,
+            "rule_version": rehearsal_slip.rule_version,
+            "recalc_note_id": rehearsal_slip.recalc_note_id,
+            "recalc_note_version": rehearsal_slip.recalc_note_version,
+            "health_history_id": rehearsal_slip.health_history_id,
+            "health_rule_version": rehearsal_slip.health_rule_version,
+            "health_blocker_count": rehearsal_slip.health_blocker_count,
+            "health_warning_count": rehearsal_slip.health_warning_count,
+            "health_info_count": rehearsal_slip.health_info_count,
+            "release_package_id": rehearsal_slip.release_package_id,
+            "release_package_status": rehearsal_slip.release_package_status,
+            "is_stale": rehearsal_slip.is_stale,
+            "content_hash": rehearsal_slip.content_hash,
+            "created_at": rehearsal_slip.created_at.isoformat() if rehearsal_slip.created_at else None,
+        }
+
+    return {
+        "batch_summary": batch_summary,
+        "match_snapshot": match_snapshot,
+        "exception_snapshot": exception_snapshot,
+        "recalc_snapshot": recalc_snapshot,
+        "health_snapshot": health_snapshot,
+        "release_snapshot": release_snapshot,
+        "rehearsal_snapshot": rehearsal_snapshot,
+    }
+
+
+def compute_archive_content_hash(batch, note, health_history, release_pkg, rehearsal_slip):
+    """统一计算归档内容哈希"""
+    parts = []
+    parts.append(f"batch_status:{batch.status}")
+    parts.append(f"batch_updated:{batch.updated_at.isoformat() if batch.updated_at else ''}")
+    parts.append(f"rule_version:{batch.rule_version}")
+    parts.append(f"tolerance_pct:{batch.tolerance_pct}")
+    parts.append(f"tolerance_abs:{batch.tolerance_abs}")
+    summary = batch.summary
+    parts.append(f"matched:{summary['matched_count']}")
+    parts.append(f"exception:{summary['exception_count']}")
+    parts.append(f"payable:{summary['payable_total']}")
+    if note:
+        parts.append(f"note_id:{note.id}")
+        parts.append(f"note_version:{note.version}")
+        parts.append(f"note_hash:{note.content_hash}")
+    if health_history:
+        parts.append(f"health_id:{health_history.id}")
+        parts.append(f"health_version:{health_history.rule_version}")
+    if release_pkg:
+        parts.append(f"release_id:{release_pkg.id}")
+        parts.append(f"release_status:{release_pkg.status}")
+        parts.append(f"release_hash:{release_pkg.content_hash}")
+    if rehearsal_slip:
+        parts.append(f"rehearsal_id:{rehearsal_slip.id}")
+        parts.append(f"rehearsal_status:{rehearsal_slip.status}")
+        parts.append(f"rehearsal_hash:{rehearsal_slip.content_hash}")
+    for mr in sorted(batch.match_results, key=lambda x: x.id or 0):
+        parts.append(
+            f"mr:{mr.id}:{mr.po_id}:{mr.invoice_id}:{mr.match_type}:"
+            f"{mr.status}:{mr.po_amount}:{mr.invoice_amount}:{mr.amount_diff}:"
+            f"{mr.is_exception}:{mr.exception_type or ''}:{mr.remarks or ''}:{mr.rule_version or ''}"
+        )
+    for exc in sorted(batch.exception_items, key=lambda x: x.id or 0):
+        parts.append(
+            f"exc:{exc.id}:{exc.match_result_id}:{exc.exception_type}:{exc.status}:{exc.remarks or ''}"
+        )
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_archive_items(batch, archive_id):
+    """统一构建归档明细项"""
+    exc_map = {}
+    for exc in batch.exception_items:
+        if exc.match_result_id:
+            exc_map[exc.match_result_id] = exc
+
+    matched_types = (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)
+    matched_results = [r for r in batch.match_results if r.match_type in matched_types]
+
+    items = []
+    for idx, mr in enumerate(sorted(matched_results, key=lambda x: x.id or 0)):
+        exc = exc_map.get(mr.id)
+        items.append(ClosingArchiveItem(
+            closing_archive_id=archive_id,
+            match_result_id=mr.id,
+            po_number=mr.po.po_number if mr.po else None,
+            invoice_number=mr.invoice.invoice_number if mr.invoice else None,
+            vendor_code=mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
+            vendor_name=mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
+            po_amount=mr.po_amount,
+            invoice_amount=mr.invoice_amount,
+            amount_diff=mr.amount_diff,
+            match_type=mr.match_type,
+            is_exception=mr.is_exception,
+            exception_type=mr.exception_type,
+            status=mr.status,
+            remarks=mr.remarks,
+            exception_remarks=exc.remarks if exc else None,
+            rule_version=mr.rule_version,
+            item_order=idx,
+        ))
+    return items
+
+
+def _generate_archive_number(batch_id):
+    count = ClosingArchive.query.filter_by(batch_id=batch_id).count()
+    return f"CA-{batch_id}-{count + 1:04d}"
+
+
+def parse_archive_csv(csv_content):
+    """统一解析归档 CSV，返回结构化数据（头段、明细、各快照）"""
+    if isinstance(csv_content, bytes):
+        csv_content = csv_content.decode("utf-8-sig")
+
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+
+    sections = {v: k for k, v in ARCHIVE_CSV_SECTIONS.items()}
+    current_section = None
+
+    header_data = {}
+    detail_items = []
+    detail_headers = None
+    snapshots = {
+        "batch_summary": None,
+        "recalc": None,
+        "health": None,
+        "release": None,
+        "rehearsal": None,
+    }
+
+    for row in rows:
+        if not row or not any(cell.strip() for cell in row):
+            continue
+
+        first = row[0].strip()
+        if first in sections:
+            current_section = sections[first]
+            if current_section in snapshots and snapshots[current_section] is None:
+                snapshots[current_section] = {}
+            continue
+
+        if current_section == "header" and len(row) >= 2:
+            key = row[0].strip()
+            value = row[1].strip() if len(row) > 1 else ""
+            if key in ARCHIVE_CSV_HEADER_FIELDS:
+                header_data[ARCHIVE_CSV_HEADER_FIELDS[key]] = value
+
+        elif current_section == "detail":
+            if detail_headers is None:
+                detail_headers = [h.strip() for h in row]
+                continue
+            item = {}
+            for i, h in enumerate(detail_headers):
+                item[h] = row[i].strip() if i < len(row) else ""
+            detail_items.append(item)
+
+        elif current_section in snapshots and len(row) >= 2:
+            k = row[0].strip()
+            v = row[1].strip() if len(row) > 1 else ""
+            if v.replace(".", "").isdigit() and "." in v:
+                snapshots[current_section][k] = float(v)
+            elif v.lstrip("-").isdigit():
+                snapshots[current_section][k] = int(v)
+            else:
+                snapshots[current_section][k] = v
+
+    return {
+        "header": header_data,
+        "detail_items": detail_items,
+        "detail_headers": detail_headers,
+        "snapshots": snapshots,
+    }
+
+
+def validate_archive_import(batch_id, parsed):
+    """统一校验归档回导：必填字段、跨批次、编号重复、哈希重复、已封存冲突、明细列"""
+    errors = []
+    header = parsed["header"]
+    detail_headers = parsed["detail_headers"]
+
+    required_headers = ["archive_number", "batch_id", "content_hash"]
+    field_map = {v: k for k, v in ARCHIVE_CSV_HEADER_FIELDS.items()}
+    missing_headers = [k for k in required_headers if not header.get(k)]
+    if missing_headers:
+        missing_names = [field_map[k] for k in missing_headers]
+        errors.append(f"CSV 头段缺少必填字段: {', '.join(missing_names)}")
+
+    if detail_headers is not None:
+        missing_cols = [f for f in ARCHIVE_CSV_DETAIL_FIELDS if f not in detail_headers]
+        if missing_cols:
+            errors.append(f"CSV 明细缺少必填列: {', '.join(missing_cols)}")
+    else:
+        errors.append("CSV 缺少明细分段")
+
+    csv_batch_id = None
+    if header.get("batch_id"):
+        try:
+            csv_batch_id = int(header["batch_id"])
+        except (ValueError, TypeError):
+            errors.append(f"批次ID格式错误: {header['batch_id']}")
+
+    if csv_batch_id is not None and csv_batch_id != batch_id:
+        errors.append(f"跨批次回导被拒绝：CSV 属于批次 #{csv_batch_id}，当前批次为 #{batch_id}")
+
+    archive_number = header.get("archive_number")
+    if archive_number:
+        existing_by_number = ClosingArchive.query.filter_by(archive_number=archive_number).first()
+        if existing_by_number:
+            errors.append(f"归档编号重复：{archive_number} 已存在 (#{existing_by_number.id})")
+
+    content_hash = header.get("content_hash")
+    if content_hash:
+        existing_by_hash = ClosingArchive.query.filter_by(
+            batch_id=batch_id, content_hash=content_hash,
+        ).first()
+        if existing_by_hash:
+            errors.append(
+                f"内容哈希重复：哈希 {content_hash[:12]} 已存在于归档 {existing_by_hash.archive_number}"
+            )
+
+    existing_sealed = ClosingArchive.query.filter_by(
+        batch_id=batch_id, status=ARCHIVE_STATUS_SEALED,
+    ).first()
+    if existing_sealed:
+        errors.append(
+            f"已封存冲突：批次 #{batch_id} 存在已封存归档 {existing_sealed.archive_number}，不允许回导"
+        )
+
+    if not parsed["detail_items"]:
+        errors.append("CSV 没有明细数据")
+
+    return errors
+
+
+def build_archive_from_parsed(batch_id, parsed, operator="system"):
+    """从 CSV 解析结果构建归档对象和明细，写入 DB 并记录审计日志"""
+    header = parsed["header"]
+    detail_items = parsed["detail_items"]
+    snapshots = parsed["snapshots"]
+
+    archive_number = header["archive_number"]
+    content_hash = header["content_hash"]
+
+    recalc_snapshot = snapshots.get("recalc")
+    health_snapshot = snapshots.get("health")
+    release_snapshot = snapshots.get("release")
+    rehearsal_snapshot = snapshots.get("rehearsal")
+    batch_summary_snapshot = snapshots.get("batch_summary")
+
+    archive = ClosingArchive(
+        batch_id=batch_id,
+        archive_number=archive_number,
+        status=header.get("status", ARCHIVE_STATUS_ACTIVE),
+        batch_status=header.get("batch_status"),
+        payable_total=_archive_safe_float(header.get("payable_total")),
+        matched_count=_archive_safe_int(header.get("matched_count")) or 0,
+        exception_count=_archive_safe_int(header.get("exception_count")) or 0,
+        unmatched_po_count=_archive_safe_int(header.get("unmatched_po_count")) or 0,
+        unmatched_invoice_count=_archive_safe_int(header.get("unmatched_invoice_count")) or 0,
+        tolerance_pct=_archive_safe_float(header.get("tolerance_pct")),
+        tolerance_abs=_archive_safe_float(header.get("tolerance_abs")),
+        rule_version=header.get("rule_version"),
+        recalc_note_id=_archive_safe_int(header.get("recalc_note_id")),
+        recalc_note_version=_archive_safe_int(header.get("recalc_note_version")),
+        recalc_note_summary=json.dumps(recalc_snapshot, ensure_ascii=False) if recalc_snapshot else None,
+        health_history_id=_archive_safe_int(header.get("health_history_id")),
+        health_rule_version=header.get("health_rule_version"),
+        health_summary=json.dumps(health_snapshot, ensure_ascii=False) if health_snapshot else None,
+        health_blocker_count=_archive_safe_int(header.get("health_blocker_count")) or 0,
+        health_warning_count=_archive_safe_int(header.get("health_warning_count")) or 0,
+        health_info_count=_archive_safe_int(header.get("health_info_count")) or 0,
+        release_package_id=_archive_safe_int(header.get("release_package_id")),
+        release_package_status=header.get("release_package_status"),
+        release_package_snapshot=json.dumps(release_snapshot, ensure_ascii=False) if release_snapshot else None,
+        rehearsal_slip_id=_archive_safe_int(header.get("rehearsal_slip_id")),
+        rehearsal_slip_status=header.get("rehearsal_slip_status"),
+        rehearsal_slip_snapshot=json.dumps(rehearsal_snapshot, ensure_ascii=False) if rehearsal_snapshot else None,
+        batch_summary_snapshot=json.dumps(batch_summary_snapshot, ensure_ascii=False) if batch_summary_snapshot else None,
+        match_results_snapshot=json.dumps([], ensure_ascii=False),
+        exceptions_snapshot=json.dumps([], ensure_ascii=False),
+        recalc_notes_snapshot=json.dumps(recalc_snapshot, ensure_ascii=False) if recalc_snapshot else None,
+        content_hash=content_hash,
+        is_stale=(header.get("is_stale") == "是"),
+        stale_reason=header.get("stale_reason"),
+        created_by=header.get("created_by", operator),
+        sealed_by=header.get("sealed_by"),
+        voided_by=header.get("voided_by"),
+        void_reason=header.get("void_reason"),
+    )
+    db.session.add(archive)
+    db.session.flush()
+
+    for idx, item in enumerate(detail_items):
+        archive_item = ClosingArchiveItem(
+            closing_archive_id=archive.id,
+            match_result_id=_archive_safe_int(item.get("匹配结果ID")),
+            po_number=item.get("采购单号") or None,
+            invoice_number=item.get("发票号") or None,
+            vendor_code=item.get("供应商编码") or None,
+            vendor_name=item.get("供应商名称") or None,
+            po_amount=_archive_safe_float(item.get("采购金额")),
+            invoice_amount=_archive_safe_float(item.get("发票金额")),
+            amount_diff=_archive_safe_float(item.get("金额差异")),
+            match_type=item.get("匹配类型") or None,
+            is_exception=(item.get("是否异常") == "是"),
+            exception_type=item.get("异常类型") or None,
+            status=item.get("匹配状态") or None,
+            remarks=item.get("匹配备注") or None,
+            exception_remarks=item.get("异常备注") or None,
+            rule_version=item.get("规则版本") or None,
+            item_order=idx,
+        )
+        db.session.add(archive_item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="ARCHIVE_IMPORT",
+        detail=f"回导结账归档 {archive_number} (#{archive.id})，共 {len(detail_items)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    db.session.refresh(archive)
+    return archive
+
+
+def export_archive_to_csv(archive):
+    """统一导出归档为 CSV 字符串"""
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([ARCHIVE_CSV_SECTIONS["header"]])
+    header_data = archive.to_dict()
+    header_data["created_at"] = header_data["created_at"] if header_data["created_at"] else ""
+    header_data["sealed_at"] = header_data["sealed_at"] if header_data["sealed_at"] else ""
+    header_data["voided_at"] = header_data["voided_at"] if header_data["voided_at"] else ""
+    header_data["is_stale"] = "是" if header_data["is_stale"] else "否"
+
+    for label, key in ARCHIVE_CSV_HEADER_FIELDS.items():
+        value = header_data.get(key, "")
+        writer.writerow([label, value])
+
+    writer.writerow([])
+    writer.writerow([ARCHIVE_CSV_SECTIONS["detail"]])
+    writer.writerow(ARCHIVE_CSV_DETAIL_FIELDS)
+
+    for idx, item in enumerate(sorted(archive.items, key=lambda x: x.item_order)):
+        writer.writerow([
+            idx + 1,
+            item.match_result_id or "",
+            item.po_number or "",
+            item.invoice_number or "",
+            item.vendor_code or "",
+            item.vendor_name or "",
+            item.po_amount if item.po_amount is not None else "",
+            item.invoice_amount if item.invoice_amount is not None else "",
+            item.amount_diff if item.amount_diff is not None else "",
+            item.match_type or "",
+            "是" if item.is_exception else "否",
+            item.exception_type or "",
+            item.status or "",
+            item.rule_version or "",
+            item.remarks or "",
+            item.exception_remarks or "",
+        ])
+
+    snapshot_sections = [
+        ("batch_summary", "批次摘要快照"),
+        ("recalc", "重算说明快照"),
+        ("health", "巡检摘要快照"),
+        ("release", "放行包快照"),
+        ("rehearsal", "预演单快照"),
+    ]
+    snapshot_attrs = {
+        "batch_summary": "batch_summary_snapshot",
+        "recalc": "recalc_note_summary",
+        "health": "health_summary",
+        "release": "release_package_snapshot",
+        "rehearsal": "rehearsal_slip_snapshot",
+    }
+    for key, label in snapshot_sections:
+        writer.writerow([])
+        writer.writerow([f"===== {label} ====="])
+        attr = snapshot_attrs[key]
+        raw = getattr(archive, attr, None)
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, (dict, list)):
+                        writer.writerow([k, json.dumps(v, ensure_ascii=False)])
+                    else:
+                        writer.writerow([k, v])
+
+    content = output.getvalue()
+    output.close()
+    return content, f"{archive.archive_number}.csv"
