@@ -28,6 +28,10 @@ from matcher import (
     get_health_rules, update_health_rules, run_health_check,
     list_health_history, get_health_history_detail,
     export_health_check_csv, import_health_remarks,
+    create_handover_list, get_handover_list, list_handover_lists,
+    get_handover_items, refresh_handover_list, complete_handover_list,
+    void_handover_list, export_handover_csv, import_handover_csv,
+    list_handover_audit_logs, get_handover_list_by_number,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
@@ -988,6 +992,156 @@ def import_health_remarks_api(batch_id):
         return jsonify({"error": str(e), "details": e.details}), 400
     except UnicodeDecodeError:
         return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
+
+
+@bp.route("/api/handover-lists", methods=["GET"])
+def list_all_handover_lists():
+    status = request.args.get("status")
+    batch_id = request.args.get("batch_id")
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            return jsonify({"error": "batch_id 必须是整数"}), 400
+    lists = list_handover_lists(batch_id=batch_id, status=status)
+    return jsonify({"handover_lists": [h.to_dict() for h in lists]})
+
+
+@bp.route("/api/batches/<int:batch_id>/handover-lists", methods=["GET"])
+def list_batch_handover_lists(batch_id):
+    Batch.query.get_or_404(batch_id)
+    status = request.args.get("status")
+    lists = list_handover_lists(batch_id=batch_id, status=status)
+    return jsonify({"handover_lists": [h.to_dict() for h in lists]})
+
+
+@bp.route("/api/batches/<int:batch_id>/handover-lists", methods=["POST"])
+def create_batch_handover_list(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    pending_remarks = payload.get("pending_remarks", "")
+    operator = payload.get("operator", "web_user")
+    try:
+        handover = create_handover_list(batch_id, pending_remarks=pending_remarks, operator=operator)
+        return jsonify(handover.to_dict()), 201
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/handover-lists/<int:handover_id>", methods=["GET"])
+def get_handover_list_api(handover_id):
+    handover = get_handover_list(handover_id)
+    if handover is None:
+        return jsonify({"error": "交接清单不存在"}), 404
+    resp = handover.to_dict()
+    resp["items"] = [i.to_dict() for i in get_handover_items(handover_id)]
+    return jsonify(resp)
+
+
+@bp.route("/api/handover-lists/<int:handover_id>/refresh", methods=["POST"])
+def refresh_handover_list_api(handover_id):
+    handover = get_handover_list(handover_id)
+    if handover is None:
+        return jsonify({"error": "交接清单不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    operator = payload.get("operator", "web_user")
+    try:
+        updated, is_changed = refresh_handover_list(handover_id, operator=operator)
+        resp = updated.to_dict()
+        resp["is_changed"] = is_changed
+        return jsonify(resp)
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/handover-lists/<int:handover_id>/complete", methods=["POST"])
+def complete_handover_list_api(handover_id):
+    handover = get_handover_list(handover_id)
+    if handover is None:
+        return jsonify({"error": "交接清单不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = complete_handover_list(handover_id, role=role, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 403
+
+
+@bp.route("/api/handover-lists/<int:handover_id>/void", methods=["POST"])
+def void_handover_list_api(handover_id):
+    handover = get_handover_list(handover_id)
+    if handover is None:
+        return jsonify({"error": "交接清单不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason", "")
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = void_handover_list(handover_id, reason=reason, role=role, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 403
+
+
+@bp.route("/api/handover-lists/<int:handover_id>/export", methods=["GET"])
+def export_handover_list_csv(handover_id):
+    handover = get_handover_list(handover_id)
+    if handover is None:
+        return jsonify({"error": "交接清单不存在"}), 404
+    try:
+        csv_content = export_handover_csv(handover_id)
+        filename = f"handover_{handover.list_number}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        handover.export_filename = filename
+        db.session.commit()
+        return send_file(
+            io.BytesIO(csv_content.encode("utf-8-sig")),
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/handover-lists/import", methods=["POST"])
+def import_handover_list_csv(batch_id):
+    Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    operator = request.form.get("operator", "web_user")
+    try:
+        content = f.read().decode("utf-8-sig")
+        handover = import_handover_csv(batch_id, content, operator=operator)
+        return jsonify(handover.to_dict()), 201
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+    except UnicodeDecodeError:
+        return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
+
+
+@bp.route("/api/handover-lists/audit-logs", methods=["GET"])
+def list_handover_audit_logs_api():
+    batch_id = request.args.get("batch_id")
+    handover_id = request.args.get("handover_id")
+    limit = int(request.args.get("limit", 50))
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            batch_id = None
+    if handover_id:
+        try:
+            handover_id = int(handover_id)
+        except ValueError:
+            handover_id = None
+    logs = list_handover_audit_logs(batch_id=batch_id, handover_id=handover_id, limit=limit)
+    return jsonify({"audit_logs": [l.to_dict() for l in logs]})
 
 
 app = create_app()

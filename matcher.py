@@ -8,6 +8,7 @@ from models import (
     ToleranceHistory, AuditLog, PayableRecalcNote, NoteComparison,
     ImportDraft, ImportDraftIssue, ImportPlan, PlanSnapshot,
     HealthCheckRule, HealthCheckHistory, HealthCheckResult,
+    HandoverList, HandoverListItem,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
@@ -28,7 +29,11 @@ from models import (
     HEALTH_RULE_MISSING_COLUMNS, HEALTH_RULE_NEGATIVE_AMOUNT,
     HEALTH_RULE_VENDOR_MISMATCH, HEALTH_RULE_CONFIRMED_OVERRIDE_RISK,
     DEFAULT_HEALTH_RULES,
+    HANDOVER_STATUS_DRAFT, HANDOVER_STATUS_COMPLETED, HANDOVER_STATUS_VOID,
+    HANDOVER_PERMISSION_COMPLETE, HANDOVER_PERMISSION_VOID,
+    HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD,
     compute_rule_version, compute_note_content_hash, compute_health_rule_version,
+    compute_handover_content_hash,
 )
 
 PO_REQUIRED_COLUMNS = ["po_number", "vendor_code", "vendor_name", "amount", "po_date"]
@@ -2906,3 +2911,520 @@ def import_health_remarks(batch_id, csv_content, operator="system"):
         "rule_version_match": csv_rule_version == current_version if csv_rule_version else None,
         "history_id": history_id,
     }
+
+
+def _generate_handover_list_number(batch_id):
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y%m%d")
+    prefix = f"HO-{batch_id:04d}-{date_str}-"
+    latest = HandoverList.query.filter(
+        HandoverList.list_number.like(prefix + "%")
+    ).order_by(HandoverList.id.desc()).first()
+    seq = 1
+    if latest:
+        try:
+            seq = int(latest.list_number.split("-")[-1]) + 1
+        except (ValueError, IndexError):
+            seq = 1
+    return f"{prefix}{seq:04d}"
+
+
+def _get_latest_confirmed_plan(batch_id):
+    from models import PLAN_STATUS_CONFIRMED
+    plan = ImportPlan.query.filter_by(
+        batch_id=batch_id, status=PLAN_STATUS_CONFIRMED,
+    ).order_by(ImportPlan.confirmed_at.desc()).first()
+    if plan:
+        ps = json.loads(plan.plan_summary) if plan.plan_summary else {}
+        return {
+            "plan_id": plan.id,
+            "status": plan.status,
+            "confirmed_by": plan.confirmed_by,
+            "confirmed_at": plan.confirmed_at.isoformat() if plan.confirmed_at else None,
+            "summary": ps,
+        }
+    return None
+
+
+def _get_latest_health_summary(batch_id):
+    history = HealthCheckHistory.query.filter_by(
+        batch_id=batch_id,
+    ).order_by(HealthCheckHistory.created_at.desc()).first()
+    if history:
+        return {
+            "history_id": history.id,
+            "rule_version": history.rule_version,
+            "operator": history.operator,
+            "blocker_count": history.blocker_count,
+            "warning_count": history.warning_count,
+            "info_count": history.info_count,
+            "summary": json.loads(history.summary) if history.summary else None,
+            "created_at": history.created_at.isoformat() if history.created_at else None,
+        }, history.id
+    return None, None
+
+
+def create_handover_list(batch_id, pending_remarks="", operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+
+    content_hash = compute_handover_content_hash(batch)
+
+    list_number = _generate_handover_list_number(batch_id)
+
+    summary = batch.summary
+
+    latest_plan = _get_latest_confirmed_plan(batch_id)
+    latest_health, latest_health_id = _get_latest_health_summary(batch_id)
+
+    handover = HandoverList(
+        batch_id=batch_id,
+        list_number=list_number,
+        status=HANDOVER_STATUS_DRAFT,
+        batch_status=batch.status,
+        payable_total=summary["payable_total"],
+        matched_count=summary["matched_count"],
+        exception_count=summary["exception_count"],
+        unmatched_po_count=summary["unmatched_po_count"],
+        unmatched_invoice_count=summary["unmatched_invoice_count"],
+        latest_import_plan=json.dumps(latest_plan, ensure_ascii=False) if latest_plan else None,
+        latest_health_summary=json.dumps(latest_health, ensure_ascii=False) if latest_health else None,
+        latest_health_history_id=latest_health_id,
+        export_filename=None,
+        pending_remarks=pending_remarks,
+        batch_updated_at=batch.updated_at,
+        content_hash=content_hash,
+        created_by=operator,
+    )
+    db.session.add(handover)
+    db.session.flush()
+
+    results = MatchResult.query.filter_by(batch_id=batch_id).order_by(MatchResult.id).all()
+    for idx, mr in enumerate(results):
+        exc_remark = ""
+        for e in batch.exception_items:
+            if e.match_result_id == mr.id and e.remarks:
+                exc_remark = e.remarks
+                break
+        item = HandoverListItem(
+            handover_list_id=handover.id,
+            match_result_id=mr.id,
+            po_number=mr.po.po_number if mr.po else None,
+            invoice_number=mr.invoice.invoice_number if mr.invoice else None,
+            vendor_code=mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
+            vendor_name=mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
+            po_amount=mr.po_amount,
+            invoice_amount=mr.invoice_amount,
+            amount_diff=mr.amount_diff,
+            match_type=mr.match_type,
+            is_exception=mr.is_exception,
+            exception_type=mr.exception_type,
+            status=mr.status,
+            remarks=exc_remark if exc_remark else (mr.remarks or ""),
+            rule_version=mr.rule_version,
+            item_order=idx,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="HANDOVER_CREATE",
+        detail=f"创建对账交接清单 #{handover.id} ({list_number})，共 {len(results)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return handover
+
+
+def get_handover_list(handover_id):
+    return HandoverList.query.get(handover_id)
+
+
+def get_handover_list_by_number(list_number):
+    return HandoverList.query.filter_by(list_number=list_number).first()
+
+
+def list_handover_lists(batch_id=None, status=None):
+    query = HandoverList.query
+    if batch_id is not None:
+        query = query.filter_by(batch_id=batch_id)
+    if status:
+        query = query.filter_by(status=status)
+    return query.order_by(HandoverList.created_at.desc()).all()
+
+
+def get_handover_items(handover_id):
+    return HandoverListItem.query.filter_by(
+        handover_list_id=handover_id
+    ).order_by(HandoverListItem.item_order).all()
+
+
+def refresh_handover_list(handover_id, operator="system"):
+    handover = HandoverList.query.get(handover_id)
+    if not handover:
+        raise ValidationError(["handover list not found"])
+    if handover.status != HANDOVER_STATUS_DRAFT:
+        raise ValidationError([f"只有草稿状态的清单可以刷新，当前状态: {handover.status}"])
+
+    batch = Batch.query.get(handover.batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+
+    content_hash = compute_handover_content_hash(batch)
+
+    if content_hash == handover.content_hash:
+        return handover, False
+
+    summary = batch.summary
+    latest_plan = _get_latest_confirmed_plan(handover.batch_id)
+    latest_health, latest_health_id = _get_latest_health_summary(handover.batch_id)
+
+    handover.batch_status = batch.status
+    handover.payable_total = summary["payable_total"]
+    handover.matched_count = summary["matched_count"]
+    handover.exception_count = summary["exception_count"]
+    handover.unmatched_po_count = summary["unmatched_po_count"]
+    handover.unmatched_invoice_count = summary["unmatched_invoice_count"]
+    handover.latest_import_plan = json.dumps(latest_plan, ensure_ascii=False) if latest_plan else None
+    handover.latest_health_summary = json.dumps(latest_health, ensure_ascii=False) if latest_health else None
+    handover.latest_health_history_id = latest_health_id
+    handover.batch_updated_at = batch.updated_at
+    handover.content_hash = content_hash
+
+    HandoverListItem.query.filter_by(handover_list_id=handover_id).delete()
+
+    results = MatchResult.query.filter_by(batch_id=handover.batch_id).order_by(MatchResult.id).all()
+    for idx, mr in enumerate(results):
+        exc_remark = ""
+        for e in batch.exception_items:
+            if e.match_result_id == mr.id and e.remarks:
+                exc_remark = e.remarks
+                break
+        item = HandoverListItem(
+            handover_list_id=handover.id,
+            match_result_id=mr.id,
+            po_number=mr.po.po_number if mr.po else None,
+            invoice_number=mr.invoice.invoice_number if mr.invoice else None,
+            vendor_code=mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
+            vendor_name=mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
+            po_amount=mr.po_amount,
+            invoice_amount=mr.invoice_amount,
+            amount_diff=mr.amount_diff,
+            match_type=mr.match_type,
+            is_exception=mr.is_exception,
+            exception_type=mr.exception_type,
+            status=mr.status,
+            remarks=exc_remark if exc_remark else (mr.remarks or ""),
+            rule_version=mr.rule_version,
+            item_order=idx,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=handover.batch_id,
+        action="HANDOVER_REFRESH",
+        detail=f"刷新对账交接清单 #{handover.id} ({handover.list_number})，更新为 {len(results)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return handover, True
+
+
+def complete_handover_list(handover_id, role="viewer", operator="system"):
+    handover = HandoverList.query.get(handover_id)
+    if not handover:
+        raise ValidationError(["handover list not found"])
+
+    if role not in HANDOVER_PERMISSION_COMPLETE:
+        log = AuditLog(
+            batch_id=handover.batch_id,
+            action="HANDOVER_COMPLETE_DENIED",
+            detail=f"用户 {operator} (角色 {role}) 无权限完成对账交接清单 #{handover.id}",
+            operator=operator,
+        )
+        db.session.add(log)
+        db.session.commit()
+        raise ValidationError([f"权限不足：只有 {HANDOVER_PERMISSION_COMPLETE} 角色可以完成清单，当前角色: {role}"])
+
+    if not handover.can_transition(HANDOVER_STATUS_COMPLETED):
+        raise ValidationError([f"清单状态 '{handover.status}' 不允许完成操作"])
+
+    current_hash = compute_handover_content_hash(Batch.query.get(handover.batch_id))
+    if current_hash != handover.content_hash:
+        log = AuditLog(
+            batch_id=handover.batch_id,
+            action="HANDOVER_COMPLETE_DENIED",
+            detail=f"批次已变更，清单 #{handover.id} 未刷新，完成操作被拒绝",
+            operator=operator,
+        )
+        db.session.add(log)
+        db.session.commit()
+        raise ValidationError(["批次数据已变更，请先刷新清单后再完成"])
+
+    handover.status = HANDOVER_STATUS_COMPLETED
+    handover.completed_by = operator
+    handover.completed_at = datetime.now(timezone.utc)
+
+    log = AuditLog(
+        batch_id=handover.batch_id,
+        action="HANDOVER_COMPLETE",
+        detail=f"完成对账交接清单 #{handover.id} ({handover.list_number})",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return handover
+
+
+def void_handover_list(handover_id, reason="", role="viewer", operator="system"):
+    handover = HandoverList.query.get(handover_id)
+    if not handover:
+        raise ValidationError(["handover list not found"])
+
+    if role not in HANDOVER_PERMISSION_VOID:
+        log = AuditLog(
+            batch_id=handover.batch_id,
+            action="HANDOVER_VOID_DENIED",
+            detail=f"用户 {operator} (角色 {role}) 无权限作废对账交接清单 #{handover.id}",
+            operator=operator,
+        )
+        db.session.add(log)
+        db.session.commit()
+        raise ValidationError([f"权限不足：只有 {HANDOVER_PERMISSION_VOID} 角色可以作废清单，当前角色: {role}"])
+
+    if not handover.can_transition(HANDOVER_STATUS_VOID):
+        raise ValidationError([f"清单状态 '{handover.status}' 不允许作废操作"])
+
+    handover.status = HANDOVER_STATUS_VOID
+    handover.voided_by = operator
+    handover.voided_at = datetime.now(timezone.utc)
+    handover.void_reason = reason
+
+    log = AuditLog(
+        batch_id=handover.batch_id,
+        action="HANDOVER_VOID",
+        detail=f"作废对账交接清单 #{handover.id} ({handover.list_number})，原因: {reason}",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return handover
+
+
+def export_handover_csv(handover_id):
+    handover = HandoverList.query.get(handover_id)
+    if not handover:
+        raise ValidationError(["handover list not found"])
+
+    items = get_handover_items(handover_id)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(["=== 对账交接清单头 ==="])
+    writer.writerow(["清单编号", handover.list_number])
+    writer.writerow(["清单状态", handover.status])
+    writer.writerow(["批次ID", handover.batch_id])
+    writer.writerow(["批次状态", handover.batch_status])
+    writer.writerow(["应付合计", handover.payable_total])
+    writer.writerow(["匹配成功数", handover.matched_count])
+    writer.writerow(["异常数量", handover.exception_count])
+    writer.writerow(["未匹配采购单数", handover.unmatched_po_count])
+    writer.writerow(["未匹配发票数", handover.unmatched_invoice_count])
+
+    if handover.latest_import_plan:
+        plan = json.loads(handover.latest_import_plan)
+        writer.writerow(["最近导入方案ID", plan.get("plan_id", "")])
+        writer.writerow(["最近导入方案确认人", plan.get("confirmed_by", "")])
+        writer.writerow(["最近导入方案确认时间", plan.get("confirmed_at", "")])
+
+    if handover.latest_health_summary:
+        health = json.loads(handover.latest_health_summary)
+        writer.writerow(["最近巡检ID", health.get("history_id", "")])
+        writer.writerow(["最近巡检摘要", f"阻断:{health.get('blocker_count',0)} 警告:{health.get('warning_count',0)} 信息:{health.get('info_count',0)}"])
+
+    writer.writerow(["导出文件名", handover.export_filename or ""])
+    writer.writerow(["待处理备注", handover.pending_remarks or ""])
+    writer.writerow(["批次更新时间", handover.batch_updated_at.isoformat() if handover.batch_updated_at else ""])
+    writer.writerow(["内容哈希", handover.content_hash])
+    writer.writerow(["创建人", handover.created_by])
+    writer.writerow(["创建时间", handover.created_at.isoformat() if handover.created_at else ""])
+    writer.writerow(["完成人", handover.completed_by or ""])
+    writer.writerow(["完成时间", handover.completed_at.isoformat() if handover.completed_at else ""])
+    writer.writerow(["作废人", handover.voided_by or ""])
+    writer.writerow(["作废时间", handover.voided_at.isoformat() if handover.voided_at else ""])
+    writer.writerow(["作废原因", handover.void_reason or ""])
+    writer.writerow([])
+
+    writer.writerow(["=== 对账交接清单明细 ==="])
+    writer.writerow([
+        "序号", "匹配结果ID", "采购单号", "发票号", "供应商编码", "供应商名称",
+        "采购金额", "发票金额", "金额差异", "匹配类型", "是否异常",
+        "异常类型", "匹配状态", "规则版本", "备注",
+    ])
+    for idx, item in enumerate(items, 1):
+        writer.writerow([
+            idx,
+            item.match_result_id or "",
+            item.po_number or "",
+            item.invoice_number or "",
+            item.vendor_code or "",
+            item.vendor_name or "",
+            f"{item.po_amount:.2f}" if item.po_amount is not None else "",
+            f"{item.invoice_amount:.2f}" if item.invoice_amount is not None else "",
+            f"{item.amount_diff:.2f}" if item.amount_diff is not None else "",
+            item.match_type or "",
+            "是" if item.is_exception else "否",
+            item.exception_type or "",
+            item.status or "",
+            item.rule_version or "",
+            item.remarks or "",
+        ])
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def import_handover_csv(batch_id, csv_content, operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["batch not found"])
+
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+    if not rows:
+        raise ValidationError(["empty CSV file"])
+
+    header_data = {}
+    detail_start = -1
+    list_number = None
+
+    for i, row in enumerate(rows):
+        if len(row) >= 1 and row[0] == "=== 对账交接清单头 ===":
+            continue
+        if len(row) >= 1 and row[0] == "=== 对账交接清单明细 ===":
+            detail_start = i
+            break
+        if len(row) >= 2 and not row[0].startswith("===") and row[0] != "":
+            key = row[0].strip()
+            val = row[1].strip() if len(row) > 1 else ""
+            header_data[key] = val
+            if key == "清单编号":
+                list_number = val
+
+    if not list_number:
+        raise ValidationError(["CSV 格式错误，缺少清单编号"])
+
+    existing = get_handover_list_by_number(list_number)
+    if existing:
+        log = AuditLog(
+            batch_id=batch_id,
+            action="HANDOVER_IMPORT_DENIED",
+            detail=f"重复回导被拒绝：清单编号 {list_number} 已存在（#{existing.id}）",
+            operator=operator,
+        )
+        db.session.add(log)
+        db.session.commit()
+        raise ValidationError([f"清单编号 {list_number} 已存在，禁止重复回导"])
+
+    content_hash = header_data.get("内容哈希", "")
+    current_hash = compute_handover_content_hash(batch)
+
+    if content_hash != current_hash:
+        log = AuditLog(
+            batch_id=batch_id,
+            action="HANDOVER_IMPORT_DENIED",
+            detail=f"批次已变更，回导被拒绝：清单 {list_number} 哈希不匹配",
+            operator=operator,
+        )
+        db.session.add(log)
+        db.session.commit()
+        raise ValidationError(["批次数据已变更，与清单快照不一致，禁止回导。请先确认批次数据与清单导出时一致。"])
+
+    if detail_start < 0:
+        raise ValidationError(["CSV 格式错误，缺少明细段"])
+
+    detail_items = []
+    for i in range(detail_start + 2, len(rows)):
+        row = rows[i]
+        if not row or (len(row) >= 1 and row[0].startswith("===")):
+            break
+        if len(row) < 2:
+            continue
+        detail_items.append(row)
+
+    handover = HandoverList(
+        batch_id=batch_id,
+        list_number=list_number,
+        status=HANDOVER_STATUS_DRAFT,
+        batch_status=header_data.get("批次状态", ""),
+        payable_total=float(header_data.get("应付合计", 0)) if header_data.get("应付合计", "") else 0.0,
+        matched_count=int(header_data.get("匹配成功数", 0)) if header_data.get("匹配成功数", "") else 0,
+        exception_count=int(header_data.get("异常数量", 0)) if header_data.get("异常数量", "") else 0,
+        unmatched_po_count=int(header_data.get("未匹配采购单数", 0)) if header_data.get("未匹配采购单数", "") else 0,
+        unmatched_invoice_count=int(header_data.get("未匹配发票数", 0)) if header_data.get("未匹配发票数", "") else 0,
+        export_filename=header_data.get("导出文件名", "") or None,
+        pending_remarks=header_data.get("待处理备注", "") or None,
+        content_hash=content_hash,
+        created_by=header_data.get("创建人", operator) or operator,
+    )
+    db.session.add(handover)
+    db.session.flush()
+
+    for idx, row in enumerate(detail_items):
+        def safe_get(arr, i, default=""):
+            return arr[i].strip() if i < len(arr) else default
+
+        is_exception = safe_get(row, 10) == "是"
+        po_amount = safe_get(row, 6)
+        inv_amount = safe_get(row, 7)
+        amt_diff = safe_get(row, 8)
+
+        item = HandoverListItem(
+            handover_list_id=handover.id,
+            match_result_id=int(safe_get(row, 1)) if safe_get(row, 1).isdigit() else None,
+            po_number=safe_get(row, 2) or None,
+            invoice_number=safe_get(row, 3) or None,
+            vendor_code=safe_get(row, 4) or None,
+            vendor_name=safe_get(row, 5) or None,
+            po_amount=float(po_amount) if po_amount else None,
+            invoice_amount=float(inv_amount) if inv_amount else None,
+            amount_diff=float(amt_diff) if amt_diff else None,
+            match_type=safe_get(row, 9) or None,
+            is_exception=is_exception,
+            exception_type=safe_get(row, 11) or None,
+            status=safe_get(row, 12) or None,
+            rule_version=safe_get(row, 13) or None,
+            remarks=safe_get(row, 14) or None,
+            item_order=idx,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="HANDOVER_IMPORT",
+        detail=f"回导对账交接清单 {list_number} (#{handover.id})，共 {len(detail_items)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    return handover
+
+
+def list_handover_audit_logs(batch_id=None, handover_id=None, limit=50):
+    query = AuditLog.query
+    if batch_id is not None:
+        query = query.filter_by(batch_id=batch_id)
+    action_filter = "HANDOVER_"
+    query = query.filter(AuditLog.action.like(action_filter + "%"))
+    if handover_id is not None:
+        query = query.filter(AuditLog.detail.like(f"%#{handover_id}%"))
+    return query.order_by(AuditLog.created_at.desc()).limit(limit).all()

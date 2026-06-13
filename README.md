@@ -516,7 +516,7 @@ python -m pytest tests/ -v
 #   test_export_csv_includes_review_summary      CSV 汇总含复核摘要
 ```
 
-### 方案 C：requests 端到端（需先起服务）
+### 方案 D：requests 端到端（需先起服务，含健康巡检链路）
 
 ```bash
 # 终端 1

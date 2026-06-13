@@ -76,6 +76,24 @@ HEALTH_SEVERITY_BLOCKER = "BLOCKER"
 HEALTH_SEVERITY_WARNING = "WARNING"
 HEALTH_SEVERITY_INFO = "INFO"
 
+HANDOVER_STATUS_DRAFT = "DRAFT"
+HANDOVER_STATUS_COMPLETED = "COMPLETED"
+HANDOVER_STATUS_VOID = "VOID"
+
+HANDOVER_ALLOWED_TRANSITIONS = {
+    HANDOVER_STATUS_DRAFT: [HANDOVER_STATUS_COMPLETED, HANDOVER_STATUS_VOID],
+    HANDOVER_STATUS_COMPLETED: [],
+    HANDOVER_STATUS_VOID: [],
+}
+
+HANDOVER_ROLE_ADMIN = "admin"
+HANDOVER_ROLE_FINANCE_LEAD = "finance_lead"
+HANDOVER_ROLE_FINANCE = "finance"
+HANDOVER_ROLE_VIEWER = "viewer"
+
+HANDOVER_PERMISSION_COMPLETE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
+HANDOVER_PERMISSION_VOID = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
+
 HEALTH_RULE_DUPLICATE_PO = "duplicate_po_number"
 HEALTH_RULE_DUPLICATE_INVOICE = "duplicate_invoice_number"
 HEALTH_RULE_MISSING_COLUMNS = "missing_required_columns"
@@ -672,6 +690,133 @@ class HealthCheckResult(db.Model):
             "row_id": self.row_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class HandoverList(db.Model):
+    __tablename__ = "handover_lists"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    list_number = db.Column(db.String(100), nullable=False, unique=True)
+    status = db.Column(db.String(20), nullable=False, default=HANDOVER_STATUS_DRAFT)
+    batch_status = db.Column(db.String(30))
+    payable_total = db.Column(db.Float, default=0.0)
+    matched_count = db.Column(db.Integer, default=0)
+    exception_count = db.Column(db.Integer, default=0)
+    unmatched_po_count = db.Column(db.Integer, default=0)
+    unmatched_invoice_count = db.Column(db.Integer, default=0)
+    latest_import_plan = db.Column(db.Text)
+    latest_health_summary = db.Column(db.Text)
+    latest_health_history_id = db.Column(db.Integer)
+    export_filename = db.Column(db.String(500))
+    pending_remarks = db.Column(db.Text)
+    batch_updated_at = db.Column(db.DateTime)
+    content_hash = db.Column(db.String(64))
+    created_by = db.Column(db.String(100), default="system")
+    completed_by = db.Column(db.String(100))
+    completed_at = db.Column(db.DateTime)
+    voided_by = db.Column(db.String(100))
+    voided_at = db.Column(db.DateTime)
+    void_reason = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="handover_lists")
+    items = db.relationship("HandoverListItem", backref="handover_list", cascade="all, delete-orphan")
+
+    def can_transition(self, new_status):
+        allowed = HANDOVER_ALLOWED_TRANSITIONS.get(self.status, [])
+        return new_status in allowed
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "list_number": self.list_number,
+            "status": self.status,
+            "batch_status": self.batch_status,
+            "payable_total": round(self.payable_total, 2) if self.payable_total is not None else None,
+            "matched_count": self.matched_count,
+            "exception_count": self.exception_count,
+            "unmatched_po_count": self.unmatched_po_count,
+            "unmatched_invoice_count": self.unmatched_invoice_count,
+            "latest_import_plan": json.loads(self.latest_import_plan) if self.latest_import_plan else None,
+            "latest_health_summary": json.loads(self.latest_health_summary) if self.latest_health_summary else None,
+            "latest_health_history_id": self.latest_health_history_id,
+            "export_filename": self.export_filename,
+            "pending_remarks": self.pending_remarks,
+            "batch_updated_at": self.batch_updated_at.isoformat() if self.batch_updated_at else None,
+            "content_hash": self.content_hash,
+            "created_by": self.created_by,
+            "completed_by": self.completed_by,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "voided_by": self.voided_by,
+            "voided_at": self.voided_at.isoformat() if self.voided_at else None,
+            "void_reason": self.void_reason,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class HandoverListItem(db.Model):
+    __tablename__ = "handover_list_items"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    handover_list_id = db.Column(db.Integer, db.ForeignKey("handover_lists.id"), nullable=False)
+    match_result_id = db.Column(db.Integer, db.ForeignKey("match_results.id"))
+    po_number = db.Column(db.String(100))
+    invoice_number = db.Column(db.String(100))
+    vendor_code = db.Column(db.String(100))
+    vendor_name = db.Column(db.String(200))
+    po_amount = db.Column(db.Float)
+    invoice_amount = db.Column(db.Float)
+    amount_diff = db.Column(db.Float)
+    match_type = db.Column(db.String(30))
+    is_exception = db.Column(db.Boolean, default=False)
+    exception_type = db.Column(db.String(50))
+    status = db.Column(db.String(20))
+    remarks = db.Column(db.Text)
+    rule_version = db.Column(db.String(50))
+    item_order = db.Column(db.Integer, default=0)
+
+    match_result = db.relationship("MatchResult")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "handover_list_id": self.handover_list_id,
+            "match_result_id": self.match_result_id,
+            "po_number": self.po_number,
+            "invoice_number": self.invoice_number,
+            "vendor_code": self.vendor_code,
+            "vendor_name": self.vendor_name,
+            "po_amount": self.po_amount,
+            "invoice_amount": self.invoice_amount,
+            "amount_diff": self.amount_diff,
+            "match_type": self.match_type,
+            "is_exception": self.is_exception,
+            "exception_type": self.exception_type,
+            "status": self.status,
+            "remarks": self.remarks,
+            "rule_version": self.rule_version,
+            "item_order": self.item_order,
+        }
+
+
+def compute_handover_content_hash(batch):
+    parts = []
+    parts.append(f"status:{batch.status}")
+    parts.append(f"updated:{batch.updated_at.isoformat() if batch.updated_at else ''}")
+    summary = batch.summary
+    parts.append(f"matched:{summary['matched_count']}")
+    parts.append(f"exception:{summary['exception_count']}")
+    parts.append(f"payable:{summary['payable_total']}")
+    for mr in sorted(batch.match_results, key=lambda x: x.id or 0):
+        parts.append(
+            f"mr:{mr.id}:{mr.po_id}:{mr.invoice_id}:{mr.match_type}:"
+            f"{mr.status}:{mr.po_amount}:{mr.invoice_amount}:{mr.amount_diff}:"
+            f"{mr.is_exception}:{mr.exception_type or ''}:{mr.remarks or ''}:{mr.rule_version or ''}"
+        )
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def init_db(app):

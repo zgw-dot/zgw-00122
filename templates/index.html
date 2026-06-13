@@ -817,6 +817,118 @@
             <div v-if="auditLogs.length===0" class="text-center text-gray-400 py-4">暂无操作日志</div>
           </div>
         </div>
+
+        <div v-if="activeTab==='handover'">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-semibold text-gray-700">对账交接清单</h3>
+            <div class="flex gap-2">
+              <button @click="loadHandoverLists" class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded text-sm transition">刷新列表</button>
+              <button @click="createHandoverList" :disabled="!canCreateHandover" class="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-3 py-1.5 rounded text-sm font-medium transition">+ 生成清单</button>
+            </div>
+          </div>
+
+          <div v-if="handoverLists.length>0" class="space-y-3 mb-6">
+            <div v-for="h in handoverLists" :key="h.id" @click="openHandoverDetail(h.id)" class="bg-white border border-gray-200 rounded-lg p-4 cursor-pointer hover:border-indigo-300 hover:shadow-sm transition">
+              <div class="flex items-center justify-between mb-2">
+                <span class="font-medium text-gray-800">{{ h.list_number }}</span>
+                <span :class="handoverStatusClass(h.status)">{{ handoverStatusLabel(h.status) }}</span>
+              </div>
+              <div class="grid grid-cols-4 gap-2 text-xs text-gray-600 mb-2">
+                <div>批次状态: {{ h.batch_status }}</div>
+                <div>应付: ¥{{ h.payable_total }}</div>
+                <div>匹配: {{ h.matched_count }}</div>
+                <div>异常: {{ h.exception_count }}</div>
+              </div>
+              <div class="text-xs text-gray-400">创建人: {{ h.created_by }} · {{ formatTime(h.created_at) }}</div>
+            </div>
+          </div>
+          <div v-if="handoverLists.length===0" class="text-center text-gray-400 py-8 border-2 border-dashed border-gray-200 rounded-lg">
+            暂无交接清单，点击「生成清单」创建
+          </div>
+
+          <div v-if="currentHandover" class="mt-6 fade-in">
+            <div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4 mb-4">
+              <div class="flex items-center justify-between mb-3">
+                <h4 class="font-semibold text-indigo-800">清单详情 - {{ currentHandover.list_number }}</h4>
+                <span :class="handoverStatusClass(currentHandover.status)">{{ handoverStatusLabel(currentHandover.status) }}</span>
+              </div>
+              <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                <div><span class="text-gray-500">批次状态:</span> {{ currentHandover.batch_status }}</div>
+                <div><span class="text-gray-500">应付合计:</span> ¥{{ currentHandover.payable_total }}</div>
+                <div><span class="text-gray-500">匹配成功:</span> {{ currentHandover.matched_count }}</div>
+                <div><span class="text-gray-500">异常数量:</span> {{ currentHandover.exception_count }}</div>
+                <div><span class="text-gray-500">未匹配PO:</span> {{ currentHandover.unmatched_po_count }}</div>
+                <div><span class="text-gray-500">未匹配发票:</span> {{ currentHandover.unmatched_invoice_count }}</div>
+                <div><span class="text-gray-500">导出文件名:</span> {{ currentHandover.export_filename || '-' }}</div>
+                <div><span class="text-gray-500">创建人:</span> {{ currentHandover.created_by }}</div>
+              </div>
+              <div v-if="currentHandover.pending_remarks" class="mt-3 text-sm">
+                <span class="text-gray-500">待处理备注:</span> {{ currentHandover.pending_remarks }}
+              </div>
+              <div class="flex flex-wrap gap-2 mt-4">
+                <button @click="exportHandover(currentHandover.id)" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">导出 CSV</button>
+                <button v-if="currentHandover.status==='DRAFT'" @click="refreshHandover(currentHandover.id)" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">刷新快照</button>
+                <button v-if="currentHandover.status==='DRAFT'" @click="showCompleteHandoverModal=true" class="bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">完成签收</button>
+                <button v-if="currentHandover.status==='DRAFT'" @click="showVoidHandoverModal=true" class="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm font-medium transition">作废清单</button>
+                <button @click="currentHandover=null" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1.5 rounded text-sm font-medium transition">关闭</button>
+              </div>
+            </div>
+
+            <h4 class="font-medium text-gray-700 mb-2">明细列表 ({{ handoverItems.length }})</h4>
+            <div class="overflow-x-auto">
+              <table class="min-w-full text-xs">
+                <thead class="bg-gray-50">
+                  <tr>
+                    <th class="px-2 py-2 text-left text-gray-600">采购单号</th>
+                    <th class="px-2 py-2 text-left text-gray-600">发票号</th>
+                    <th class="px-2 py-2 text-left text-gray-600">供应商</th>
+                    <th class="px-2 py-2 text-right text-gray-600">采购金额</th>
+                    <th class="px-2 py-2 text-right text-gray-600">发票金额</th>
+                    <th class="px-2 py-2 text-right text-gray-600">差异</th>
+                    <th class="px-2 py-2 text-center text-gray-600">匹配类型</th>
+                    <th class="px-2 py-2 text-center text-gray-600">状态</th>
+                    <th class="px-2 py-2 text-left text-gray-600">备注</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in handoverItems" :key="item.id" class="border-t border-gray-100">
+                    <td class="px-2 py-2">{{ item.po_number || '-' }}</td>
+                    <td class="px-2 py-2">{{ item.invoice_number || '-' }}</td>
+                    <td class="px-2 py-2">{{ item.vendor_name || '-' }}</td>
+                    <td class="px-2 py-2 text-right">{{ item.po_amount ? '¥' + item.po_amount : '-' }}</td>
+                    <td class="px-2 py-2 text-right">{{ item.invoice_amount ? '¥' + item.invoice_amount : '-' }}</td>
+                    <td class="px-2 py-2 text-right" :class="item.amount_diff > 0 ? 'text-red-600' : ''">{{ item.amount_diff !== null ? '¥' + item.amount_diff : '-' }}</td>
+                    <td class="px-2 py-2 text-center"><span :class="matchTypeClass(item.match_type)">{{ item.match_type }}</span></td>
+                    <td class="px-2 py-2 text-center">{{ item.status }}</td>
+                    <td class="px-2 py-2">{{ item.remarks || '-' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="mt-6">
+            <div class="flex items-center justify-between mb-3">
+              <h4 class="font-medium text-gray-700">回导清单</h4>
+            </div>
+            <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center">
+              <input type="file" ref="handoverImportFile" accept=".csv" @change="importHandoverFile" class="hidden">
+              <button @click="$refs.handoverImportFile.click()" class="text-indigo-600 hover:text-indigo-800 text-sm">选择 CSV 文件回导交接清单</button>
+              <p class="text-xs text-gray-400 mt-1">回导同一份导出的 CSV 可恢复清单</p>
+            </div>
+          </div>
+
+          <div class="mt-6">
+            <h4 class="font-medium text-gray-700 mb-2">交接审计日志</h4>
+            <div class="space-y-2">
+              <div v-for="log in handoverAuditLogs" :key="log.id" class="bg-gray-50 rounded-lg p-3 flex justify-between text-sm">
+                <div><span :class="log.action.includes('DENIED') ? 'text-red-600 font-medium' : 'font-medium'">{{ log.action }}</span> <span class="text-gray-500">{{ log.detail||'' }}</span></div>
+                <span class="text-gray-400 text-xs">{{ formatTime(log.created_at) }}</span>
+              </div>
+              <div v-if="handoverAuditLogs.length===0" class="text-center text-gray-400 py-4">暂无交接审计日志</div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -843,6 +955,62 @@
       <div class="flex justify-end gap-3 mt-6">
         <button @click="showCreateModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
         <button @click="createBatch" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showCompleteHandoverModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showCompleteHandoverModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+      <h3 class="text-lg font-bold mb-4">完成签收交接清单</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作角色</label>
+          <select v-model="completeHandoverForm.role" class="w-full border rounded-lg px-3 py-2 text-sm">
+            <option value="admin">admin</option>
+            <option value="finance_lead">finance_lead</option>
+            <option value="finance">finance</option>
+            <option value="viewer">viewer</option>
+          </select>
+          <p class="text-xs text-gray-500 mt-1">只有 admin 或 finance_lead 角色可以完成签收</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作人</label>
+          <input type="text" v-model="completeHandoverForm.operator" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="例: zhangsan">
+        </div>
+      </div>
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showCompleteHandoverModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
+        <button @click="completeHandover" class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg text-sm font-medium">确认完成</button>
+      </div>
+    </div>
+  </div>
+
+  <div v-if="showVoidHandoverModal" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showVoidHandoverModal=false">
+    <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+      <h3 class="text-lg font-bold mb-4">作废交接清单</h3>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作角色</label>
+          <select v-model="voidHandoverForm.role" class="w-full border rounded-lg px-3 py-2 text-sm">
+            <option value="admin">admin</option>
+            <option value="finance_lead">finance_lead</option>
+            <option value="finance">finance</option>
+            <option value="viewer">viewer</option>
+          </select>
+          <p class="text-xs text-gray-500 mt-1">只有 admin 或 finance_lead 角色可以作废清单</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">操作人</label>
+          <input type="text" v-model="voidHandoverForm.operator" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="例: zhangsan">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">作废原因</label>
+          <textarea v-model="voidHandoverForm.reason" rows="3" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="请输入作废原因"></textarea>
+        </div>
+      </div>
+      <div class="flex justify-end gap-3 mt-6">
+        <button @click="showVoidHandoverModal=false" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">取消</button>
+        <button @click="voidHandover" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm font-medium">确认作废</button>
       </div>
     </div>
   </div>
