@@ -110,6 +110,14 @@ RELEASE_ALLOWED_TRANSITIONS = {
     RELEASE_STATUS_EXPIRED: [],
 }
 
+REHEARSAL_STATUS_ACTIVE = "ACTIVE"
+REHEARSAL_STATUS_STALE = "STALE"
+REHEARSAL_STATUS_VOID = "VOID"
+
+REHEARSAL_PERMISSION_VOID = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
+REHEARSAL_PERMISSION_CREATE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE}
+REHEARSAL_PERMISSION_VIEW = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE, HANDOVER_ROLE_VIEWER}
+
 RELEASE_PERMISSION_APPROVE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
 RELEASE_PERMISSION_REJECT = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
 RELEASE_PERMISSION_REVOKE = {HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD}
@@ -1021,6 +1029,184 @@ class ReleasePackageItem(db.Model):
             "rule_version": self.rule_version,
             "item_order": self.item_order,
         }
+
+
+class RehearsalSlip(db.Model):
+    __tablename__ = "rehearsal_slips"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("batches.id"), nullable=False)
+    slip_number = db.Column(db.String(100), nullable=False, unique=True)
+    status = db.Column(db.String(20), nullable=False, default=REHEARSAL_STATUS_ACTIVE)
+    batch_status = db.Column(db.String(30))
+    payable_total = db.Column(db.Float, default=0.0)
+    matched_count = db.Column(db.Integer, default=0)
+    exception_count = db.Column(db.Integer, default=0)
+    unmatched_po_count = db.Column(db.Integer, default=0)
+    unmatched_invoice_count = db.Column(db.Integer, default=0)
+    tolerance_pct = db.Column(db.Float)
+    tolerance_abs = db.Column(db.Float)
+    rule_version = db.Column(db.String(50))
+    recalc_note_id = db.Column(db.Integer, db.ForeignKey("payable_recalc_notes.id"))
+    recalc_note_version = db.Column(db.Integer)
+    recalc_note_summary = db.Column(db.Text)
+    health_history_id = db.Column(db.Integer, db.ForeignKey("health_check_history.id"))
+    health_rule_version = db.Column(db.String(50))
+    health_summary = db.Column(db.Text)
+    health_blocker_count = db.Column(db.Integer, default=0)
+    health_warning_count = db.Column(db.Integer, default=0)
+    health_info_count = db.Column(db.Integer, default=0)
+    release_package_id = db.Column(db.Integer, db.ForeignKey("release_packages.id"))
+    release_package_status = db.Column(db.String(20))
+    release_package_snapshot = db.Column(db.Text)
+    vendor_payable_summary = db.Column(db.Text)
+    exception_result_summary = db.Column(db.Text)
+    recalc_note_version_snapshot = db.Column(db.Text)
+    health_inspection_summary = db.Column(db.Text)
+    release_package_status_snapshot = db.Column(db.Text)
+    content_hash = db.Column(db.String(64))
+    is_stale = db.Column(db.Boolean, default=False)
+    stale_reason = db.Column(db.Text)
+    stale_at = db.Column(db.DateTime)
+    export_filename = db.Column(db.String(500))
+    voided_by = db.Column(db.String(100))
+    voided_at = db.Column(db.DateTime)
+    void_reason = db.Column(db.Text)
+    created_by = db.Column(db.String(100), default="system")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    batch = db.relationship("Batch", backref="rehearsal_slips")
+    recalc_note = db.relationship("PayableRecalcNote", foreign_keys=[recalc_note_id])
+    health_history = db.relationship("HealthCheckHistory", foreign_keys=[health_history_id])
+    release_package = db.relationship("ReleasePackage", foreign_keys=[release_package_id])
+    items = db.relationship("RehearsalSlipItem", backref="rehearsal_slip", cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "batch_id": self.batch_id,
+            "slip_number": self.slip_number,
+            "status": self.status,
+            "batch_status": self.batch_status,
+            "payable_total": round(self.payable_total, 2) if self.payable_total is not None else None,
+            "matched_count": self.matched_count,
+            "exception_count": self.exception_count,
+            "unmatched_po_count": self.unmatched_po_count,
+            "unmatched_invoice_count": self.unmatched_invoice_count,
+            "tolerance_pct": self.tolerance_pct,
+            "tolerance_abs": self.tolerance_abs,
+            "rule_version": self.rule_version,
+            "recalc_note_id": self.recalc_note_id,
+            "recalc_note_version": self.recalc_note_version,
+            "recalc_note_summary": self.recalc_note_summary,
+            "health_history_id": self.health_history_id,
+            "health_rule_version": self.health_rule_version,
+            "health_summary": json.loads(self.health_summary) if self.health_summary else None,
+            "health_blocker_count": self.health_blocker_count,
+            "health_warning_count": self.health_warning_count,
+            "health_info_count": self.health_info_count,
+            "release_package_id": self.release_package_id,
+            "release_package_status": self.release_package_status,
+            "release_package_snapshot": json.loads(self.release_package_snapshot) if self.release_package_snapshot else None,
+            "vendor_payable_summary": json.loads(self.vendor_payable_summary) if self.vendor_payable_summary else None,
+            "exception_result_summary": json.loads(self.exception_result_summary) if self.exception_result_summary else None,
+            "recalc_note_version_snapshot": json.loads(self.recalc_note_version_snapshot) if self.recalc_note_version_snapshot else None,
+            "health_inspection_summary": json.loads(self.health_inspection_summary) if self.health_inspection_summary else None,
+            "release_package_status_snapshot": json.loads(self.release_package_status_snapshot) if self.release_package_status_snapshot else None,
+            "content_hash": self.content_hash,
+            "is_stale": self.is_stale,
+            "stale_reason": self.stale_reason,
+            "stale_at": self.stale_at.isoformat() if self.stale_at else None,
+            "export_filename": self.export_filename,
+            "voided_by": self.voided_by,
+            "voided_at": self.voided_at.isoformat() if self.voided_at else None,
+            "void_reason": self.void_reason,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class RehearsalSlipItem(db.Model):
+    __tablename__ = "rehearsal_slip_items"
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    rehearsal_slip_id = db.Column(db.Integer, db.ForeignKey("rehearsal_slips.id"), nullable=False)
+    match_result_id = db.Column(db.Integer, db.ForeignKey("match_results.id"))
+    po_number = db.Column(db.String(100))
+    invoice_number = db.Column(db.String(100))
+    vendor_code = db.Column(db.String(100))
+    vendor_name = db.Column(db.String(200))
+    po_amount = db.Column(db.Float)
+    invoice_amount = db.Column(db.Float)
+    amount_diff = db.Column(db.Float)
+    match_type = db.Column(db.String(30))
+    is_exception = db.Column(db.Boolean, default=False)
+    exception_type = db.Column(db.String(50))
+    status = db.Column(db.String(20))
+    remarks = db.Column(db.Text)
+    exception_remarks = db.Column(db.Text)
+    rule_version = db.Column(db.String(50))
+    item_order = db.Column(db.Integer, default=0)
+
+    match_result = db.relationship("MatchResult")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "rehearsal_slip_id": self.rehearsal_slip_id,
+            "match_result_id": self.match_result_id,
+            "po_number": self.po_number,
+            "invoice_number": self.invoice_number,
+            "vendor_code": self.vendor_code,
+            "vendor_name": self.vendor_name,
+            "po_amount": self.po_amount,
+            "invoice_amount": self.invoice_amount,
+            "amount_diff": self.amount_diff,
+            "match_type": self.match_type,
+            "is_exception": self.is_exception,
+            "exception_type": self.exception_type,
+            "status": self.status,
+            "remarks": self.remarks,
+            "exception_remarks": self.exception_remarks,
+            "rule_version": self.rule_version,
+            "item_order": self.item_order,
+        }
+
+
+def compute_rehearsal_content_hash(batch, note=None, health_history=None, release_pkg=None):
+    parts = []
+    parts.append(f"batch_status:{batch.status}")
+    parts.append(f"batch_updated:{batch.updated_at.isoformat() if batch.updated_at else ''}")
+    parts.append(f"rule_version:{batch.rule_version}")
+    parts.append(f"tolerance_pct:{batch.tolerance_pct}")
+    parts.append(f"tolerance_abs:{batch.tolerance_abs}")
+    summary = batch.summary
+    parts.append(f"matched:{summary['matched_count']}")
+    parts.append(f"exception:{summary['exception_count']}")
+    parts.append(f"payable:{summary['payable_total']}")
+    if note:
+        parts.append(f"note_id:{note.id}")
+        parts.append(f"note_version:{note.version}")
+        parts.append(f"note_hash:{note.content_hash}")
+    if health_history:
+        parts.append(f"health_id:{health_history.id}")
+        parts.append(f"health_version:{health_history.rule_version}")
+    if release_pkg:
+        parts.append(f"release_id:{release_pkg.id}")
+        parts.append(f"release_status:{release_pkg.status}")
+        parts.append(f"release_hash:{release_pkg.content_hash}")
+    for mr in sorted(batch.match_results, key=lambda x: x.id or 0):
+        parts.append(
+            f"mr:{mr.id}:{mr.po_id}:{mr.invoice_id}:{mr.match_type}:"
+            f"{mr.status}:{mr.po_amount}:{mr.invoice_amount}:{mr.amount_diff}:"
+            f"{mr.is_exception}:{mr.exception_type or ''}:{mr.remarks or ''}:{mr.rule_version or ''}"
+        )
+    for exc in sorted(batch.exception_items, key=lambda x: x.id or 0):
+        parts.append(
+            f"exc:{exc.id}:{exc.match_result_id}:{exc.exception_type}:{exc.status}:{exc.remarks or ''}"
+        )
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def init_db(app):

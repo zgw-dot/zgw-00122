@@ -10,6 +10,7 @@ from models import (
     HealthCheckRule, HealthCheckHistory, HealthCheckResult,
     HandoverList, HandoverListItem,
     ReleasePackage, ReleasePackageItem,
+    RehearsalSlip, RehearsalSlipItem,
     BATCH_STATUS_VALIDATING, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION,
     BATCH_STATUS_FAILED, BATCH_STATUS_CREATED, BATCH_STATUS_CONFIRMED,
     MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE,
@@ -35,10 +36,13 @@ from models import (
     HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD,
     compute_rule_version, compute_note_content_hash, compute_health_rule_version,
     compute_handover_content_hash, compute_release_content_hash,
+    compute_rehearsal_content_hash,
     RELEASE_STATUS_DRAFT, RELEASE_STATUS_PENDING, RELEASE_STATUS_APPROVED,
     RELEASE_STATUS_REJECTED, RELEASE_STATUS_REVOKED, RELEASE_STATUS_EXPIRED,
     RELEASE_PERMISSION_APPROVE, RELEASE_PERMISSION_REJECT, RELEASE_PERMISSION_REVOKE,
     RELEASE_PERMISSION_CREATE, RELEASE_PERMISSION_VIEW,
+    REHEARSAL_STATUS_ACTIVE, REHEARSAL_STATUS_STALE, REHEARSAL_STATUS_VOID,
+    REHEARSAL_PERMISSION_VOID, REHEARSAL_PERMISSION_CREATE, REHEARSAL_PERMISSION_VIEW,
     HANDOVER_ROLE_ADMIN, HANDOVER_ROLE_FINANCE_LEAD, HANDOVER_ROLE_FINANCE,
 )
 
@@ -4082,3 +4086,506 @@ def list_release_audit_logs(batch_id=None, package_id=None, limit=50):
     if package_id is not None:
         query = query.filter(AuditLog.detail.like(f"%#{package_id}%"))
     return query.order_by(AuditLog.created_at.desc()).limit(limit).all()
+
+
+def _generate_rehearsal_slip_number(batch_id):
+    count = RehearsalSlip.query.filter_by(batch_id=batch_id).count()
+    return f"RS-{batch_id}-{count + 1:04d}"
+
+
+def _build_vendor_payable_summary(batch):
+    vendor_map = {}
+    matched_types = (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)
+    for mr in batch.match_results:
+        if mr.match_type not in matched_types:
+            continue
+        if mr.status == RESULT_STATUS_REJECTED:
+            continue
+        vc = mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None)
+        vn = mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None)
+        if not vc:
+            continue
+        if vc not in vendor_map:
+            vendor_map[vc] = {"vendor_code": vc, "vendor_name": vn, "total": 0.0, "count": 0}
+        vendor_map[vc]["total"] += mr.invoice_amount or 0
+        vendor_map[vc]["count"] += 1
+    for v in vendor_map.values():
+        v["total"] = round(v["total"], 2)
+    return sorted(vendor_map.values(), key=lambda x: x["vendor_code"])
+
+
+def _build_exception_result_summary(batch):
+    results = []
+    for exc in batch.exception_items:
+        mr = MatchResult.query.get(exc.match_result_id) if exc.match_result_id else None
+        results.append({
+            "exception_id": exc.id,
+            "exception_type": exc.exception_type,
+            "status": exc.status,
+            "detail": exc.detail,
+            "remarks": exc.remarks or "",
+            "po_number": mr.po.po_number if mr and mr.po else None,
+            "invoice_number": mr.invoice.invoice_number if mr and mr.invoice else None,
+        })
+    return results
+
+
+def _build_recalc_note_version_snapshot(note):
+    if not note:
+        return None
+    return {
+        "id": note.id,
+        "version": note.version,
+        "current_total": note.current_total,
+        "change_source": note.change_source,
+        "change_summary": note.change_summary,
+        "rule_version": note.rule_version,
+    }
+
+
+def _build_health_inspection_summary(health_history):
+    if not health_history:
+        return None
+    return {
+        "id": health_history.id,
+        "rule_version": health_history.rule_version,
+        "blocker_count": health_history.blocker_count,
+        "warning_count": health_history.warning_count,
+        "info_count": health_history.info_count,
+        "summary": json.loads(health_history.summary) if health_history.summary else None,
+    }
+
+
+def _build_release_package_status_snapshot(release_pkg):
+    if not release_pkg:
+        return None
+    return {
+        "id": release_pkg.id,
+        "package_number": release_pkg.package_number,
+        "status": release_pkg.status,
+        "is_expired": release_pkg.is_expired,
+        "content_hash": release_pkg.content_hash,
+    }
+
+
+def mark_stale_rehearsal_slips(batch_id, change_source, operator="system"):
+    active_slips = RehearsalSlip.query.filter_by(
+        batch_id=batch_id,
+        status=REHEARSAL_STATUS_ACTIVE,
+    ).all()
+    now = datetime.now(timezone.utc)
+    for slip in active_slips:
+        slip.status = REHEARSAL_STATUS_STALE
+        slip.is_stale = True
+        slip.stale_reason = change_source
+        slip.stale_at = now
+        log = AuditLog(
+            batch_id=batch_id,
+            action="REHEARSAL_STALE",
+            detail=f"预演单 {slip.slip_number} 因 {change_source} 标记为 STALE",
+            operator=operator,
+        )
+        db.session.add(log)
+    if active_slips:
+        db.session.commit()
+    return len(active_slips)
+
+
+def create_rehearsal_slip(batch_id, operator="system", force_new=False):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    if batch.status not in (BATCH_STATUS_CONFIRMED, BATCH_STATUS_MATCHED, BATCH_STATUS_EXCEPTION):
+        raise ValidationError([f"批次状态 '{batch.status}' 不允许生成预演单，需先确认批次或完成匹配"])
+
+    summary = batch.summary
+    latest_note = get_latest_recalc_note(batch_id)
+    latest_health = (
+        HealthCheckHistory.query.filter_by(batch_id=batch_id)
+        .order_by(HealthCheckHistory.created_at.desc())
+        .first()
+    )
+    latest_release = (
+        ReleasePackage.query.filter_by(batch_id=batch_id)
+        .order_by(ReleasePackage.created_at.desc())
+        .first()
+    )
+
+    content_hash = compute_rehearsal_content_hash(batch, latest_note, latest_health, latest_release)
+
+    if not force_new:
+        existing = RehearsalSlip.query.filter_by(
+            batch_id=batch_id,
+            content_hash=content_hash,
+            status=REHEARSAL_STATUS_ACTIVE,
+        ).first()
+        if existing:
+            return existing, False, None
+
+    mark_stale_rehearsal_slips(batch_id, "REHEARSAL_CREATE", operator=operator)
+
+    slip_number = _generate_rehearsal_slip_number(batch_id)
+
+    vendor_summary = _build_vendor_payable_summary(batch)
+    exception_summary = _build_exception_result_summary(batch)
+    recalc_snapshot = _build_recalc_note_version_snapshot(latest_note)
+    health_snapshot = _build_health_inspection_summary(latest_health)
+    release_snapshot = _build_release_package_status_snapshot(latest_release)
+
+    slip = RehearsalSlip(
+        batch_id=batch_id,
+        slip_number=slip_number,
+        status=REHEARSAL_STATUS_ACTIVE,
+        batch_status=batch.status,
+        payable_total=summary["payable_total"],
+        matched_count=summary["matched_count"],
+        exception_count=summary["exception_count"],
+        unmatched_po_count=summary["unmatched_po_count"],
+        unmatched_invoice_count=summary["unmatched_invoice_count"],
+        tolerance_pct=batch.tolerance_pct,
+        tolerance_abs=batch.tolerance_abs,
+        rule_version=batch.rule_version,
+        recalc_note_id=latest_note.id if latest_note else None,
+        recalc_note_version=latest_note.version if latest_note else None,
+        recalc_note_summary=latest_note.change_summary if latest_note else None,
+        health_history_id=latest_health.id if latest_health else None,
+        health_rule_version=latest_health.rule_version if latest_health else None,
+        health_summary=json.dumps(latest_health.summary, ensure_ascii=False) if latest_health and latest_health.summary else None,
+        health_blocker_count=latest_health.blocker_count if latest_health else 0,
+        health_warning_count=latest_health.warning_count if latest_health else 0,
+        health_info_count=latest_health.info_count if latest_health else 0,
+        release_package_id=latest_release.id if latest_release else None,
+        release_package_status=latest_release.status if latest_release else None,
+        release_package_snapshot=json.dumps(release_snapshot, ensure_ascii=False) if release_snapshot else None,
+        vendor_payable_summary=json.dumps(vendor_summary, ensure_ascii=False),
+        exception_result_summary=json.dumps(exception_summary, ensure_ascii=False),
+        recalc_note_version_snapshot=json.dumps(recalc_snapshot, ensure_ascii=False) if recalc_snapshot else None,
+        health_inspection_summary=json.dumps(health_snapshot, ensure_ascii=False) if health_snapshot else None,
+        release_package_status_snapshot=json.dumps(release_snapshot, ensure_ascii=False) if release_snapshot else None,
+        content_hash=content_hash,
+        created_by=operator,
+    )
+    db.session.add(slip)
+    db.session.flush()
+
+    matched_types = (MATCH_TYPE_EXACT, MATCH_TYPE_TOLERANCE, MATCH_TYPE_OVER_TOLERANCE)
+    matched_results = [r for r in batch.match_results if r.match_type in matched_types]
+
+    exc_map = {}
+    for exc in batch.exception_items:
+        if exc.match_result_id:
+            exc_map[exc.match_result_id] = exc
+
+    for idx, mr in enumerate(matched_results):
+        exc = exc_map.get(mr.id)
+        item = RehearsalSlipItem(
+            rehearsal_slip_id=slip.id,
+            match_result_id=mr.id,
+            po_number=mr.po.po_number if mr.po else None,
+            invoice_number=mr.invoice.invoice_number if mr.invoice else None,
+            vendor_code=mr.po.vendor_code if mr.po else (mr.invoice.vendor_code if mr.invoice else None),
+            vendor_name=mr.po.vendor_name if mr.po else (mr.invoice.vendor_name if mr.invoice else None),
+            po_amount=mr.po_amount,
+            invoice_amount=mr.invoice_amount,
+            amount_diff=mr.amount_diff,
+            match_type=mr.match_type,
+            is_exception=mr.is_exception,
+            exception_type=mr.exception_type,
+            status=mr.status,
+            remarks=mr.remarks,
+            exception_remarks=exc.remarks if exc else None,
+            rule_version=mr.rule_version,
+            item_order=idx,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="REHEARSAL_CREATE",
+        detail=f"生成预演单 {slip_number} (#{slip.id})，应付合计 {summary['payable_total']:.2f}，共 {len(matched_results)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    db.session.refresh(slip)
+
+    return slip, True, None
+
+
+def get_rehearsal_slip(slip_id):
+    return RehearsalSlip.query.get(slip_id)
+
+
+def get_rehearsal_slip_by_number(slip_number):
+    return RehearsalSlip.query.filter_by(slip_number=slip_number).first()
+
+
+def list_rehearsal_slips(batch_id=None, status=None):
+    query = RehearsalSlip.query
+    if batch_id is not None:
+        query = query.filter_by(batch_id=batch_id)
+    if status:
+        query = query.filter_by(status=status)
+    return query.order_by(RehearsalSlip.created_at.desc()).all()
+
+
+def get_latest_rehearsal_slip(batch_id):
+    return (
+        RehearsalSlip.query.filter_by(batch_id=batch_id)
+        .order_by(RehearsalSlip.created_at.desc())
+        .first()
+    )
+
+
+def get_rehearsal_slip_items(slip_id):
+    return RehearsalSlipItem.query.filter_by(
+        rehearsal_slip_id=slip_id
+    ).order_by(RehearsalSlipItem.item_order).all()
+
+
+def void_rehearsal_slip(slip_id, reason="", role="viewer", operator="system"):
+    if role not in REHEARSAL_PERMISSION_VOID:
+        raise ValidationError([f"角色 '{role}' 无作废预演单权限"])
+
+    slip = get_rehearsal_slip(slip_id)
+    if not slip:
+        raise ValidationError(["预演单不存在"])
+
+    if slip.status == REHEARSAL_STATUS_VOID:
+        raise ValidationError(["预演单已作废，不允许重复作废"])
+
+    slip.status = REHEARSAL_STATUS_VOID
+    slip.voided_by = operator
+    slip.voided_at = datetime.now(timezone.utc)
+    slip.void_reason = reason
+
+    log = AuditLog(
+        batch_id=slip.batch_id,
+        action="REHEARSAL_VOID",
+        detail=f"作废预演单 {slip.slip_number} (#{slip.id})" + (f"，原因: {reason}" if reason else ""),
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    return slip
+
+
+def regenerate_rehearsal_slip(batch_id, operator="system"):
+    return create_rehearsal_slip(batch_id, operator=operator, force_new=True)
+
+
+def export_rehearsal_csv(slip_id):
+    slip = get_rehearsal_slip(slip_id)
+    if not slip:
+        raise ValidationError(["预演单不存在"])
+
+    items = get_rehearsal_slip_items(slip_id)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(["===== 预演单头段 ====="])
+    writer.writerow(["slip_number", slip.slip_number])
+    writer.writerow(["batch_id", slip.batch_id])
+    writer.writerow(["status", slip.status])
+    writer.writerow(["batch_status", slip.batch_status or ""])
+    writer.writerow(["payable_total", slip.payable_total or 0])
+    writer.writerow(["matched_count", slip.matched_count or 0])
+    writer.writerow(["exception_count", slip.exception_count or 0])
+    writer.writerow(["unmatched_po_count", slip.unmatched_po_count or 0])
+    writer.writerow(["unmatched_invoice_count", slip.unmatched_invoice_count or 0])
+    writer.writerow(["tolerance_pct", slip.tolerance_pct or ""])
+    writer.writerow(["tolerance_abs", slip.tolerance_abs or ""])
+    writer.writerow(["rule_version", slip.rule_version or ""])
+    writer.writerow(["recalc_note_id", slip.recalc_note_id or ""])
+    writer.writerow(["recalc_note_version", slip.recalc_note_version or ""])
+    writer.writerow(["recalc_note_summary", slip.recalc_note_summary or ""])
+    writer.writerow(["health_history_id", slip.health_history_id or ""])
+    writer.writerow(["health_rule_version", slip.health_rule_version or ""])
+    writer.writerow(["health_summary", slip.health_summary or ""])
+    writer.writerow(["health_blocker_count", slip.health_blocker_count or 0])
+    writer.writerow(["health_warning_count", slip.health_warning_count or 0])
+    writer.writerow(["health_info_count", slip.health_info_count or 0])
+    writer.writerow(["release_package_id", slip.release_package_id or ""])
+    writer.writerow(["release_package_status", slip.release_package_status or ""])
+    writer.writerow(["vendor_payable_summary", slip.vendor_payable_summary or ""])
+    writer.writerow(["exception_result_summary", slip.exception_result_summary or ""])
+    writer.writerow(["recalc_note_version_snapshot", slip.recalc_note_version_snapshot or ""])
+    writer.writerow(["health_inspection_summary", slip.health_inspection_summary or ""])
+    writer.writerow(["release_package_status_snapshot", slip.release_package_status_snapshot or ""])
+    writer.writerow(["release_package_snapshot", slip.release_package_snapshot or ""])
+    writer.writerow(["content_hash", slip.content_hash or ""])
+    writer.writerow(["created_by", slip.created_by or ""])
+    writer.writerow(["created_at", slip.created_at.isoformat() if slip.created_at else ""])
+
+    writer.writerow([])
+    writer.writerow(["===== 预演单明细 ====="])
+    writer.writerow([
+        "序号", "采购单号", "发票号", "供应商编码", "供应商名称",
+        "采购金额", "发票金额", "金额差异", "匹配类型", "是否异常",
+        "异常类型", "状态", "备注", "异常备注", "规则版本",
+    ])
+    for item in items:
+        writer.writerow([
+            item.item_order,
+            item.po_number or "",
+            item.invoice_number or "",
+            item.vendor_code or "",
+            item.vendor_name or "",
+            item.po_amount or "",
+            item.invoice_amount or "",
+            f"{item.amount_diff:.2f}" if item.amount_diff is not None else "",
+            item.match_type or "",
+            "是" if item.is_exception else "否",
+            item.exception_type or "",
+            item.status or "",
+            item.remarks or "",
+            item.exception_remarks or "",
+            item.rule_version or "",
+        ])
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def import_rehearsal_csv(batch_id, csv_content, operator="system"):
+    batch = Batch.query.get(batch_id)
+    if not batch:
+        raise ValidationError(["批次不存在"])
+
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+
+    header_section = False
+    item_section = False
+    header_data = {}
+    item_rows = []
+
+    for row in rows:
+        if not row:
+            continue
+        first = row[0].strip()
+        if first == "===== 预演单头段 =====":
+            header_section = True
+            item_section = False
+            continue
+        if first == "===== 预演单明细 =====":
+            header_section = False
+            item_section = True
+            continue
+        if header_section and len(row) >= 2:
+            header_data[row[0].strip()] = row[1].strip() if len(row) > 1 else ""
+        elif item_section and first and first != "序号":
+            item_rows.append(row)
+
+    required_header_fields = ["slip_number", "batch_id", "status", "content_hash"]
+    missing = [f for f in required_header_fields if f not in header_data]
+    if missing:
+        raise ValidationError([f"CSV 头段缺少必填字段: {', '.join(missing)}"])
+
+    csv_batch_id = header_data.get("batch_id")
+    try:
+        csv_batch_id = int(csv_batch_id)
+    except (ValueError, TypeError):
+        raise ValidationError([f"CSV 中 batch_id '{csv_batch_id}' 不是有效整数"])
+    if csv_batch_id != batch_id:
+        raise ValidationError([f"CSV 中 batch_id ({csv_batch_id}) 与当前批次 ({batch_id}) 不匹配，跨批次回导被拒绝"])
+
+    existing_by_number = get_rehearsal_slip_by_number(header_data["slip_number"])
+    if existing_by_number:
+        raise ValidationError([f"预演单号 '{header_data['slip_number']}' 已存在，内容哈希重复，回导被拒绝"])
+
+    existing_by_hash = RehearsalSlip.query.filter_by(
+        batch_id=batch_id,
+        content_hash=header_data["content_hash"],
+    ).first()
+    if existing_by_hash:
+        raise ValidationError([f"内容哈希 '{header_data['content_hash'][:12]}' 已存在于预演单 {existing_by_hash.slip_number}，重复回导被拒绝"])
+
+    required_item_cols = 15
+    if item_rows:
+        for i, row in enumerate(item_rows):
+            if len(row) < 3:
+                raise ValidationError([f"明细第 {i + 1} 行字段不足，至少需要 3 列（采购单号/发票号/供应商编码）"])
+
+    slip = RehearsalSlip(
+        batch_id=batch_id,
+        slip_number=header_data.get("slip_number", _generate_rehearsal_slip_number(batch_id)),
+        status=header_data.get("status", REHEARSAL_STATUS_ACTIVE),
+        batch_status=header_data.get("batch_status"),
+        payable_total=float(header_data.get("payable_total", 0)),
+        matched_count=int(header_data.get("matched_count", 0)),
+        exception_count=int(header_data.get("exception_count", 0)),
+        unmatched_po_count=int(header_data.get("unmatched_po_count", 0)),
+        unmatched_invoice_count=int(header_data.get("unmatched_invoice_count", 0)),
+        tolerance_pct=float(header_data["tolerance_pct"]) if header_data.get("tolerance_pct") else None,
+        tolerance_abs=float(header_data["tolerance_abs"]) if header_data.get("tolerance_abs") else None,
+        rule_version=header_data.get("rule_version"),
+        recalc_note_id=int(header_data["recalc_note_id"]) if header_data.get("recalc_note_id") else None,
+        recalc_note_version=int(header_data["recalc_note_version"]) if header_data.get("recalc_note_version") else None,
+        recalc_note_summary=header_data.get("recalc_note_summary"),
+        health_history_id=int(header_data["health_history_id"]) if header_data.get("health_history_id") else None,
+        health_rule_version=header_data.get("health_rule_version"),
+        health_summary=header_data.get("health_summary"),
+        health_blocker_count=int(header_data.get("health_blocker_count", 0)),
+        health_warning_count=int(header_data.get("health_warning_count", 0)),
+        health_info_count=int(header_data.get("health_info_count", 0)),
+        release_package_id=int(header_data["release_package_id"]) if header_data.get("release_package_id") else None,
+        release_package_status=header_data.get("release_package_status"),
+        release_package_snapshot=header_data.get("release_package_snapshot"),
+        vendor_payable_summary=header_data.get("vendor_payable_summary"),
+        exception_result_summary=header_data.get("exception_result_summary"),
+        recalc_note_version_snapshot=header_data.get("recalc_note_version_snapshot"),
+        health_inspection_summary=header_data.get("health_inspection_summary"),
+        release_package_status_snapshot=header_data.get("release_package_status_snapshot"),
+        content_hash=header_data.get("content_hash"),
+        created_by=operator,
+    )
+    db.session.add(slip)
+    db.session.flush()
+
+    for i, row in enumerate(item_rows):
+        try:
+            po_amount = float(row[5]) if len(row) > 5 and row[5] else None
+        except (ValueError, TypeError):
+            po_amount = None
+        try:
+            inv_amount = float(row[6]) if len(row) > 6 and row[6] else None
+        except (ValueError, TypeError):
+            inv_amount = None
+        try:
+            amount_diff = float(row[7]) if len(row) > 7 and row[7] else None
+        except (ValueError, TypeError):
+            amount_diff = None
+
+        item = RehearsalSlipItem(
+            rehearsal_slip_id=slip.id,
+            po_number=row[1] if len(row) > 1 else None,
+            invoice_number=row[2] if len(row) > 2 else None,
+            vendor_code=row[3] if len(row) > 3 else None,
+            vendor_name=row[4] if len(row) > 4 else None,
+            po_amount=po_amount,
+            invoice_amount=inv_amount,
+            amount_diff=amount_diff,
+            match_type=row[8] if len(row) > 8 else None,
+            is_exception=(row[9] == "是") if len(row) > 9 else False,
+            exception_type=row[10] if len(row) > 10 else None,
+            status=row[11] if len(row) > 11 else None,
+            remarks=row[12] if len(row) > 12 else None,
+            exception_remarks=row[13] if len(row) > 13 else None,
+            rule_version=row[14] if len(row) > 14 else None,
+            item_order=i,
+        )
+        db.session.add(item)
+
+    log = AuditLog(
+        batch_id=batch_id,
+        action="REHEARSAL_IMPORT",
+        detail=f"回导预演单 {slip.slip_number} (#{slip.id})，共 {len(item_rows)} 条明细",
+        operator=operator,
+    )
+    db.session.add(log)
+    db.session.commit()
+    db.session.refresh(slip)
+    return slip

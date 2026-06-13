@@ -36,6 +36,9 @@ createApp({
     const healthRuleForm = reactive({});
 
     const releasePackages = ref([]);
+    const rehearsalSlips = ref([]);
+    const currentRehearsalSlip = ref(null);
+    const rehearsalSlipItems = ref([]);
     const currentReleasePackage = ref(null);
     const releasePackageItems = ref([]);
     const showCreateReleaseModal = ref(false);
@@ -53,6 +56,7 @@ createApp({
       { key: "results", label: "匹配结果" },
       { key: "exceptions", label: "异常待确认" },
       { key: "recalc-notes", label: "重算说明" },
+      { key: "rehearsal", label: "入账预演沙箱" },
       { key: "release", label: "入账放行包" },
       { key: "actions", label: "操作" },
       { key: "history", label: "历史记录" },
@@ -807,6 +811,87 @@ createApp({
       if (data) releasePackages.value = data.release_packages || [];
     }
 
+    async function loadRehearsalSlips() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/rehearsal-slips`);
+      if (data) rehearsalSlips.value = data.rehearsal_slips || [];
+    }
+
+    async function loadRehearsalSlipDetail(id) {
+      const data = await api(`/api/rehearsal-slips/${id}`);
+      if (data) {
+        currentRehearsalSlip.value = data;
+        rehearsalSlipItems.value = data.items || [];
+      }
+    }
+
+    async function createRehearsalSlip() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/rehearsal-slips`, {
+        method: "POST",
+        body: JSON.stringify({ operator: "web_user", role: roleForm.role }),
+      });
+      if (data) {
+        if (data.is_new) showToast("预演单生成成功");
+        else showToast("已存在相同快照的预演单，返回已有版本");
+        loadRehearsalSlips();
+      }
+    }
+
+    async function regenerateRehearsalSlip() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/rehearsal-slips/regenerate`, {
+        method: "POST",
+        body: JSON.stringify({ operator: "web_user", role: roleForm.role }),
+      });
+      if (data) {
+        showToast("已重新生成预演单");
+        loadRehearsalSlips();
+      }
+    }
+
+    async function voidRehearsalSlip(id) {
+      const data = await api(`/api/rehearsal-slips/${id}/void`, {
+        method: "POST",
+        body: JSON.stringify({ reason: "", role: roleForm.role, operator: "web_user" }),
+      });
+      if (data) {
+        showToast("已作废预演单");
+        loadRehearsalSlips();
+        currentRehearsalSlip.value = null;
+      }
+    }
+
+    async function exportRehearsalSlip(id) {
+      try {
+        const res = await fetch(`/api/rehearsal-slips/${id}/export`);
+        if (!res.ok) {
+          const data = await res.json();
+          showToast(data.error || "导出失败", "error");
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `rehearsal_slip_${id}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        showToast("导出失败: " + e.message, "error");
+      }
+    }
+
+    function rehearsalStatusLabel(status) {
+      const map = { ACTIVE: "有效", STALE: "已过期", VOID: "已作废" };
+      return map[status] || status;
+    }
+
+    function rehearsalStatusClass(status) {
+      const map = { ACTIVE: "bg-green-100 text-green-800", STALE: "bg-yellow-100 text-yellow-800", VOID: "bg-gray-100 text-gray-800" };
+      return "status-badge " + (map[status] || "bg-gray-100 text-gray-800");
+    }
+
     async function loadReleasePackageDetail(id) {
       const data = await api(`/api/release-packages/${id}`);
       if (data) {
@@ -978,6 +1063,7 @@ createApp({
       if (tab === "results") loadResults();
       else if (tab === "exceptions") loadExceptions();
       else if (tab === "recalc-notes") loadRecalcNotes();
+      else if (tab === "rehearsal") loadRehearsalSlips();
       else if (tab === "release") loadReleasePackages();
     });
 
@@ -995,6 +1081,7 @@ createApp({
       showCreateReleaseModal, showReleaseDetailModal, showRejectModal, showRevokeModal,
       releaseFilter,
       roleForm, releaseForm, releaseActionForm,
+      rehearsalSlips, currentRehearsalSlip, rehearsalSlipItems,
       canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons, canConfirmPlan,
       canCreateRelease, canApproveRelease, canRevokeRelease,
       openBatch, createBatch, precheckFile, handleDrop, updateTolerance, runMatch,
@@ -1009,6 +1096,9 @@ createApp({
       submitReleasePackage, approveReleasePackage, rejectReleasePackage,
       revokeReleasePackage, exportReleasePackage, importReleasePackage,
       releaseStatusLabel, releaseStatusClass,
+      loadRehearsalSlips, loadRehearsalSlipDetail, createRehearsalSlip,
+      regenerateRehearsalSlip, voidRehearsalSlip, exportRehearsalSlip,
+      rehearsalStatusLabel, rehearsalStatusClass,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };

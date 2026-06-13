@@ -779,6 +779,124 @@
           </div>
         </div>
 
+        <div v-if="activeTab==='rehearsal'">
+          <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-800">
+            <div class="flex items-center gap-2">
+              <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+              <div>
+                <span class="font-medium">入账预演沙箱</span>：确认批次后先生成预演单，不会真实改批次状态。预演单将快照凭证行、供应商应付汇总、异常处理结果、重算说明版本、巡检摘要和放行包状态。数据变化时旧预演单自动标记 STALE。
+              </div>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-semibold text-gray-700">预演单列表</h3>
+            <div class="flex items-center gap-2">
+              <select v-model="roleForm.role" class="border rounded px-2 py-1 text-sm">
+                <option value="admin">admin</option>
+                <option value="finance_lead">finance_lead</option>
+                <option value="finance">finance</option>
+                <option value="viewer">viewer</option>
+              </select>
+              <button @click="createRehearsalSlip" :disabled="!canConfirm && !canPost" class="bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-4 py-1.5 rounded text-sm font-medium transition">生成预演单</button>
+              <button @click="regenerateRehearsalSlip" :disabled="!canConfirm && !canPost" class="bg-amber-500 hover:bg-amber-600 disabled:bg-gray-300 text-white px-4 py-1.5 rounded text-sm font-medium transition">重新生成</button>
+            </div>
+          </div>
+
+          <div v-if="rehearsalSlips.length === 0" class="text-center text-gray-400 py-8">暂无预演单</div>
+          <div v-else class="space-y-2 mb-4">
+            <div v-for="s in rehearsalSlips" :key="s.id" @click="loadRehearsalSlipDetail(s.id)"
+                 :class="['border rounded-lg p-3 cursor-pointer hover:shadow-md transition', currentRehearsalSlip && currentRehearsalSlip.id === s.id ? 'border-indigo-300 bg-indigo-50' : 'border-gray-200 bg-white']">
+              <div class="flex justify-between items-center">
+                <div>
+                  <span class="font-medium text-gray-800">{{ s.slip_number }}</span>
+                  <span :class="rehearsalStatusClass(s.status)">{{ rehearsalStatusLabel(s.status) }}</span>
+                  <span v-if="s.is_stale" class="ml-2 text-xs px-2 py-0.5 rounded bg-yellow-200 text-yellow-800">STALE</span>
+                </div>
+                <div class="text-xs text-gray-500">{{ formatTime(s.created_at) }}</div>
+              </div>
+              <div class="flex gap-4 text-xs text-gray-600 mt-1">
+                <span>应付 ¥{{ s.payable_total }}</span>
+                <span>匹配 {{ s.matched_count }}</span>
+                <span>异常 {{ s.exception_count }}</span>
+                <span>创建: {{ s.created_by }}</span>
+              </div>
+              <div v-if="s.stale_reason" class="text-xs text-yellow-700 mt-1">过期原因: {{ s.stale_reason }}</div>
+            </div>
+          </div>
+
+          <div v-if="currentRehearsalSlip" class="border rounded-lg p-4 bg-white fade-in">
+            <div class="flex items-center justify-between mb-3">
+              <h4 class="font-semibold text-gray-800">预演单详情: {{ currentRehearsalSlip.slip_number }}</h4>
+              <div class="flex gap-2">
+                <button @click="exportRehearsalSlip(currentRehearsalSlip.id)" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-xs font-medium transition">导出 CSV</button>
+                <button v-if="currentRehearsalSlip.status !== 'VOID'" @click="voidRehearsalSlip(currentRehearsalSlip.id)" class="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-xs font-medium transition">作废</button>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-xs">
+              <div class="bg-gray-50 rounded p-2"><strong>批次状态:</strong> {{ currentRehearsalSlip.batch_status }}</div>
+              <div class="bg-gray-50 rounded p-2"><strong>应付合计:</strong> ¥{{ currentRehearsalSlip.payable_total }}</div>
+              <div class="bg-gray-50 rounded p-2"><strong>容差:</strong> {{ currentRehearsalSlip.tolerance_pct }}% / ¥{{ currentRehearsalSlip.tolerance_abs }}</div>
+              <div class="bg-gray-50 rounded p-2"><strong>规则版本:</strong> {{ currentRehearsalSlip.rule_version?.slice(0,8) }}</div>
+            </div>
+
+            <div v-if="currentRehearsalSlip.vendor_payable_summary" class="mb-4">
+              <h5 class="text-sm font-medium text-gray-700 mb-2">供应商应付汇总</h5>
+              <table class="w-full text-xs">
+                <thead class="bg-gray-50"><tr><th class="px-2 py-1 text-left">供应商编码</th><th class="px-2 py-1 text-left">供应商名称</th><th class="px-2 py-1 text-right">应付合计</th><th class="px-2 py-1 text-right">笔数</th></tr></thead>
+                <tbody>
+                  <tr v-for="v in currentRehearsalSlip.vendor_payable_summary" :key="v.vendor_code" class="border-t border-gray-100">
+                    <td class="px-2 py-1">{{ v.vendor_code }}</td><td class="px-2 py-1">{{ v.vendor_name }}</td><td class="px-2 py-1 text-right">¥{{ v.total }}</td><td class="px-2 py-1 text-right">{{ v.count }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div v-if="currentRehearsalSlip.exception_result_summary && currentRehearsalSlip.exception_result_summary.length" class="mb-4">
+              <h5 class="text-sm font-medium text-gray-700 mb-2">异常处理结果</h5>
+              <div class="space-y-1">
+                <div v-for="e in currentRehearsalSlip.exception_result_summary" :key="e.exception_id" class="text-xs border rounded p-2" :class="e.status==='PENDING'?'border-red-200 bg-red-50':'border-green-200 bg-green-50'">
+                  <span class="font-medium">{{ e.exception_type }}</span> <span :class="e.status==='PENDING'?'text-red-700':'text-green-700'">[{{ e.status }}]</span>
+                  <span class="text-gray-500 ml-2">{{ e.po_number || '-' }} / {{ e.invoice_number || '-' }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="mb-4">
+              <h5 class="text-sm font-medium text-gray-700 mb-2">凭证行明细 ({{ rehearsalSlipItems.length }} 条)</h5>
+              <div class="overflow-x-auto max-h-64 overflow-y-auto">
+                <table class="w-full text-xs">
+                  <thead class="bg-gray-50 sticky top-0"><tr><th class="px-2 py-1 text-left">采购单号</th><th class="px-2 py-1 text-left">发票号</th><th class="px-2 py-1 text-left">供应商</th><th class="px-2 py-1 text-right">采购金额</th><th class="px-2 py-1 text-right">发票金额</th><th class="px-2 py-1 text-center">匹配类型</th><th class="px-2 py-1 text-center">状态</th></tr></thead>
+                  <tbody>
+                    <tr v-for="i in rehearsalSlipItems" :key="i.id" class="border-t border-gray-100">
+                      <td class="px-2 py-1">{{ i.po_number || '-' }}</td><td class="px-2 py-1">{{ i.invoice_number || '-' }}</td><td class="px-2 py-1">{{ i.vendor_name || '-' }}</td>
+                      <td class="px-2 py-1 text-right">{{ i.po_amount != null ? '¥'+i.po_amount.toFixed(2) : '-' }}</td>
+                      <td class="px-2 py-1 text-right">{{ i.invoice_amount != null ? '¥'+i.invoice_amount.toFixed(2) : '-' }}</td>
+                      <td class="px-2 py-1 text-center">{{ i.match_type }}</td><td class="px-2 py-1 text-center">{{ i.status }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+              <div v-if="currentRehearsalSlip.recalc_note_version_snapshot" class="bg-blue-50 border border-blue-200 rounded p-2">
+                <strong class="text-blue-800">重算说明快照</strong><br>
+                版本 v{{ currentRehearsalSlip.recalc_note_version_snapshot.version }} · 应付 ¥{{ currentRehearsalSlip.recalc_note_version_snapshot.current_total }} · {{ currentRehearsalSlip.recalc_note_version_snapshot.change_source }}
+              </div>
+              <div v-if="currentRehearsalSlip.health_inspection_summary" class="bg-green-50 border border-green-200 rounded p-2">
+                <strong class="text-green-800">巡检摘要快照</strong><br>
+                阻断 {{ currentRehearsalSlip.health_inspection_summary.blocker_count }} · 警告 {{ currentRehearsalSlip.health_inspection_summary.warning_count }} · 提示 {{ currentRehearsalSlip.health_inspection_summary.info_count }}
+              </div>
+              <div v-if="currentRehearsalSlip.release_package_status_snapshot" class="bg-purple-50 border border-purple-200 rounded p-2">
+                <strong class="text-purple-800">放行包状态快照</strong><br>
+                {{ currentRehearsalSlip.release_package_status_snapshot.package_number }} · {{ currentRehearsalSlip.release_package_status_snapshot.status }}
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div v-if="activeTab==='release'">
           <div class="flex items-center justify-between mb-4">
             <h3 class="font-semibold text-gray-700">入账放行包</h3>

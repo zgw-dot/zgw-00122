@@ -13,6 +13,8 @@ from models import (
     RESULT_STATUS_PENDING, RESULT_STATUS_CONFIRMED, RESULT_STATUS_REJECTED,
     REVIEW_STATUS_PENDING, REVIEW_STATUS_CONFIRMED, REVIEW_STATUS_IGNORED,
     VALID_TRANSITIONS, compute_rule_version, init_db,
+    REHEARSAL_STATUS_ACTIVE, REHEARSAL_STATUS_STALE, REHEARSAL_STATUS_VOID,
+    REHEARSAL_PERMISSION_VOID, REHEARSAL_PERMISSION_CREATE, REHEARSAL_PERMISSION_VIEW,
 )
 from matcher import (
     process_batch, validate_and_import_po, validate_and_import_invoice, ValidationError,
@@ -38,6 +40,10 @@ from matcher import (
     revoke_release_package, export_release_csv, import_release_csv,
     list_release_audit_logs, get_release_package_by_number,
     mark_expired_packages_on_change,
+    create_rehearsal_slip, get_rehearsal_slip, get_rehearsal_slip_by_number,
+    list_rehearsal_slips, get_latest_rehearsal_slip, get_rehearsal_slip_items,
+    void_rehearsal_slip, regenerate_rehearsal_slip,
+    export_rehearsal_csv, import_rehearsal_csv, mark_stale_rehearsal_slips,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
@@ -172,6 +178,7 @@ def update_tolerance(batch_id):
     db.session.commit()
     generate_payable_recalc_note(batch_id, change_source="UPDATE_TOLERANCE", operator="user")
     mark_expired_packages_on_change(batch_id, "UPDATE_TOLERANCE", operator="user")
+    mark_stale_rehearsal_slips(batch_id, "UPDATE_TOLERANCE", operator="user")
     resp = batch.to_dict()
     resp["summary"] = batch.summary
     return jsonify(resp)
@@ -334,6 +341,7 @@ def confirm_batch_draft(batch_id, draft_id):
         operator = payload.get("operator", "web_user")
         result = confirm_draft(draft_id, operator=operator)
         mark_expired_packages_on_change(batch_id, "DRAFT_CONFIRMED", operator=operator)
+        mark_stale_rehearsal_slips(batch_id, "DRAFT_CONFIRMED", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -474,6 +482,7 @@ def confirm_batch_plan(batch_id, plan_id):
         operator = payload.get("operator", "web_user")
         result = confirm_plan(plan_id, operator=operator)
         mark_expired_packages_on_change(batch_id, "PLAN_CONFIRMED", operator=operator)
+        mark_stale_rehearsal_slips(batch_id, "PLAN_CONFIRMED", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -522,6 +531,7 @@ def match_batch(batch_id):
     try:
         success = process_batch(batch.id)
         mark_expired_packages_on_change(batch_id, "MATCH", operator="system")
+        mark_stale_rehearsal_slips(batch_id, "MATCH", operator="system")
         return jsonify({"success": True, "has_exceptions": not success})
     except ValidationError as e:
         return jsonify({"success": False, "error": str(e), "details": e.details}), 400
@@ -564,6 +574,7 @@ def remark_exception(batch_id, exc_id):
     db.session.commit()
     generate_payable_recalc_note(batch_id, change_source="EXCEPTION_REMARK", operator="user")
     mark_expired_packages_on_change(batch_id, "EXCEPTION_REMARK", operator="user")
+    mark_stale_rehearsal_slips(batch_id, "EXCEPTION_REMARK", operator="user")
     return jsonify(exc.to_dict())
 
 
@@ -602,6 +613,7 @@ def resolve_exception(batch_id, exc_id):
 
     generate_payable_recalc_note(batch_id, change_source=f"EXCEPTION_{action.upper()}", operator="user")
     mark_expired_packages_on_change(batch_id, f"EXCEPTION_{action.upper()}", operator="user")
+    mark_stale_rehearsal_slips(batch_id, f"EXCEPTION_{action.upper()}", operator="user")
 
     return jsonify(exc.to_dict())
 
@@ -623,6 +635,7 @@ def confirm_batch(batch_id):
     db.session.commit()
     generate_payable_recalc_note(batch_id, change_source="CONFIRM", operator="user")
     mark_expired_packages_on_change(batch_id, "CONFIRM", operator="user")
+    mark_stale_rehearsal_slips(batch_id, "CONFIRM", operator="user")
     return jsonify(batch.to_dict())
 
 
@@ -946,6 +959,7 @@ def run_health_check_api(batch_id):
     try:
         result = run_health_check(batch_id, operator=operator)
         mark_expired_packages_on_change(batch_id, "HEALTH_CHECK", operator=operator)
+        mark_stale_rehearsal_slips(batch_id, "HEALTH_CHECK", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         return jsonify({"error": str(e), "details": e.details}), 400
@@ -1356,6 +1370,150 @@ def get_batch_latest_release_package(batch_id):
     resp = pkg.to_dict()
     resp["items"] = [i.to_dict() for i in get_release_package_items(pkg.id)]
     return jsonify({"release_package": resp})
+
+
+@bp.route("/api/rehearsal-slips", methods=["GET"])
+def list_all_rehearsal_slips():
+    status = request.args.get("status")
+    batch_id = request.args.get("batch_id")
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            return jsonify({"error": "batch_id 必须是整数"}), 400
+    slips = list_rehearsal_slips(batch_id=batch_id, status=status)
+    return jsonify({"rehearsal_slips": [s.to_dict() for s in slips]})
+
+
+@bp.route("/api/batches/<int:batch_id>/rehearsal-slips", methods=["GET"])
+def list_batch_rehearsal_slips(batch_id):
+    Batch.query.get_or_404(batch_id)
+    status = request.args.get("status")
+    slips = list_rehearsal_slips(batch_id=batch_id, status=status)
+    return jsonify({"rehearsal_slips": [s.to_dict() for s in slips]})
+
+
+@bp.route("/api/batches/<int:batch_id>/rehearsal-slips", methods=["POST"])
+def create_batch_rehearsal_slip(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+
+    if role not in REHEARSAL_PERMISSION_CREATE:
+        return jsonify({"error": f"角色 '{role}' 无生成预演单权限"}), 403
+
+    try:
+        slip, is_new, _ = create_rehearsal_slip(batch_id, operator=operator)
+        resp = slip.to_dict()
+        resp["is_new"] = is_new
+        if is_new:
+            return jsonify(resp), 201
+        return jsonify(resp)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/rehearsal-slips/<int:slip_id>", methods=["GET"])
+def get_rehearsal_slip_api(slip_id):
+    slip = get_rehearsal_slip(slip_id)
+    if slip is None:
+        return jsonify({"error": "预演单不存在"}), 404
+    resp = slip.to_dict()
+    resp["items"] = [i.to_dict() for i in get_rehearsal_slip_items(slip_id)]
+    return jsonify(resp)
+
+
+@bp.route("/api/batches/<int:batch_id>/rehearsal-slips/latest", methods=["GET"])
+def get_batch_latest_rehearsal_slip(batch_id):
+    Batch.query.get_or_404(batch_id)
+    slip = get_latest_rehearsal_slip(batch_id)
+    if slip is None:
+        return jsonify({"rehearsal_slip": None})
+    resp = slip.to_dict()
+    resp["items"] = [i.to_dict() for i in get_rehearsal_slip_items(slip.id)]
+    return jsonify({"rehearsal_slip": resp})
+
+
+@bp.route("/api/batches/<int:batch_id>/rehearsal-slips/regenerate", methods=["POST"])
+def regenerate_batch_rehearsal_slip(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+
+    if role not in REHEARSAL_PERMISSION_CREATE:
+        return jsonify({"error": f"角色 '{role}' 无生成预演单权限"}), 403
+
+    try:
+        slip, is_new, _ = regenerate_rehearsal_slip(batch_id, operator=operator)
+        resp = slip.to_dict()
+        resp["is_new"] = is_new
+        return jsonify(resp), 201
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/rehearsal-slips/<int:slip_id>/void", methods=["POST"])
+def void_rehearsal_slip_api(slip_id):
+    slip = get_rehearsal_slip(slip_id)
+    if slip is None:
+        return jsonify({"error": "预演单不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason", "")
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    try:
+        updated = void_rehearsal_slip(slip_id, reason=reason, role=role, operator=operator)
+        return jsonify(updated.to_dict())
+    except ValidationError as e:
+        db.session.rollback()
+        if "权限" in str(e):
+            return jsonify({"error": str(e), "details": e.details}), 403
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/rehearsal-slips/<int:slip_id>/export", methods=["GET"])
+def export_rehearsal_slip_csv(slip_id):
+    slip = get_rehearsal_slip(slip_id)
+    if slip is None:
+        return jsonify({"error": "预演单不存在"}), 404
+    try:
+        csv_content = export_rehearsal_csv(slip_id)
+        filename = f"rehearsal_{slip.slip_number}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        slip.export_filename = filename
+        db.session.commit()
+        return send_file(
+            io.BytesIO(csv_content.encode("utf-8-sig")),
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/rehearsal-slips/import", methods=["POST"])
+def import_rehearsal_slip_csv(batch_id):
+    Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    operator = request.form.get("operator", "web_user")
+
+    try:
+        content = f.read().decode("utf-8-sig")
+        slip = import_rehearsal_csv(batch_id, content, operator=operator)
+        return jsonify(slip.to_dict()), 201
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+    except UnicodeDecodeError:
+        return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
 
 
 app = create_app()
