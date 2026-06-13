@@ -50,6 +50,13 @@ createApp({
     const releaseForm = reactive({ remarks: "", operator: "web_user" });
     const releaseActionForm = reactive({ reason: "", operator: "web_user", role: "finance_lead" });
 
+    const archives = ref([]);
+    const currentArchive = ref(null);
+    const archiveItems = ref([]);
+    const showArchiveDetailModal = ref(false);
+    const showVoidArchiveModal = ref(false);
+    const archiveActionForm = reactive({ reason: "", operator: "web_user", role: "finance_lead" });
+
     const tabs = [
       { key: "upload", label: "文件上传（预检模式）" },
       { key: "health-check", label: "数据健康巡检" },
@@ -58,6 +65,7 @@ createApp({
       { key: "recalc-notes", label: "重算说明" },
       { key: "rehearsal", label: "入账预演沙箱" },
       { key: "release", label: "入账放行包" },
+      { key: "archives", label: "结账归档包" },
       { key: "actions", label: "操作" },
       { key: "history", label: "历史记录" },
     ];
@@ -1029,6 +1037,112 @@ createApp({
       }
     }
 
+    async function loadArchives() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/archives`);
+      if (data) archives.value = data.archives || [];
+    }
+
+    async function loadArchiveDetail(archiveId) {
+      const data = await api(`/api/archives/${archiveId}`);
+      if (data) {
+        currentArchive.value = data;
+        archiveItems.value = data.items || [];
+        showArchiveDetailModal.value = true;
+        archiveActionForm.role = roleForm.role;
+      }
+    }
+
+    async function createArchive() {
+      if (!currentBatch.value) return;
+      const data = await api(`/api/batches/${currentBatch.value.id}/archives`, {
+        method: "POST",
+        body: JSON.stringify({ role: roleForm.role, operator: roleForm.role + "_user", force_new: false }),
+      });
+      if (data) {
+        if (data.message) showToast(data.message);
+        else showToast(data.is_new ? "已生成新归档" : "内容无变化，返回已有归档");
+        loadArchives();
+      }
+    }
+
+    async function sealArchive(archiveId) {
+      const data = await api(`/api/archives/${archiveId}/seal`, {
+        method: "POST",
+        body: JSON.stringify({ role: archiveActionForm.role, operator: archiveActionForm.operator }),
+      });
+      if (data) {
+        showToast("封存成功");
+        currentArchive.value = data;
+        showArchiveDetailModal.value = false;
+        showVoidArchiveModal.value = false;
+        loadArchives();
+      }
+    }
+
+    async function voidArchive(archiveId) {
+      const data = await api(`/api/archives/${archiveId}/void`, {
+        method: "POST",
+        body: JSON.stringify({ role: archiveActionForm.role, operator: archiveActionForm.operator, reason: archiveActionForm.reason }),
+      });
+      if (data) {
+        showToast("作废成功");
+        currentArchive.value = data;
+        showArchiveDetailModal.value = false;
+        showVoidArchiveModal.value = false;
+        archiveActionForm.reason = "";
+        loadArchives();
+      }
+    }
+
+    async function exportArchive(archiveId) {
+      try {
+        const res = await fetch(`/api/archives/${archiveId}/export`);
+        if (!res.ok) {
+          const data = await res.json();
+          showToast(data.error || "导出失败", "error");
+          return;
+        }
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        const cd = res.headers.get("Content-Disposition") || "";
+        const m = cd.match(/filename="?([^"]+)"?/);
+        a.download = m ? m[1] : `archive_${archiveId}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+      } catch (e) {
+        showToast("导出失败: " + e.message, "error");
+      }
+    }
+
+    async function importArchive(event) {
+      if (!currentBatch.value) return;
+      const file = event.target.files[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("operator", archiveActionForm.operator);
+      try {
+        const res = await fetch(`/api/batches/${currentBatch.value.id}/archives/import`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const detail = data.details ? data.details.join("; ") : data.error || "导入失败";
+          showToast(detail, "error");
+          return;
+        }
+        showToast("导入成功");
+        event.target.value = "";
+        loadArchives();
+      } catch (e) {
+        showToast("导入失败: " + e.message, "error");
+      }
+    }
+
     function releaseStatusLabel(s) {
       const m = { DRAFT: "草稿", PENDING: "待审批", APPROVED: "已通过", REJECTED: "已驳回", REVOKED: "已撤销", EXPIRED: "已过期" };
       return m[s] || s;
@@ -1058,6 +1172,34 @@ createApp({
       return currentBatch.value && ["MATCHED", "EXCEPTION_PENDING", "CONFIRMED"].includes(currentBatch.value.status);
     });
 
+    const canCreateArchive = computed(() => {
+      return currentBatch.value && ["CONFIRMED", "MATCHED", "POSTED"].includes(currentBatch.value.status)
+        && ["admin", "finance_lead", "finance"].includes(roleForm.role);
+    });
+
+    function archiveStatusLabel(s) {
+      const m = { ACTIVE: "有效", STALE: "已过期", SEALED: "已封存", VOID: "已作废" };
+      return m[s] || s;
+    }
+
+    function archiveStatusClass(s) {
+      const m = {
+        ACTIVE: "bg-blue-100 text-blue-700",
+        STALE: "bg-yellow-100 text-yellow-700",
+        SEALED: "bg-green-100 text-green-700",
+        VOID: "bg-red-100 text-red-700",
+      };
+      return "status-badge " + (m[s] || "bg-gray-100 text-gray-700");
+    }
+
+    function canSealArchive(arc) {
+      return arc && ["ACTIVE", "STALE"].includes(arc.status) && ["admin", "finance_lead"].includes(archiveActionForm.role);
+    }
+
+    function canVoidArchive(arc) {
+      return arc && ["ACTIVE", "STALE"].includes(arc.status) && ["admin", "finance_lead"].includes(archiveActionForm.role);
+    }
+
     watch(activeTab, (tab) => {
       if (!currentBatch.value) return;
       if (tab === "results") loadResults();
@@ -1065,6 +1207,7 @@ createApp({
       else if (tab === "recalc-notes") loadRecalcNotes();
       else if (tab === "rehearsal") loadRehearsalSlips();
       else if (tab === "release") loadReleasePackages();
+      else if (tab === "archives") loadArchives();
     });
 
     onMounted(loadDashboard);
@@ -1082,8 +1225,11 @@ createApp({
       releaseFilter,
       roleForm, releaseForm, releaseActionForm,
       rehearsalSlips, currentRehearsalSlip, rehearsalSlipItems,
+      archives, currentArchive, archiveItems,
+      showArchiveDetailModal, showVoidArchiveModal, archiveActionForm,
       canUpload, canMatch, canConfirm, canPost, canRollback, canReset, canCompare, hasSelectedComparisons, canConfirmPlan,
       canCreateRelease, canApproveRelease, canRevokeRelease,
+      canCreateArchive, canSealArchive, canVoidArchive,
       openBatch, createBatch, precheckFile, handleDrop, updateTolerance, runMatch,
       saveRemark, resolveException, confirmBatch, postBatch, rollbackBatch, resetBatch,
       exportReport, loadRecalcNotes, doCompare, loadComparisons, loadComparisonDetail, doReview,
@@ -1099,6 +1245,9 @@ createApp({
       loadRehearsalSlips, loadRehearsalSlipDetail, createRehearsalSlip,
       regenerateRehearsalSlip, voidRehearsalSlip, exportRehearsalSlip,
       rehearsalStatusLabel, rehearsalStatusClass,
+      loadArchives, loadArchiveDetail, createArchive, sealArchive, voidArchive,
+      exportArchive, importArchive,
+      archiveStatusLabel, archiveStatusClass,
       statusLabel, statusClass, matchTypeLabel, matchTypeClass, reviewStatusLabel, reviewStatusClass, formatTime,
       showToast,
     };

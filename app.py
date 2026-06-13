@@ -15,6 +15,8 @@ from models import (
     VALID_TRANSITIONS, compute_rule_version, init_db,
     REHEARSAL_STATUS_ACTIVE, REHEARSAL_STATUS_STALE, REHEARSAL_STATUS_VOID,
     REHEARSAL_PERMISSION_VOID, REHEARSAL_PERMISSION_CREATE, REHEARSAL_PERMISSION_VIEW,
+    ARCHIVE_STATUS_ACTIVE, ARCHIVE_STATUS_STALE, ARCHIVE_STATUS_SEALED, ARCHIVE_STATUS_VOID,
+    ARCHIVE_PERMISSION_SEAL, ARCHIVE_PERMISSION_VOID, ARCHIVE_PERMISSION_CREATE, ARCHIVE_PERMISSION_VIEW,
 )
 from matcher import (
     process_batch, validate_and_import_po, validate_and_import_invoice, ValidationError,
@@ -44,6 +46,10 @@ from matcher import (
     list_rehearsal_slips, get_latest_rehearsal_slip, get_rehearsal_slip_items,
     void_rehearsal_slip, regenerate_rehearsal_slip,
     export_rehearsal_csv, import_rehearsal_csv, mark_stale_rehearsal_slips,
+    create_closing_archive, get_closing_archive, get_closing_archive_by_number,
+    list_closing_archives, seal_closing_archive, void_closing_archive,
+    export_closing_archive_csv, import_closing_archive_csv,
+    list_archive_audit_logs, mark_stale_archives,
     DRAFT_FILE_TYPE_PO, DRAFT_FILE_TYPE_INVOICE,
     DRAFT_STATUS_PENDING, DRAFT_STATUS_CONFLICT,
 )
@@ -179,6 +185,7 @@ def update_tolerance(batch_id):
     generate_payable_recalc_note(batch_id, change_source="UPDATE_TOLERANCE", operator="user")
     mark_expired_packages_on_change(batch_id, "UPDATE_TOLERANCE", operator="user")
     mark_stale_rehearsal_slips(batch_id, "UPDATE_TOLERANCE", operator="user")
+    mark_stale_archives(batch_id, "TOLERANCE_RULE", operator="user")
     resp = batch.to_dict()
     resp["summary"] = batch.summary
     return jsonify(resp)
@@ -342,6 +349,7 @@ def confirm_batch_draft(batch_id, draft_id):
         result = confirm_draft(draft_id, operator=operator)
         mark_expired_packages_on_change(batch_id, "DRAFT_CONFIRMED", operator=operator)
         mark_stale_rehearsal_slips(batch_id, "DRAFT_CONFIRMED", operator=operator)
+        mark_stale_archives(batch_id, "BATCH_DATA", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -483,6 +491,7 @@ def confirm_batch_plan(batch_id, plan_id):
         result = confirm_plan(plan_id, operator=operator)
         mark_expired_packages_on_change(batch_id, "PLAN_CONFIRMED", operator=operator)
         mark_stale_rehearsal_slips(batch_id, "PLAN_CONFIRMED", operator=operator)
+        mark_stale_archives(batch_id, "BATCH_DATA", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         db.session.rollback()
@@ -532,6 +541,7 @@ def match_batch(batch_id):
         success = process_batch(batch.id)
         mark_expired_packages_on_change(batch_id, "MATCH", operator="system")
         mark_stale_rehearsal_slips(batch_id, "MATCH", operator="system")
+        mark_stale_archives(batch_id, "BATCH_DATA", operator="system")
         return jsonify({"success": True, "has_exceptions": not success})
     except ValidationError as e:
         return jsonify({"success": False, "error": str(e), "details": e.details}), 400
@@ -575,6 +585,7 @@ def remark_exception(batch_id, exc_id):
     generate_payable_recalc_note(batch_id, change_source="EXCEPTION_REMARK", operator="user")
     mark_expired_packages_on_change(batch_id, "EXCEPTION_REMARK", operator="user")
     mark_stale_rehearsal_slips(batch_id, "EXCEPTION_REMARK", operator="user")
+    mark_stale_archives(batch_id, "BATCH_DATA", operator="user")
     return jsonify(exc.to_dict())
 
 
@@ -614,6 +625,7 @@ def resolve_exception(batch_id, exc_id):
     generate_payable_recalc_note(batch_id, change_source=f"EXCEPTION_{action.upper()}", operator="user")
     mark_expired_packages_on_change(batch_id, f"EXCEPTION_{action.upper()}", operator="user")
     mark_stale_rehearsal_slips(batch_id, f"EXCEPTION_{action.upper()}", operator="user")
+    mark_stale_archives(batch_id, "BATCH_DATA", operator="user")
 
     return jsonify(exc.to_dict())
 
@@ -636,6 +648,7 @@ def confirm_batch(batch_id):
     generate_payable_recalc_note(batch_id, change_source="CONFIRM", operator="user")
     mark_expired_packages_on_change(batch_id, "CONFIRM", operator="user")
     mark_stale_rehearsal_slips(batch_id, "CONFIRM", operator="user")
+    mark_stale_archives(batch_id, "BATCH_DATA", operator="user")
     return jsonify(batch.to_dict())
 
 
@@ -960,6 +973,7 @@ def run_health_check_api(batch_id):
         result = run_health_check(batch_id, operator=operator)
         mark_expired_packages_on_change(batch_id, "HEALTH_CHECK", operator=operator)
         mark_stale_rehearsal_slips(batch_id, "HEALTH_CHECK", operator=operator)
+        mark_stale_archives(batch_id, "HEALTH_STATUS", operator=operator)
         return jsonify(result)
     except ValidationError as e:
         return jsonify({"error": str(e), "details": e.details}), 400
@@ -1514,6 +1528,170 @@ def import_rehearsal_slip_csv(batch_id):
         return jsonify({"error": str(e), "details": e.details}), 400
     except UnicodeDecodeError:
         return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
+
+
+@bp.route("/api/archives", methods=["GET"])
+def list_all_archives():
+    status = request.args.get("status")
+    batch_id = request.args.get("batch_id")
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            return jsonify({"error": "batch_id 必须是整数"}), 400
+    archives = list_closing_archives(batch_id=batch_id, status=status)
+    return jsonify({"archives": [a.to_dict() for a in archives]})
+
+
+@bp.route("/api/batches/<int:batch_id>/archives", methods=["GET"])
+def list_batch_archives(batch_id):
+    Batch.query.get_or_404(batch_id)
+    status = request.args.get("status")
+    archives = list_closing_archives(batch_id=batch_id, status=status)
+    return jsonify({"archives": [a.to_dict() for a in archives]})
+
+
+@bp.route("/api/batches/<int:batch_id>/archives", methods=["POST"])
+def create_batch_archive(batch_id):
+    Batch.query.get_or_404(batch_id)
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+    force_new = payload.get("force_new", False)
+
+    if role not in ARCHIVE_PERMISSION_CREATE:
+        return jsonify({"error": f"角色 '{role}' 无生成归档权限"}), 403
+
+    try:
+        archive, is_new, message = create_closing_archive(
+            batch_id, operator=operator, force_new=force_new
+        )
+        resp = archive.to_dict()
+        resp["is_new"] = is_new
+        resp["message"] = message
+        if is_new:
+            return jsonify(resp), 201
+        return jsonify(resp)
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/archives/<int:archive_id>", methods=["GET"])
+def get_archive_api(archive_id):
+    archive = get_closing_archive(archive_id)
+    if archive is None:
+        return jsonify({"error": "归档不存在"}), 404
+    resp = archive.to_dict()
+    resp["items"] = [i.to_dict() for i in sorted(archive.items, key=lambda x: x.item_order)]
+    return jsonify(resp)
+
+
+@bp.route("/api/archives/<int:archive_id>/seal", methods=["POST"])
+def seal_archive_api(archive_id):
+    archive = get_closing_archive(archive_id)
+    if archive is None:
+        return jsonify({"error": "归档不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+
+    if role not in ARCHIVE_PERMISSION_SEAL:
+        return jsonify({"error": f"角色 '{role}' 无封存权限"}), 403
+
+    try:
+        updated, changed = seal_closing_archive(archive_id, operator=operator)
+        resp = updated.to_dict()
+        resp["changed"] = changed
+        return jsonify(resp)
+    except ValidationError as e:
+        db.session.rollback()
+        if "权限" in str(e):
+            return jsonify({"error": str(e), "details": e.details}), 403
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/archives/<int:archive_id>/void", methods=["POST"])
+def void_archive_api(archive_id):
+    archive = get_closing_archive(archive_id)
+    if archive is None:
+        return jsonify({"error": "归档不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    reason = payload.get("reason", "")
+    role = payload.get("role", "viewer")
+    operator = payload.get("operator", "web_user")
+
+    if role not in ARCHIVE_PERMISSION_VOID:
+        return jsonify({"error": f"角色 '{role}' 无作废权限"}), 403
+
+    try:
+        updated, changed = void_closing_archive(archive_id, reason=reason, operator=operator)
+        resp = updated.to_dict()
+        resp["changed"] = changed
+        return jsonify(resp)
+    except ValidationError as e:
+        db.session.rollback()
+        if "权限" in str(e):
+            return jsonify({"error": str(e), "details": e.details}), 403
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/archives/<int:archive_id>/export", methods=["GET"])
+def export_archive_csv(archive_id):
+    archive = get_closing_archive(archive_id)
+    if archive is None:
+        return jsonify({"error": "归档不存在"}), 404
+    try:
+        csv_content, filename = export_closing_archive_csv(archive_id)
+        archive.export_filename = filename
+        db.session.commit()
+        return send_file(
+            io.BytesIO(csv_content.encode("utf-8-sig")),
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name=filename,
+        )
+    except ValidationError as e:
+        return jsonify({"error": str(e), "details": e.details}), 400
+
+
+@bp.route("/api/batches/<int:batch_id>/archives/import", methods=["POST"])
+def import_archive_csv(batch_id):
+    Batch.query.get_or_404(batch_id)
+    if "file" not in request.files:
+        return jsonify({"error": "缺少文件字段 file"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    operator = request.form.get("operator", "web_user")
+
+    try:
+        content = f.read()
+        archive = import_closing_archive_csv(batch_id, content, operator=operator)
+        return jsonify(archive.to_dict()), 201
+    except ValidationError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e), "details": e.details}), 400
+    except UnicodeDecodeError:
+        return jsonify({"error": "文件编码错误，请使用 UTF-8 编码的 CSV 文件"}), 400
+
+
+@bp.route("/api/archives/audit-logs", methods=["GET"])
+def list_archive_audit_logs_api():
+    batch_id = request.args.get("batch_id")
+    archive_id = request.args.get("archive_id")
+    if batch_id:
+        try:
+            batch_id = int(batch_id)
+        except ValueError:
+            return jsonify({"error": "batch_id 必须是整数"}), 400
+    if archive_id:
+        try:
+            archive_id = int(archive_id)
+        except ValueError:
+            return jsonify({"error": "archive_id 必须是整数"}), 400
+    logs = list_archive_audit_logs(batch_id=batch_id, archive_id=archive_id)
+    return jsonify({"audit_logs": [log.to_dict() for log in logs]})
 
 
 app = create_app()
